@@ -101,7 +101,6 @@ section_text() {
         f { print }
     ' "$1" | grep -v '^[[:space:]]*<!--' | grep -v '^[[:space:]]*$' | head -3
 }
-
 validate_task_file() {
     local file="$1" missing="" header content
     for header in "Task ID" "Mode" "Objective" "Acceptance Criteria" "Required Verification" "Allowed Changes" "Forbidden Changes"; do
@@ -110,7 +109,7 @@ validate_task_file() {
             missing="$missing '$header'"
             continue
         fi
-        if printf '%s\n' "$content" | grep -q '<.*>'; then
+        if printf '%s\n' "$content" | grep -q '^[[:space:]]*<'; then
             missing="$missing '$header(placeholder)'"
         fi
     done

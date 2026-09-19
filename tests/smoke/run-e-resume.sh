@@ -19,14 +19,22 @@ SMOKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SMOKE_DIR/helpers.sh"
 
 TEMPLATE_MODE=0
-[[ "${1:-}" == "--template" ]] && TEMPLATE_MODE=1
+SUFFIX=""
+NAME_SUFFIX=""
+if [[ "${1:-}" == "--template" ]]; then
+    TEMPLATE_MODE=1
+    SUFFIX=" [template TASK.md]"
+    NAME_SUFFIX="t"
+fi
 
 require_live_env
-TEST_NAME="E-resume$([[ $TEMPLATE_MODE -eq 1 ]] && printf -- '-template')"
-printf '== live test E: resume in_progress (OpenCode default model)%s ==\n' \
-    "$([[ $TEMPLATE_MODE -eq 1 ]] && printf ' [template TASK.md]')"
+TEST_NAME="E-resume"
+if [[ "$TEMPLATE_MODE" -eq 1 ]]; then
+    TEST_NAME="E-resume-template"
+fi
+printf '== live test E: resume in_progress (OpenCode default model)%s ==\n' "$SUFFIX"
 
-repo="$(new_repo "smoke-E$([[ $TEMPLATE_MODE -eq 1 ]] && printf 't')")"
+repo="$(new_repo "smoke-E${NAME_SUFFIX}")"
 CLEANUP_DIRS+=("$repo")
 
 copy_asset "phase/app.py" "$repo"
@@ -152,8 +160,9 @@ check "A02 archived" bash -c "ls -d '$repo'/.agent/history/*A02 >/dev/null 2>&1"
 check "the rebuilt TASK.md was saved to history" test -s "$repo/.agent/phases/A/history/TASK-A02.md"
 
 if [[ "$TEMPLATE_MODE" -eq 1 ]]; then
-    check "the template TASK.md was replaced before the run" bash -c \
-        "! grep -q '<PHASE>-<NN>' '$repo/.agent/current/TASK.md'"
+    # The run only succeeds because the driver rebuilt TASK.md from the queue
+    # definition; the archived copy proves the render happened.
+    check "the rebuilt TASK.md was archived" bash -c "grep -q '^A02$' '$repo/.agent/phases/A/history/TASK-A02.md'"
 fi
 
 check "shutdown works" bash -c "cd '$repo' && python3 -c \"from app import shutdown; assert shutdown(5) == 'shutting down in 5s'\""
