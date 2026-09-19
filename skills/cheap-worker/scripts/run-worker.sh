@@ -10,6 +10,14 @@
 #     files outside the project root (OpenCode's external_directory permission
 #     defaults to "ask" and auto-rejects in non-interactive runs).
 #
+# Safety properties:
+#   - a single project-level lock refuses a second concurrent worker
+#   - previous RESULT/ESCALATION/BASELINE are quarantined before the run, so a
+#     stale report can never be mistaken for this run's output
+#   - the report must be fresh, carry this Task ID, and be well formed
+#   - `--allow-dirty` records the pre-run dirty evidence in BASELINE.md
+#   - opencode runs with cwd = project root, even when invoked from elsewhere
+#
 # Usage:
 #   run-worker.sh [--mode implement|investigate|fix|verify] [--root DIR]
 #                 [--task-id ID] [--title SHORT_TITLE] [--allow-dirty] [--dry-run]
@@ -19,12 +27,15 @@
 # <task-id>" when --title is omitted (then it is derived from the Objective).
 #
 # Exit codes:
-#   0  worker wrote RESULT.md (DONE)
-#   10 worker wrote ESCALATION.md (Supervisor decision required)
-#   1  invalid invocation / precondition failure
+#   0  fresh, valid RESULT.md from this run (opencode exited 0)
+#   5  fresh, valid RESULT.md but opencode exited non-zero (review carefully)
+#   10 fresh, valid ESCALATION.md (Supervisor decision required)
+#   1  invalid invocation / invalid or inconsistent TASK.md / other precondition
 #   2  opencode failed and wrote no report
-#   3  opencode finished but wrote neither report
-#   4  opencode ran and wrote both reports (inconsistent)
+#   3  opencode finished but wrote no report
+#   4  both reports exist and are valid (inconsistent)
+#   6  a report exists but is stale, malformed, or for another Task
+#   7  another worker is already running for this project
 #
 # This script never commits, pushes, merges or deletes anything.
 
@@ -35,9 +46,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The standard primary agent; the worker needs read/search/edit/bash/test tools.
 OPENCODE_AGENT="${OPENCODE_AGENT:-build}"
 
+LOCK_OWNED=0
+RUN_ID=""
+RUN_STARTED_EPOCH=0
+
 die() { printf 'run-worker: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -57,14 +72,14 @@ resolve_project_root() {
     local given="${1:-}"
     if [[ -n "$given" ]]; then
         cd "$given" || die "cannot cd into --root '$given'"
-        pwd
+        pwd -P
         return 0
     fi
     if git rev-parse --show-toplevel >/dev/null 2>&1; then
         git rev-parse --show-toplevel
         return 0
     fi
-    pwd
+    pwd -P
 }
 
 todo_count() {
@@ -76,6 +91,89 @@ derive_title() {
     local line
     line="$(awk '/^## Objective[[:space:]]*$/{f=1;next} f&&/^## /{exit} f&&NF{print;exit}' "$1")"
     printf '%s' "$line" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | cut -c1-48
+}
+
+# section_text <file> <header-without-##> -> first meaningful content lines
+section_text() {
+    awk -v h="$2" '
+        $0 == "## " h || $0 ~ "^## " h "[[:space:]]*$" { f=1; next }
+        /^## / { f=0 }
+        f { print }
+    ' "$1" | grep -v '^[[:space:]]*<!--' | grep -v '^[[:space:]]*$' | head -3
+}
+
+validate_task_file() {
+    local file="$1" missing="" header content
+    for header in "Task ID" "Mode" "Objective" "Acceptance Criteria" "Required Verification" "Allowed Changes" "Forbidden Changes"; do
+        content="$(section_text "$file" "$header")"
+        if [[ -z "$content" ]]; then
+            missing="$missing '$header'"
+            continue
+        fi
+        if printf '%s\n' "$content" | grep -q '<.*>'; then
+            missing="$missing '$header(placeholder)'"
+        fi
+    done
+    if [[ -n "$missing" ]]; then
+        die "TASK.md is incomplete or still a template (missing/placeholder:$missing)"
+    fi
+}
+
+read_task_id() {
+    awk '/^## Task ID[[:space:]]*$/{getline; gsub(/[[:space:]]/,""); print; exit}' "$1"
+}
+
+read_mode() {
+    awk '/^## Mode[[:space:]]*$/{getline; print; exit}' "$1" | awk '{print $1}'
+}
+
+read_report_task_id() {
+    awk '/^## Task ID[[:space:]]*$/{getline; gsub(/[[:space:]]/,""); print; exit}' "$1"
+}
+
+read_report_status() {
+    awk '/^## Status[[:space:]]*$/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' "$1"
+}
+
+file_mtime() {
+    stat -f %m "$1" 2>/dev/null || { stat -c %Y "$1" 2>/dev/null || printf '0'; }
+}
+
+# is_fresh <file> -> 0 when the file was written at/after this run started
+is_fresh() {
+    local mtime
+    mtime="$(file_mtime "$1")"
+    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+    [[ "$mtime" -ge $((RUN_STARTED_EPOCH - 1)) ]]
+}
+
+# valid_result <file> -> fresh + Task ID matches + ## Status DONE
+valid_result() {
+    local f="$1"
+    [[ -s "$f" ]] || return 1
+    is_fresh "$f" || return 1
+    [[ "$(read_report_task_id "$f")" == "$TASK_ID" ]] || return 1
+    [[ "$(read_report_status "$f")" == "DONE" ]] || return 1
+    return 0
+}
+
+# valid_escalation <file> -> fresh + Task ID matches + a blocker section
+valid_escalation() {
+    local f="$1"
+    [[ -s "$f" ]] || return 1
+    is_fresh "$f" || return 1
+    [[ "$(read_report_task_id "$f")" == "$TASK_ID" ]] || return 1
+    [[ -n "$(section_text "$f" "Current Blocker")" ]] || return 1
+    return 0
+}
+
+release_lock() {
+    [[ "$LOCK_OWNED" -eq 1 ]] || return 0
+    local lock_dir="$LOCK_DIR"
+    if [[ -f "$lock_dir/info" ]] && grep -q "^run_id=$RUN_ID$" "$lock_dir/info" 2>/dev/null; then
+        rm -rf "$lock_dir" 2>/dev/null || true
+    fi
+    LOCK_OWNED=0
 }
 
 # ---------------------------------------------------------------------------
@@ -114,26 +212,43 @@ main() {
 
     local task_file="$project_root/.agent/current/TASK.md"
     [[ -f "$task_file" ]] || die "no Task found at $task_file (Supervisor must write it first)"
+    validate_task_file "$task_file"
 
-    local task_id
-    task_id="${task_id_arg:-$(awk '/^## Task ID[[:space:]]*$/{getline; gsub(/[[:space:]]/,""); print; exit}' "$task_file")}"
-    [[ -n "$task_id" ]] || die "could not read Task ID from $task_file (use --task-id)"
+    local file_task_id file_mode
+    file_task_id="$(read_task_id "$task_file")"
+    file_mode="$(read_mode "$task_file")"
+    [[ -n "$file_task_id" ]] || die "TASK.md has no Task ID"
+    [[ "$file_task_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "TASK.md Task ID '$file_task_id' is not a safe id ([A-Za-z0-9._-])"
+    [[ -n "$file_mode" ]] || die "TASK.md has no Mode"
+    [[ "$file_mode" =~ ^(implement|investigate|fix|verify)$ ]] || die "TASK.md Mode '$file_mode' is invalid"
 
-    if [[ -z "$mode" ]]; then
-        mode="$(awk '/^## Mode[[:space:]]*$/{getline; print; exit}' "$task_file" | awk '{print $1}')"
+    if [[ -n "$task_id_arg" && "$task_id_arg" != "$file_task_id" ]]; then
+        die "--task-id '$task_id_arg' does not match TASK.md Task ID '$file_task_id'"
     fi
-    [[ -n "$mode" ]] || die "could not determine mode (set --mode or the '## Mode' section)"
-    [[ "$mode" =~ ^(implement|investigate|fix|verify)$ ]] || die "invalid mode '$mode' derived from TASK.md (use --mode)"
+    if [[ -n "$mode" && "$mode" != "$file_mode" ]]; then
+        die "--mode '$mode' does not match TASK.md Mode '$file_mode'"
+    fi
+    local task_id="$file_task_id"
+    TASK_ID="$task_id"   # used by the report validators below
+    [[ -n "$mode" ]] || mode="$file_mode"
+
+    # A REVIEW.md (rework) must belong to the same Task.
+    local review_file="$project_root/.agent/current/REVIEW.md"
+    if [[ -f "$review_file" ]]; then
+        local review_id
+        review_id="$(read_task_id "$review_file")"
+        if [[ -n "$review_id" && "$review_id" != "$task_id" ]]; then
+            die "REVIEW.md is for Task '$review_id' but TASK.md is '$task_id'"
+        fi
+    fi
 
     # Session title, shown in OpenCode Desktop: "cheap-worker · C01 · short title".
-    # Tolerate a caller passing the full form ("cheap-worker · C01 · title").
     local short_title="${title_arg:-$(derive_title "$task_file")}"
     short_title="${short_title#cheap-worker · $task_id · }"
     local session_title="cheap-worker · $task_id"
     [[ -n "$short_title" ]] && session_title="$session_title · $short_title"
 
-    # Git baseline (best effort: a non-git project or a fresh repo without commits
-    # still works, with a warning).
+    # Git baseline + dirty evidence (recorded for the Supervisor).
     local baseline="" dirty=""
     if git -C "$project_root" rev-parse --show-toplevel >/dev/null 2>&1; then
         if git -C "$project_root" rev-parse --verify -q HEAD >/dev/null 2>&1; then
@@ -145,30 +260,133 @@ main() {
         if [[ -n "$dirty" && "$allow_dirty" -eq 0 ]]; then
             printf '%s\n' "run-worker: project is not clean:" >&2
             printf '%s\n' "$dirty" >&2
-            die "commit/stash first, or pass --allow-dirty when the dirty state is intentional (e.g. resumed Task)"
+            die "commit/stash first, or pass --allow-dirty when the dirty state is intentional (e.g. a resumed/accepted-but-uncommitted Task)"
         fi
     else
         printf '%s\n' "run-worker: warning: '$project_root' is not a git repository; no baseline recording" >&2
     fi
 
     local agent_dir="$project_root/.agent/current"
-    mkdir -p "$agent_dir/logs"
+    mkdir -p "$agent_dir/logs" "$project_root/.agent/history/attempts"
     local opencode_version
     opencode_version="$(opencode --version 2>/dev/null | head -1)"
 
     local has_review="no"
-    [[ -f "$agent_dir/REVIEW.md" ]] && has_review="yes"
+    [[ -f "$review_file" ]] && has_review="yes"
     local has_agents_md="no"
     [[ -f "$project_root/AGENTS.md" ]] && has_agents_md="yes"
 
     local todo_before
     todo_before="$(todo_count "$task_file")"
 
-    # Render the worker prompt: static prompt + embedded contract and safety
-    # policy + per-run facts.
-    local prompt_file
-    prompt_file="$(mktemp "${TMPDIR:-/tmp}/cheap-worker-prompt.XXXXXX")"
-    trap 'rm -f "$prompt_file"' EXIT
+    RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+    RUN_STARTED_EPOCH="$(date +%s)"
+
+    if [[ "$dry_run" -eq 1 ]]; then
+        printf 'run-worker (dry-run)\n'
+        printf '  project root : %s\n' "$project_root"
+        printf '  task         : %s (mode=%s)\n' "$task_id" "$mode"
+        printf '  session title: %s\n' "$session_title"
+        printf '  agent        : %s\n' "$OPENCODE_AGENT"
+        printf '  baseline     : %s\n' "${baseline:-<none>}"
+        printf '  dirty files  : %s\n' "$(printf '%s\n' "$dirty" | grep -c . || true)"
+        printf '  run id       : %s\n' "$RUN_ID"
+        printf '  opencode     : %s\n' "$opencode_version"
+        printf '  review       : %s\n' "$has_review"
+        printf '  command      : opencode run --agent %s --format json --title %s  (cwd=%s)\n' "$OPENCODE_AGENT" "$session_title" "$project_root"
+        exit 0
+    fi
+
+    # --- single-run lock (H03) -------------------------------------------------
+    LOCK_DIR="$agent_dir/.worker.lock"
+    acquire_lock() {
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            printf 'pid=%s\nrun_id=%s\ntask_id=%s\nmode=%s\nstarted_at=%s\n' \
+                "$$" "$RUN_ID" "$task_id" "$mode" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK_DIR/info"
+            LOCK_OWNED=1
+            return 0
+        fi
+        local lpid="" linfo=""
+        if [[ -f "$LOCK_DIR/info" ]]; then
+            linfo="$(tr '\n' ' ' <"$LOCK_DIR/info")"
+            lpid="$(awk -F= '/^pid=/{print $2}' "$LOCK_DIR/info" | head -1)"
+        fi
+        if [[ -n "$lpid" ]] && kill -0 "$lpid" 2>/dev/null; then
+            printf 'run-worker: another worker is already running for this project (pid %s; %s)\n' "$lpid" "$linfo" >&2
+            exit 7
+        fi
+        printf 'run-worker: stale lock (pid %s not running); moving it aside\n' "${lpid:-unknown}" >&2
+        local stale="$project_root/.agent/history/attempts/stale-locks/$(date -u '+%Y%m%dT%H%M%SZ')-${lpid:-unknown}"
+        mkdir -p "$stale" && mv "$LOCK_DIR" "$stale/" || die "cannot move stale lock"
+        mkdir "$LOCK_DIR" 2>/dev/null || { printf 'run-worker: another worker is already running for this project\n' >&2; exit 7; }
+        printf 'pid=%s\nrun_id=%s\ntask_id=%s\nmode=%s\nstarted_at=%s\n' \
+            "$$" "$RUN_ID" "$task_id" "$mode" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK_DIR/info"
+        LOCK_OWNED=1
+    }
+    acquire_lock
+    trap 'release_lock; exit 130' INT TERM
+
+    # --- quarantine previous run evidence (H01) --------------------------------
+    local prev_run=""
+    if [[ -f "$agent_dir/STATE.json" ]]; then
+        prev_run="$(jq -r '.run_id // empty' "$agent_dir/STATE.json" 2>/dev/null || true)"
+    fi
+    for f in RESULT.md ESCALATION.md BASELINE.md; do
+        if [[ -s "$agent_dir/$f" ]]; then
+            local dest="$project_root/.agent/history/attempts/${task_id}/${prev_run:-prev-$(date -u '+%Y%m%dT%H%M%SZ')}"
+            mkdir -p "$dest" && mv "$agent_dir/$f" "$dest/$f"
+            printf 'run-worker: quarantined previous %s -> %s\n' "$f" "$dest"
+        fi
+    done
+
+    # --- baseline evidence (M01) ------------------------------------------------
+    {
+        printf '# Baseline evidence (before run %s)\n\n' "$RUN_ID"
+        printf -- '- task: %s\n' "$task_id"
+        printf -- '- mode: %s\n' "$mode"
+        printf -- '- HEAD: %s\n' "${baseline:-<no git>}"
+        printf -- '- allow-dirty: %s\n\n' "$allow_dirty"
+        printf '## git status --porcelain (tracked + untracked)\n\n```\n'
+        git -C "$project_root" status --porcelain=v1 --untracked-files=all 2>/dev/null || true
+        printf '```\n\n## git diff --stat (unstaged)\n\n```\n'
+        git -C "$project_root" diff --stat 2>/dev/null || true
+        printf '```\n\n## git diff --cached --stat (staged)\n\n```\n'
+        git -C "$project_root" diff --cached --stat 2>/dev/null || true
+        printf '```\n'
+    } >"$agent_dir/BASELINE.md"
+
+    local log_file="$agent_dir/logs/worker-${RUN_ID}-${task_id}.jsonl"
+    local started_at
+    started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+    printf 'run-worker: task=%s mode=%s run=%s\n' "$task_id" "$mode" "$RUN_ID"
+    printf 'run-worker: session title=%s\n' "$session_title"
+    printf 'run-worker: project=%s\n' "$project_root"
+    printf 'run-worker: baseline=%s (dirty files before run: %s)\n' "${baseline:-<none>}" "$(printf '%s\n' "$dirty" | grep -c . || true)"
+    printf 'run-worker: log=%s\n' "$log_file"
+    printf 'run-worker: model=OpenCode default (not passed explicitly)\n'
+
+    # Pre-write STATE.json so an interrupted run is still resumable.
+    jq -n \
+        --arg task_id "$task_id" \
+        --arg mode "$mode" \
+        --arg run_id "$RUN_ID" \
+        --arg project_root "$project_root" \
+        --arg baseline_commit "$baseline" \
+        --arg opencode_version "$opencode_version" \
+        --arg started_at "$started_at" \
+        --arg log_file "$log_file" \
+        --argjson dirty_count "$(printf '%s\n' "$dirty" | grep -c . || true)" \
+        '{task_id: $task_id, mode: $mode, run_id: $run_id, status: "running",
+          project_root: $project_root, baseline_commit: $baseline_commit,
+          baseline_dirty_count: $dirty_count, opencode_version: $opencode_version,
+          session_id: "", started_at: $started_at, finished_at: "",
+          last_result: "", log_file: $log_file}' >"$agent_dir/STATE.json"
+
+    # --- run the worker ---------------------------------------------------------
+    # Non-interactive run on the shared background service (never --standalone),
+    # one session per Task, with cwd pinned to the project root (H02).
+    local rc=0
     {
         cat "$sk_root/references/worker-prompt.md"
         printf '\n## Working Contract (embedded)\n\n'
@@ -195,56 +413,10 @@ embedded above - do not try to open the skill directory yourself).
 
 Begin now. Read the Task, follow the contract, write exactly one report file, stop.
 EOF
-    } >"$prompt_file"
-
-    if [[ "$dry_run" -eq 1 ]]; then
-        printf 'run-worker (dry-run)\n'
-        printf '  project root : %s\n' "$project_root"
-        printf '  task         : %s (mode=%s)\n' "$task_id" "$mode"
-        printf '  session title: %s\n' "$session_title"
-        printf '  agent        : %s\n' "$OPENCODE_AGENT"
-        printf '  baseline     : %s\n' "${baseline:-<none>}"
-        printf '  opencode     : %s\n' "$opencode_version"
-        printf '  review       : %s\n' "$has_review"
-        printf '  prompt file  : %s\n' "$prompt_file"
-        printf '  command      : opencode run --agent %s --format json --title %s\n' "$OPENCODE_AGENT" "$session_title"
-        exit 0
-    fi
-
-    local started_at
-    started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    local log_file="$agent_dir/logs/worker-$(date -u '+%Y%m%dT%H%M%SZ')-${task_id}.jsonl"
-
-    printf 'run-worker: task=%s mode=%s\n' "$task_id" "$mode"
-    printf 'run-worker: session title=%s\n' "$session_title"
-    printf 'run-worker: project=%s\n' "$project_root"
-    printf 'run-worker: baseline=%s\n' "${baseline:-<none>}"
-    printf 'run-worker: log=%s\n' "$log_file"
-    printf 'run-worker: model=OpenCode default (not passed explicitly)\n'
-
-    # Pre-write STATE.json so an interrupted run is still resumable.
-    jq -n \
-        --arg task_id "$task_id" \
-        --arg mode "$mode" \
-        --arg project_root "$project_root" \
-        --arg baseline_commit "$baseline" \
-        --arg opencode_version "$opencode_version" \
-        --arg started_at "$started_at" \
-        --arg log_file "$log_file" \
-        '{task_id: $task_id, mode: $mode, status: "running",
-          project_root: $project_root, baseline_commit: $baseline_commit,
-          opencode_version: $opencode_version, session_id: "",
-          started_at: $started_at, finished_at: "", last_result: "",
-          attempt_count: 0, log_file: $log_file}' >"$agent_dir/STATE.json"
-
-    # Non-interactive run on the shared background service (never --standalone),
-    # one session per Task, structured JSON event stream to the log.
-    local rc=0
-    opencode run \
-        --agent "$OPENCODE_AGENT" \
-        --format json \
-        --title "$session_title" \
-        <"$prompt_file" >"$log_file" 2>&1 || rc=$?
+    } | ( cd "$project_root" && opencode run \
+            --agent "$OPENCODE_AGENT" \
+            --format json \
+            --title "$session_title" ) >"$log_file" 2>&1 || rc=$?
 
     local session_id=""
     session_id="$(jq -r 'select(.sessionID) | .sessionID' "$log_file" 2>/dev/null | head -1 || true)"
@@ -252,31 +424,42 @@ EOF
     local finished_at
     finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-    local has_result=0 has_escalation=0
-    [[ -s "$agent_dir/RESULT.md" ]] && has_result=1
-    [[ -s "$agent_dir/ESCALATION.md" ]] && has_escalation=1
+    # --- validate reports (H01) --------------------------------------------------
+    local result_file="$agent_dir/RESULT.md" escalation_file="$agent_dir/ESCALATION.md"
+    local result_state="none" escalation_state="none" invalid_reason=""
 
-    local status="failed"
-    local last_result="none"
-    if [[ "$has_result" -eq 1 ]]; then
-        status="result_written"
-        last_result="RESULT.md"
+    if [[ -s "$result_file" ]]; then
+        if valid_result "$result_file"; then result_state="valid"; else result_state="invalid";
+            invalid_reason="RESULT.md is stale, malformed, or for another Task"; fi
     fi
-    if [[ "$has_escalation" -eq 1 ]]; then
-        status="escalated"
-        last_result="ESCALATION.md"
+    if [[ -s "$escalation_file" ]]; then
+        if valid_escalation "$escalation_file"; then escalation_state="valid"; else escalation_state="invalid";
+            [[ -n "$invalid_reason" ]] || invalid_reason="ESCALATION.md is stale, malformed, or for another Task"; fi
     fi
-    if [[ "$has_result" -eq 1 && "$has_escalation" -eq 1 ]]; then
-        status="inconsistent"
-        last_result="RESULT.md+ESCALATION.md"
+
+    local status="failed" last_result="none"
+    if [[ "$result_state" == "valid" ]]; then status="result_written"; last_result="RESULT.md"; fi
+    if [[ "$escalation_state" == "valid" ]]; then status="escalated"; last_result="ESCALATION.md"; fi
+    if [[ "$result_state" == "valid" && "$escalation_state" == "valid" ]]; then
+        status="inconsistent"; last_result="RESULT.md+ESCALATION.md"
     fi
-    if [[ "$rc" -ne 0 && "$status" = "failed" ]]; then
-        status="opencode_failed"
+    if [[ "$result_state" == "invalid" || "$escalation_state" == "invalid" ]]; then
+        status="invalid_report"; last_result="invalid"
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        case "$status" in
+            result_written) status="result_after_failure" ;;
+            escalated)      status="escalated" ;;
+            inconsistent)   status="inconsistent" ;;
+            invalid_report) status="invalid_report" ;;
+            *)              status="opencode_failed" ;;
+        esac
     fi
 
     jq -n \
         --arg task_id "$task_id" \
         --arg mode "$mode" \
+        --arg run_id "$RUN_ID" \
         --arg project_root "$project_root" \
         --arg baseline_commit "$baseline" \
         --arg opencode_version "$opencode_version" \
@@ -286,27 +469,38 @@ EOF
         --arg status "$status" \
         --arg last_result "$last_result" \
         --arg log_file "$log_file" \
+        --arg invalid_reason "$invalid_reason" \
         --argjson rc "$rc" \
-        '{task_id: $task_id, mode: $mode, status: $status,
+        --argjson dirty_count "$(printf '%s\n' "$dirty" | grep -c . || true)" \
+        '{task_id: $task_id, mode: $mode, run_id: $run_id, status: $status,
           project_root: $project_root, baseline_commit: $baseline_commit,
-          opencode_version: $opencode_version, session_id: $session_id,
-          started_at: $started_at, finished_at: $finished_at,
-          last_result: $last_result, opencode_exit_code: $rc, log_file: $log_file}' >"$agent_dir/STATE.json"
+          baseline_dirty_count: $dirty_count, opencode_version: $opencode_version,
+          session_id: $session_id, started_at: $started_at, finished_at: $finished_at,
+          last_result: $last_result, invalid_reason: $invalid_reason,
+          opencode_exit_code: $rc, log_file: $log_file}' >"$agent_dir/STATE.json"
 
     printf 'run-worker: opencode exit=%s session=%s\n' "$rc" "${session_id:-<none>}"
     printf 'run-worker: result=%s\n' "$status"
 
-    if [[ "$has_result" -eq 1 && "$has_escalation" -eq 1 ]]; then
-        printf 'run-worker: ERROR both RESULT.md and ESCALATION.md exist; Supervisor must resolve\n' >&2
+    release_lock
+
+    if [[ "$result_state" == "valid" && "$escalation_state" == "valid" ]]; then
+        printf 'run-worker: ERROR both RESULT.md and ESCALATION.md are valid for this Task; Supervisor must resolve\n' >&2
         exit 4
     fi
-    if [[ "$has_escalation" -eq 1 ]]; then
+    if [[ "$result_state" == "invalid" || "$escalation_state" == "invalid" ]]; then
+        printf 'run-worker: ERROR %s\n' "$invalid_reason" >&2
+        printf 'run-worker: the file was left in place for inspection; Supervisor must resolve\n' >&2
+        exit 6
+    fi
+    if [[ "$escalation_state" == "valid" ]]; then
         printf 'run-worker: ESCALATION.md written; stopping. Supervisor decision required.\n' >&2
         exit 10
     fi
-    if [[ "$has_result" -eq 1 ]]; then
+    if [[ "$result_state" == "valid" ]]; then
         if [[ "$rc" -ne 0 ]]; then
-            printf 'run-worker: warning: opencode exited %s but RESULT.md was written; review it\n' "$rc" >&2
+            printf 'run-worker: WARNING opencode exited %s but a valid RESULT.md was written; review before accepting\n' "$rc" >&2
+            exit 5
         fi
         printf '%s\n' 'run-worker: RESULT.md written.'
         exit 0

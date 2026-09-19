@@ -22,12 +22,15 @@ case "${1:-all}" in
     b) tests=("$SMOKE_DIR/run-b-investigate.sh") ;;
     c) tests=("$SMOKE_DIR/run-c-escalation.sh") ;;
     d) tests=("$SMOKE_DIR/run-d-phase-runner.sh") ;;
+    e) tests=("$SMOKE_DIR/run-e-resume.sh") ;;
     all) tests=(
             "$SMOKE_DIR/run-a-single-task.sh"
             "$SMOKE_DIR/run-b-investigate.sh"
             "$SMOKE_DIR/run-c-escalation.sh"
             "$SMOKE_DIR/run-d-phase-runner.sh"
-        ) ;;    -h|--help) usage; exit 0 ;;
+            "$SMOKE_DIR/run-e-resume.sh"
+        ) ;;
+    -h|--help) usage; exit 0 ;;
     *) printf 'unknown test selection: %s\n' "$1" >&2; usage; exit 1 ;;
 esac
 

@@ -99,44 +99,60 @@ Details and sizing rules: `references/phase-planning.md`.
 
 ### 2. Task loop (repeat until the queue is done)
 
-10. Take the next `pending` Task. Mark it `in_progress` in `TASK_QUEUE.json` and
-    `RUN_STATE.json`.
-11. Render it into `.agent/current/TASK.md` using the TASK contract (keep a copy in
-    `.agent/phases/<PHASE>/history/` for traceability).
-12. Record the git baseline: `git status`, `git rev-parse HEAD`.
-13. Hand off the Task to the worker - exactly one Task at a time - in one of two modes:
-    - **Background + wake-up (default)**:
-      `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --mode <mode> --task-id <id> --title "<queue title>"`
+10. Render the next `pending` Task into `.agent/current/TASK.md` using the TASK
+    contract (keep a copy in `.agent/phases/<PHASE>/history/`), then mark it
+    `in_progress` in `TASK_QUEUE.json` and `RUN_STATE.json`. Render first, mark
+    second: an interruption then leaves a Task that is still `pending`, not a
+    queue entry pointing at a template. Write both JSON files via temp file +
+    rename.
+11. Record the git baseline: `git status`, `git rev-parse HEAD`. If the previous
+    accepted Task was not committed (the normal case: the worker never commits),
+    pass `--allow-dirty`; `run-worker.sh` records the pre-run dirty evidence in
+    `.agent/current/BASELINE.md`, and the review must compare against it so that
+    old changes are not mistaken for this Task's diff.
+12. Hand off the Task to the worker - exactly one Task at a time - in one of two modes:
+    - **Background + wake-up** (use when a target is available):
+      `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --mode <mode> --task-id <id> --title "<queue title>" [--allow-dirty]`
       The command returns immediately. End your turn and wait. When the worker
-      finishes, `codex queue` delivers a short message into THIS session and you
-      wake up to review it. The session is auto-detected from Codex's own local
-      history; pass `--codex-thread <name-or-id>` only when the detection picks the
-      wrong session (e.g. several Codex sessions are active at once).
-    - **Blocking (fallback: the human wants to watch live)**:
-      `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode> --task-id <id> --title "<queue title>"`
+      finishes, `codex queue` delivers a short message into this session and you
+      wake up to review it.
+      The session is only auto-detected when the detection is unambiguous; on
+      `exit 13` (ambiguous) or `exit 14` (none found) the script refuses to guess:
+      rerun with an explicit `--codex-thread <id-or-name>` or fall back to blocking.
+    - **Blocking (default fallback, and when the human wants to watch live)**:
+      `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode> --task-id <id> --title "<queue title>" [--allow-dirty]`
       This blocks until the worker finishes, then continue in the same turn.
     Model choice belongs to OpenCode's own configuration; neither script passes
     `--model` and neither starts a private server. One Task = one OpenCode session,
-    visible in OpenCode Desktop. Worker exit codes: `0` RESULT, `10` ESCALATION,
-    `2/3/4` plumbing failures.
-14. Review the result per `references/task-review.md`: read `TASK.md`, `RESULT.md`,
-    `git diff --stat`/`git diff`, test output, plus only the files that changed.
-15. Decide exactly one of:
-    - **ACCEPT** -> mark Task `done`; `archive-task.sh --yes --decision ACCEPT`;
-      select next pending Task; continue without asking the human.
+    visible in OpenCode Desktop.
+    Worker exit codes: `0` fresh valid RESULT, `5` RESULT but opencode failed
+    (review carefully), `10` ESCALATION, `6` stale/mismatched report, `7` another
+    worker is running, `2/3/4` plumbing failures. The script validates TASK.md
+    (required sections, real Task ID, matching `--mode`/`--task-id`) and quarantines
+    previous reports to `.agent/history/attempts/<task>/` before each run.
+13. Review the result per `references/task-review.md`: read `TASK.md`, `RESULT.md`,
+    `git diff --stat`/`git diff`, `BASELINE.md`, test output, plus only the files
+    that changed. `check-state.sh` prints the cross-file consistency verdict when
+    something looks off.
+14. Decide exactly one of:
+    - **ACCEPT** -> `archive-task.sh --yes --decision ACCEPT` first, then mark the
+      Task `done` in the queue (never `done` without an archive); select the next
+      pending Task; continue without asking the human.
     - **REWORK** -> write `.agent/current/REVIEW.md` with concrete required
-      corrections, keep the Task `in_progress`, re-run steps 13-14.
+      corrections (same Task ID), keep the Task `in_progress`, re-run steps 12-13.
     - **ESCALATE** -> the Supervisor resolves technical/architectural blockers
       itself (adjust plan, split Task, add context, change approach). Ask the human
       only for genuine product decisions. Record the decision in the queue history.
-16. If new evidence invalidates a future Task, revise the queue now and append the
+15. If new evidence invalidates a future Task, revise the queue now and append the
     reason to `TASK_QUEUE.json` -> `adjustments`. Never silently drop a Task.
+16. If `run-worker.sh` returns `7`, another worker is running: do not start a
+    second one. Run `check-state.sh`, wait for the report or wake-up, then review.
 
 ### 3. Phase completion
 
 17. All Tasks `done`? Run the Phase Acceptance Criteria from `PHASE.md` and the
     Required Phase Verification (full test suite, build, lint, smoke, manual checks
-    that don't need the human).
+    that don't need the human). This is a real run, not a status flip.
 18. Fix only via new Tasks - never by skipping verification.
 19. Write a short Phase summary into `PHASE.md` (`## Result`) and archive the phase
     in `TASK_QUEUE.json` (`status: done`).
@@ -154,14 +170,21 @@ Phase, no "helpful" extra Tasks. Answer questions, fix defects the human reports
 
 ## Resume
 
-Any time a session starts, before anything else: read `.agent/RUN_STATE.json` and
-`.agent/phases/<phase>/TASK_QUEUE.json`. They are the truth.
+Any time a session starts, before anything else:
 
-- One Task `in_progress` and a report exists -> go to review (step 14).
-- One Task `in_progress` and no report -> re-run the worker for that Task.
-- All Tasks `done` and status `running` -> go to phase completion (step 17).
-- `awaiting_human_qa` -> do not run the worker; report status and wait.
-- No `.agent/` at all -> fresh start from step 0.
+1. Run `~/.agents/skills/cheap-worker/scripts/check-state.sh` in the project. It
+   cross-checks the lock, queue, `RUN_STATE.json`, the current TASK/STATE and the
+   reports, and prints a single verdict. Trust the verdict before acting.
+2. Read `.agent/RUN_STATE.json` and `.agent/phases/<phase>/TASK_QUEUE.json`.
+
+| check-state verdict | action |
+| --- | --- |
+| `WORKER_RUNNING` | do not start another worker; wait for the report or the `[worker-notify]` message |
+| `INCONSISTENT` | fix the listed issues first (rewrite TASK.md from the saved definition, archive missing done Tasks, resolve double reports) |
+| `REVIEW_OR_RESUME` | report ready -> review (step 13); no report -> re-run the same Task (`run-worker.sh --allow-dirty`) |
+| `NEXT` | hand off the pending Task (step 10) |
+| `PHASE_COMPLETE` | run the phase final review (step 17), then stop at the checkpoint |
+| `EMPTY` | no queue: start from phase intake |
 
 Never restart a completed Task. Never re-plan from scratch if the queue is valid;
 only revise pending Tasks with recorded reasons.

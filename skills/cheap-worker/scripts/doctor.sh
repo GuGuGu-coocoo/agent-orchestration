@@ -119,7 +119,7 @@ main() {
         [[ -f "$sk/references/worker-prompt.md" ]]           && ok "references/worker-prompt.md"       || bad "references/worker-prompt.md missing"
         [[ -f "$sk/references/safety-policy.md" ]]           && ok "references/safety-policy.md"       || bad "references/safety-policy.md missing"
         [[ -f "$sk/references/escalation-policy.md" ]]       && ok "references/escalation-policy.md"   || bad "references/escalation-policy.md missing"
-        for s in doctor.sh run-worker.sh worker-notify.sh status.sh collect-result.sh archive-task.sh; do
+        for s in doctor.sh run-worker.sh worker-notify.sh status.sh check-state.sh collect-result.sh archive-task.sh; do
             [[ -f "$sk/scripts/$s" ]] && ok "scripts/$s" || bad "scripts/$s missing"
         done
         if [[ "$sk" == "$HOME/.agents/skills/cheap-worker" ]]; then

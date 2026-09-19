@@ -76,7 +76,24 @@ Priority: **Correctness > minimal change > verifiability > elegance.**
 - When to stop and escalate: `references/escalation-policy.md`
 - Default safety boundaries: `references/safety-policy.md`
 - Scripts: `scripts/doctor.sh`, `scripts/run-worker.sh`, `scripts/worker-notify.sh`,
-  `scripts/status.sh`, `scripts/collect-result.sh`, `scripts/archive-task.sh`
+  `scripts/status.sh`, `scripts/check-state.sh`, `scripts/collect-result.sh`,
+  `scripts/archive-task.sh`
+
+## Safety behaviours (hard-enforced)
+
+- A project-level lock refuses a second concurrent worker (`exit 7`); stale locks
+  are moved to `.agent/history/attempts/stale-locks/`.
+- Previous `RESULT.md`/`ESCALATION.md`/`BASELINE.md` are quarantined to
+  `.agent/history/attempts/<task>/` before every run, so a stale report can never
+  be mistaken for the current run's output.
+- The report must be fresh and carry this Task ID; `RESULT.md` must say `DONE`.
+  Anything else exits `6` (invalid report) or `5` (valid RESULT but opencode
+  failed) instead of claiming success.
+- `TASK.md` is validated (required sections, real Task ID, no placeholders) and
+  `--task-id`/`--mode` must match the file.
+- `--allow-dirty` records the pre-run tracked/staged/untracked evidence in
+  `.agent/current/BASELINE.md`.
+- opencode always runs with `cwd` = project root.
 
 ## Background handoff (worker-notify.sh)
 

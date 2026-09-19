@@ -21,12 +21,14 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_ROOT="${HOME}/.agents/skills"
+DEFAULT_TARGET="$TARGET_ROOT"
 SKILLS=("cheap-worker" "phase-runner")
 MARKER=".installed-by-agent-orchestration"
 
 CONFIRMED=0
 DRY_RUN=0
 FORCE=0
+TARGET_EXPLICIT=0
 
 step() { printf '[uninstall-skills] %s\n' "$*"; }
 die()  { printf '[uninstall-skills] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -38,11 +40,16 @@ while [[ $# -gt 0 ]]; do
         --yes|-y)  CONFIRMED=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --force)   FORCE=1; shift ;;
-        --target)  [[ $# -ge 2 ]] || die "--target requires a directory"; TARGET_ROOT="${2:?}"; shift 2 ;;
+        --target)  [[ $# -ge 2 ]] || die "--target requires a directory"; TARGET_ROOT="${2:?}"; TARGET_EXPLICIT=1; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *)         die "unknown argument '$1' (try --help)" ;;
     esac
 done
+
+# The managed target is fixed; --target exists only for isolated tests.
+if [[ "$TARGET_EXPLICIT" -eq 1 && "${AGENT_ORCHESTRATION_TEST_TARGET:-0}" != "1" ]]; then
+    die "--target is a test-only mechanism (set AGENT_ORCHESTRATION_TEST_TARGET=1 to use it); the normal target is $DEFAULT_TARGET"
+fi
 
 [[ "$TARGET_ROOT" == /* ]] || die "target root must be absolute: $TARGET_ROOT"
 [[ "$TARGET_ROOT" != "/" ]] || die "refusing to operate on '/'"

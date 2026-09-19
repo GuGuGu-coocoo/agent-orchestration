@@ -130,23 +130,43 @@ to use - the script never passes `--model` and never uses `--standalone`.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | `RESULT.md` written (DONE) |
-| 10 | `ESCALATION.md` written, Supervisor decision required |
-| 1 | precondition/invocation failure |
+| 0 | fresh, valid `RESULT.md` from this run |
+| 5 | valid `RESULT.md` but opencode exited non-zero (review before accepting) |
+| 10 | valid `ESCALATION.md`, Supervisor decision required |
+| 1 | precondition failure (missing/invalid/inconsistent TASK.md, dirty tree without `--allow-dirty`) |
 | 2 | opencode failed and wrote no report |
 | 3 | opencode finished but wrote no report |
-| 4 | both reports exist (inconsistent) |
+| 4 | both reports valid (inconsistent) |
+| 6 | report is stale, malformed, or for another Task |
+| 7 | another worker is already running for this project |
+
+Safety behaviours on every run:
+
+- a project-level lock (`.agent/current/.worker.lock`) refuses a second worker;
+  a stale lock (dead pid) is moved to `.agent/history/attempts/stale-locks/`
+  before the new run
+- previous `RESULT.md`/`ESCALATION.md`/`BASELINE.md` are quarantined to
+  `.agent/history/attempts/<task>/` so a stale report can never be mistaken for
+  this run's output
+- `TASK.md` must contain the required sections (Task ID, Mode, Objective,
+  Acceptance Criteria, Required Verification, Allowed Changes, Forbidden Changes)
+  with real content; `--task-id`/`--mode` must match the file
+- `--allow-dirty` records the pre-run dirty evidence (tracked, staged, untracked)
+  into `.agent/current/BASELINE.md`, so an accepted-but-uncommitted Task is not
+  confused with the next Task's changes
+- opencode always runs with `cwd` = project root, even when invoked elsewhere
 
 Other helper scripts:
 
 ```sh
 ~/.agents/skills/cheap-worker/scripts/status.sh
+~/.agents/skills/cheap-worker/scripts/check-state.sh    # resume consistency verdict
 ~/.agents/skills/cheap-worker/scripts/collect-result.sh --diff
 ~/.agents/skills/cheap-worker/scripts/archive-task.sh --yes --decision ACCEPT
 
 # non-blocking variant: run in background and wake a Codex session when done
 ~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
-  --codex-thread "编排" --mode implement --task-id C01 --title "Add retry queue"
+  --mode implement --task-id C01 --title "Add retry queue"
 ```
 
 ## phase-runner usage
@@ -217,10 +237,11 @@ watch a Task live.
 
 Wake-up details:
 
-- The Codex session is auto-detected from Codex's own local history: the thread with
-  the most recent activity (archived threads skipped; a session rooted at this
-  project preferred). `--codex-thread <name-or-id>` overrides it; `--print-session`
-  shows what would be detected.
+- The Codex session is auto-detected **only when unambiguous** (exactly one
+  recently active, non-archived session; a unique project-cwd match decides when
+  several are recent). Ambiguity fails fast (`exit 13`) / no candidate (`exit 14`):
+  rerun with an explicit `--codex-thread <id-or-name>`, or use the blocking mode.
+  `--print-session` shows what would be detected.
 - Requires the ChatGPT/Codex desktop app to stay open **with the orchestration
   session open**: an open session can be woken; a closed or archived one cannot
   (the message waits in the queue, and the helper writes `NOTIFY_FAILED.md` with a
@@ -274,7 +295,7 @@ project has an `AGENTS.md`, the worker must read it.
 never touches real projects. See `tests/smoke/README.md`.
 
 ```sh
-tests/smoke/run-offline.sh                  # no model calls
+tests/smoke/run-offline.sh                  # no model calls (93 checks)
 tests/smoke/run-live.sh                     # all live tests (OpenCode default model)
 SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh  # keep the generated repos
 ```
@@ -311,6 +332,9 @@ Defects reported during manual QA become new Tasks with the same loop. See
   separate orchestrator daemon. Wake-up mode requires the ChatGPT/Codex desktop app
   to stay open with the orchestration session open (its daemon owns the session and
   the message queue; closed or archived sessions cannot be woken).
+- Session auto-detection reads Codex's own local state DBs. It refuses ambiguous
+  cases instead of guessing, but it is the most fragile part of the design; passing
+  an explicit session id (or using blocking mode) is always stronger.
 - `run-worker.sh` has no built-in wall-clock timeout (OpenCode's own behavior and
   the caller's timeout apply). `worker-notify.sh` solves the timeout problem by
   detaching, but it cannot prevent lid-close sleep or a manual shutdown.
@@ -320,7 +344,7 @@ Defects reported during manual QA become new Tasks with the same loop. See
   skill directory. This is deliberate: OpenCode's `external_directory` permission
   defaults to `ask`, which auto-rejects in non-interactive runs.
 - The installer's `rsync --delete` mirror mode assumes the target directory is
-  fully managed by this project (it is marked as such).
+  fully managed by this project (it is marked as such). `--target` is test-only.
 - macOS bash 3.2 compatible; not tested on Windows.
 
 ## Development rules

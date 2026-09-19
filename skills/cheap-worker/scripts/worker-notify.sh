@@ -14,17 +14,19 @@
 #   worker-notify.sh --print-message --simulate-exit 10
 #   worker-notify.sh --print-session                  # show the detected session
 #
-# The Codex session is auto-detected from Codex's own local history: the
-# orchestration session is the one running this script, i.e. the thread with the
-# most recent activity (archived threads are skipped, a session rooted at this
-# project is preferred). Override with --codex-thread when needed.
+# The Codex session is auto-detected only when the detection is unambiguous
+# (exactly one recently active, non-archived session, or a unique project-cwd
+# match). Anything ambiguous fails fast (exit 13/14): pass --codex-thread
+# <id-or-name>, or use run-worker.sh (blocking) instead. Overrides:
+# --codex-thread NAME_OR_ID, --print-session (show what would be detected).
 #
 # Options (all other options are forwarded to run-worker.sh):
-#   --codex-thread NAME    Codex session name or id (default: auto-detect)
+#   --codex-thread NAME    Codex session name or id (default: fail-safe detect)
 #   --no-notify            run the worker but do not wake Codex
 #   --foreground           do not detach (default: detached; use for tests/debug)
 #   --print-message        dry-run: print the wake-up message and exit
 #   --print-session        print the detected session (id, title, cwd) and exit
+#                          (0 = unique, 3 = ambiguous, 1 = none)
 #   --simulate-exit N      exit code to use with --print-message (0|10|other)
 #   --message-prefix STR   optional prefix for the wake-up message
 #   --codex-bin PATH       codex CLI path (default: auto-detect)
@@ -34,7 +36,8 @@
 #              WORKER_NOTIFY_RUN_WORKER (default: sibling run-worker.sh)
 #
 # Exit codes: the worker's exit code (foreground/print mode);
-#             0 when the background launch succeeded.
+#             0 when the background launch succeeded;
+#             13 ambiguous session, 14 no session found (refusing to guess).
 #
 # This script never commits, pushes, merges or deletes anything.
 
@@ -98,14 +101,14 @@ resolve_root() {
     local given
     given="$(forward_value --root)"
     if [[ -n "$given" ]]; then
-        cd "$given" && pwd
+        cd "$given" && pwd -P
         return 0
     fi
     if git rev-parse --show-toplevel >/dev/null 2>&1; then
         git rev-parse --show-toplevel
         return 0
     fi
-    pwd
+    pwd -P
 }
 
 read_task_id() {
@@ -118,9 +121,11 @@ read_task_id() {
 }
 
 # --- Codex session auto-discovery ---------------------------------------------
-# The orchestration session is the one running this script, so it is the Codex
-# thread with the most recent activity in Codex's own local history. Reading that
-# is what lets the human just say "use $phase-runner ..." without naming a session.
+# Auto-discovery is deliberately fail-safe: it only returns a session when there
+# is exactly ONE plausible candidate (recent activity, not archived; when several
+# are recent, a unique project-cwd match decides). Anything ambiguous returns 3
+# and the caller must use an explicit --codex-thread or blocking mode instead of
+# guessing another session.
 state_db_path() {
     ls -t "$CODEX_HOME_DIR"/state_*.sqlite 2>/dev/null | head -1
 }
@@ -130,7 +135,7 @@ history_db_path() {
 }
 
 thread_row() {
-    # thread_row <id> -> "title|cwd|updated" (or empty)
+    # thread_row <id> -> "title|cwd|updated"
     local state="$1" id="$2"
     [[ -n "$state" ]] || return 0
     sqlite3 -separator '|' "$state" \
@@ -138,38 +143,59 @@ thread_row() {
         2>/dev/null || true
 }
 
+# discover_thread -> prints the session id (exit 0);
+# exit 3 = ambiguous (candidates on stderr), exit 1 = none.
 discover_thread() {
-    local hist state candidates id arch row fallback=""
+    local hist state now_ms window_ms id arch last row title cwd
     command -v sqlite3 >/dev/null 2>&1 || return 1
     hist="$(history_db_path)"
     state="$(state_db_path)"
     [[ -n "$hist" ]] || return 1
-    candidates="$(sqlite3 "$hist" \
-        "SELECT thread_id FROM thread_items GROUP BY thread_id ORDER BY max(created_at_ms) DESC LIMIT 8;" \
+    now_ms="$(printf '%s' "$(date +%s)000")"
+    window_ms=180000
+
+    local rows=""
+    rows="$(sqlite3 -separator '|' "$hist" \
+        "SELECT thread_id, max(created_at_ms) FROM thread_items GROUP BY thread_id ORDER BY max(created_at_ms) DESC LIMIT 50;" \
         2>/dev/null || true)"
-    [[ -n "$candidates" ]] || return 1
-    for id in $candidates; do
-        [[ -n "$id" ]] || continue
+    [[ -n "$rows" ]] || return 1
+
+    local recent="" recent_cwd=""
+    while IFS='|' read -r id last; do
+        [[ -n "$id" && -n "$last" ]] || continue
+        [[ "$last" =~ ^[0-9]+$ ]] || continue
+        (( last >= now_ms - window_ms )) || continue
         arch=""
-        row=""
         if [[ -n "$state" ]]; then
             arch="$(sqlite3 "$state" "SELECT archived FROM threads WHERE id='$id' LIMIT 1;" 2>/dev/null || true)"
         fi
         [[ "$arch" == "1" ]] && continue
         row="$(thread_row "$state" "$id")"
-        if [[ -n "$state" ]]; then
-            local cwd="${row#*|}"; cwd="${cwd%%|*}"
-            if [[ -n "$cwd" && ( "$ROOT" == "$cwd" || "$ROOT" == "$cwd"/* \
-                || "$ROOT_PHYS" == "$cwd" || "$ROOT_PHYS" == "$cwd"/* ) ]]; then
-                printf '%s' "$id"
-                return 0
-            fi
+        title="${row%%|*}"; row="${row#*|}"; cwd="${row%%|*}"
+        recent="${recent}${id}|${title}|${cwd}"$'\n'
+        if [[ -n "$cwd" && ( "$ROOT" == "$cwd" || "$ROOT" == "$cwd"/* \
+            || "$ROOT_PHYS" == "$cwd" || "$ROOT_PHYS" == "$cwd"/* ) ]]; then
+            recent_cwd="${recent_cwd}${id}|${title}|${cwd}"$'\n'
         fi
-        [[ -z "$fallback" ]] && fallback="$id"
-    done
-    if [[ -n "$fallback" ]]; then
-        printf '%s' "$fallback"
+    done <<EOF2
+$rows
+EOF2
+
+    local n_recent n_cwd
+    n_recent="$(printf '%s' "$recent" | grep -c . || true)"
+    n_cwd="$(printf '%s' "$recent_cwd" | grep -c . || true)"
+
+    if [[ "$n_recent" -eq 1 ]]; then
+        printf '%s' "$recent" | head -1 | cut -d'|' -f1
         return 0
+    fi
+    if [[ "$n_recent" -gt 1 ]]; then
+        if [[ "$n_cwd" -eq 1 ]]; then
+            printf '%s' "$recent_cwd" | head -1 | cut -d'|' -f1
+            return 0
+        fi
+        printf '%s' "$recent" | grep . >&2 || true
+        return 3
     fi
     return 1
 }
@@ -179,14 +205,27 @@ ROOT_PHYS="$(cd "$ROOT" 2>/dev/null && pwd -P || printf '%s' "$ROOT")"
 TASK_ID="$(read_task_id "$ROOT")"
 
 if [[ "$PRINT_SESSION" -eq 1 ]]; then
-    if DISCOVERED="$(discover_thread)"; then
-        STATE_DB="$(state_db_path)"
-        ROW="$(thread_row "$STATE_DB" "$DISCOVERED")"
-        printf '%s\t%s\n' "$DISCOVERED" "${ROW:-<no thread metadata>}"
-        exit 0
-    fi
-    printf 'worker-notify: no Codex session could be discovered in %s\n' "$CODEX_HOME_DIR" >&2
-    exit 1
+    set +e
+    DISCOVERED="$(discover_thread 2>/dev/null)"
+    D_RC=$?
+    set -e
+    case "$D_RC" in
+        0)
+            STATE_DB="$(state_db_path)"
+            ROW="$(thread_row "$STATE_DB" "$DISCOVERED")"
+            printf '%s\t%s\n' "$DISCOVERED" "${ROW:-<no thread metadata>}"
+            exit 0
+            ;;
+        3)
+            printf 'ambiguous: more than one recently active Codex session\n' >&2
+            discover_thread 2>&1 >/dev/null || true
+            exit 3
+            ;;
+        *)
+            printf 'none: no recently active Codex session found in %s\n' "$CODEX_HOME_DIR" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 # --- wake-up message ----------------------------------------------------------
@@ -214,14 +253,28 @@ if [[ "$PRINT_MESSAGE" -eq 1 ]]; then
     exit 0
 fi
 
-# --- resolve the Codex session (explicit name/id or auto-discovery) -----------
+# --- resolve the Codex session (explicit name/id, else fail-safe discovery) ---
 if [[ "$NO_NOTIFY" -eq 0 && -z "$CODEX_THREAD" ]]; then
-    if CODEX_THREAD="$(discover_thread)"; then
-        printf 'worker-notify: session auto-detected: %s\n' "$CODEX_THREAD"
-    else
-        CODEX_THREAD=""
-        printf 'worker-notify: WARNING no Codex session could be auto-detected; the result will be saved to NOTIFY_FAILED.md\n' >&2
-    fi
+    set +e
+    CODEX_THREAD="$(discover_thread 2>/dev/null)"
+    D_RC=$?
+    set -e
+    case "$D_RC" in
+        0)
+            printf 'worker-notify: session auto-detected: %s\n' "$CODEX_THREAD"
+            ;;
+        3)
+            printf 'worker-notify: ERROR more than one recently active Codex session; refusing to guess:\n' >&2
+            discover_thread 2>&1 >/dev/null || true
+            printf 'worker-notify: pass --codex-thread <id-or-name>, or use run-worker.sh (blocking mode)\n' >&2
+            exit 13
+            ;;
+        *)
+            printf 'worker-notify: ERROR no recently active Codex session found; refusing to guess\n' >&2
+            printf 'worker-notify: pass --codex-thread <id-or-name>, or use run-worker.sh (blocking mode)\n' >&2
+            exit 14
+            ;;
+    esac
 fi
 
 # --- detach (default): re-exec in the background and return immediately -------
@@ -298,17 +351,10 @@ notify_failed() {
 
 MESSAGE="$(compose_message "$worker_rc" "$TASK_ID" "$ROOT")"
 
-# Last chance: if the session was not resolved at launch (e.g. discovery failed),
-# try again now - the launching session has been active since.
+# No guessing at wake time: without a resolved target the message is preserved.
 if [[ -z "$CODEX_THREAD" ]]; then
-    if CODEX_THREAD="$(discover_thread)"; then
-        printf 'worker-notify: session auto-detected at wake time: %s\n' "$CODEX_THREAD"
-    fi
-fi
-
-if [[ -z "$CODEX_THREAD" ]]; then
-    notify_failed "$MESSAGE" "no Codex session could be auto-detected" \
-        "pass --codex-thread <name or id>, or keep the orchestration session open in the app"
+    notify_failed "$MESSAGE" "no Codex session target was resolved" \
+        "pass --codex-thread <name or id>, or use run-worker.sh (blocking mode)"
     exit "$worker_rc"
 fi
 

@@ -114,10 +114,11 @@ check "RUN_STATE is awaiting_human_qa" bash -c "jq -e '.status == \"awaiting_hum
 check "RUN_STATE current_phase is A" bash -c "jq -e '.current_phase == \"A\"' '$repo/.agent/RUN_STATE.json' >/dev/null"
 check "no ESCALATION.md remains" bash -c "! test -s '$repo/.agent/current/ESCALATION.md'"
 
+check "phase review really ran" bash -c "grep -q 'PASS (exit 0)' '$repo/.agent/phases/A/PHASE_REVIEW.md'"
+check "PHASE.md has a Result section" bash -c "grep -q '^## Result' '$repo/.agent/phases/A/PHASE.md'"
+
 archived_count="$(ls -d "$repo"/.agent/history/*A0[23] 2>/dev/null | wc -l | tr -d ' ')"
-expected_archives=2
-[[ "$REWORK_MODE" -eq 1 ]] && expected_archives=3  # A02 archived twice in rework mode
-check_eq "A02 and A03 archives recorded" "$expected_archives" "$archived_count"
+check_eq "A02 and A03 archived once each" "2" "$archived_count"
 check "A02 archive recorded ACCEPT" grep -q 'Decision: ACCEPT' "$repo"/.agent/history/*A02/REVIEW_DECISION.md
 check "A03 archive recorded ACCEPT" grep -q 'Decision: ACCEPT' "$repo"/.agent/history/*A03/REVIEW_DECISION.md
 check "A01 was never re-run (no worker log for it)" bash -c "! ls '$repo'/.agent/history/A01/logs/worker-*.jsonl >/dev/null 2>&1"

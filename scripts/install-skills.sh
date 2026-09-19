@@ -23,12 +23,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_ROOT="$REPO_ROOT/skills"
 TARGET_ROOT="${HOME}/.agents/skills"
+DEFAULT_TARGET="$TARGET_ROOT"
 SKILLS=("cheap-worker" "phase-runner")
 MARKER=".installed-by-agent-orchestration"
 
 DRY_RUN=0
 FORCE=0
 QUIET=0
+TARGET_EXPLICIT=0
 
 log()  { [[ "$QUIET" -eq 1 ]] || printf '%s\n' "$*"; }
 step() { log "[install-skills] $*"; }
@@ -41,7 +43,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1; shift ;;
         --force)   FORCE=1; shift ;;
         --quiet)   QUIET=1; shift ;;
-        --target)  [[ $# -ge 2 ]] || die "--target requires a directory"; TARGET_ROOT="${2:?}"; shift 2 ;;
+        --target)  [[ $# -ge 2 ]] || die "--target requires a directory"; TARGET_ROOT="${2:?}"; TARGET_EXPLICIT=1; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *)         die "unknown argument '$1' (try --help)" ;;
     esac
@@ -55,23 +57,33 @@ done
 [[ "$TARGET_ROOT" == /* ]] || die "target root must be absolute: $TARGET_ROOT"
 [[ "$TARGET_ROOT" != "/" ]] || die "refusing to install into '/'"
 
-# Never let the target be the source tree or a parent of it.
-RD="$(cd "$REPO_ROOT" && pwd -P)"
-if [[ -e "$TARGET_ROOT" ]]; then
-    TR_RESOLVED="$(cd "$TARGET_ROOT" && pwd -P)"
-else
-    PARENT="$(dirname "$TARGET_ROOT")"
-    [[ -d "$PARENT" ]] || die "parent of target does not exist: $PARENT"
-    TR_RESOLVED="$(cd "$PARENT" && pwd -P)/$(basename "$TARGET_ROOT")"
+# The managed install target is fixed; --target exists only for isolated tests.
+if [[ "$TARGET_EXPLICIT" -eq 1 && "${AGENT_ORCHESTRATION_TEST_TARGET:-0}" != "1" ]]; then
+    die "--target is a test-only mechanism (set AGENT_ORCHESTRATION_TEST_TARGET=1 to use it); the normal target is $DEFAULT_TARGET"
 fi
-[[ "$TR_RESOLVED" != "$RD" ]] || die "target root equals the source repo"
-case "$RD" in "$TR_RESOLVED"/*) die "target root is inside the source repo: $TR_RESOLVED" ;; esac
-case "$TR_RESOLVED" in "$RD"/*) die "target root contains the source repo: $TR_RESOLVED" ;; esac
+[[ "$(basename "$TARGET_ROOT")" == "skills" ]] || die "target must be a 'skills' directory: $TARGET_ROOT"
 
 for skill in "${SKILLS[@]}"; do
     [[ -d "$SRC_ROOT/$skill" ]]     || die "missing source skill directory: $SRC_ROOT/$skill"
     [[ -f "$SRC_ROOT/$skill/SKILL.md" ]] || die "missing source SKILL.md: $SRC_ROOT/$skill/SKILL.md"
 done
+
+# Create the target (and any missing parents, e.g. a fresh ~/.agents) unless
+# this is a dry run, then resolve it physically for the boundary checks.
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p "$TARGET_ROOT" || die "cannot create $TARGET_ROOT"
+fi
+if [[ -e "$TARGET_ROOT" ]]; then
+    TR_RESOLVED="$(cd "$TARGET_ROOT" && pwd -P)"
+else
+    ANC="$TARGET_ROOT"
+    while [[ ! -e "$ANC" && "$ANC" != "/" ]]; do ANC="$(dirname "$ANC")"; done
+    TR_RESOLVED="$(cd "$ANC" && pwd -P)${TARGET_ROOT#"$ANC"}"
+fi
+RD="$(cd "$REPO_ROOT" && pwd -P)"
+[[ "$TR_RESOLVED" != "$RD" ]] || die "target root equals the source repo"
+case "$RD" in "$TR_RESOLVED"/*) die "target root is inside the source repo: $TR_RESOLVED" ;; esac
+case "$TR_RESOLVED" in "$RD"/*) die "target root contains the source repo: $TR_RESOLVED" ;; esac
 
 # ---------------------------------------------------------------------------
 # Install
@@ -91,10 +103,6 @@ step "source : $SRC_ROOT"
 step "target : $TARGET_ROOT  (currently $(count_skills) skill director(y|ies))"
 [[ "$DRY_RUN" -eq 1 ]] && step "mode   : DRY RUN (no changes)"
 [[ "$FORCE" -eq 1 ]]   && step "mode   : FORCE (pre-existing foreign directories are backed up, then replaced)"
-
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    mkdir -p "$TARGET_ROOT" || die "cannot create $TARGET_ROOT"
-fi
 
 INSTALLED=()
 SKIPPED=()

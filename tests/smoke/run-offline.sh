@@ -251,33 +251,222 @@ else
     fail "detached worker did not notify within 10s"
 fi
 
-# --- 6c. session auto-discovery (fixture Codex home) ----------------------------
+# --- 6c. session auto-discovery (fixture Codex home, fail-safe) ------------------
 FAKE_HOME="$repo/.fake-codex-home"
 mkdir -p "$FAKE_HOME"
 PROJ="$(cd "$repo" && pwd -P)"
+NOW_MS="$(printf '%s' "$(date +%s)000")"
+OLD_MS=$((NOW_MS - 3600000))
+
 sqlite3 "$FAKE_HOME/thread_history_1.sqlite" \
-    "CREATE TABLE thread_items(thread_id TEXT, created_at_ms INTEGER);
-     INSERT INTO thread_items VALUES ('thread-old', 1000000), ('thread-new', 2000000);"
+    "CREATE TABLE thread_items(thread_id TEXT, created_at_ms INTEGER);"
 sqlite3 "$FAKE_HOME/state_5.sqlite" \
-    "CREATE TABLE threads(id TEXT, archived INTEGER, cwd TEXT, title TEXT, updated_at INTEGER);
-     INSERT INTO threads VALUES ('thread-old',0,'/tmp/old','old',1000),
-                               ('thread-new',0,'/tmp/new','new',2000);"
+    "CREATE TABLE threads(id TEXT, archived INTEGER, cwd TEXT, title TEXT, updated_at INTEGER);"
 
-discovered="$(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --print-session 2>/dev/null | cut -f1)"
-check_eq "auto-discovery picks the most recently active thread" "thread-new" "$discovered"
+discover() {  # discover -> sets D_OUT / D_RC from --print-session
+    D_OUT=""
+    D_RC=0
+    D_OUT="$(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --print-session 2>/dev/null)" || D_RC=$?
+}
 
-sqlite3 "$FAKE_HOME/state_5.sqlite" "UPDATE threads SET archived=1 WHERE id='thread-new';"
-discovered="$(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --print-session 2>/dev/null | cut -f1)"
-check_eq "auto-discovery skips archived threads" "thread-old" "$discovered"
+# unique recent, non-archived session -> detected
+sqlite3 "$FAKE_HOME/thread_history_1.sqlite" "INSERT INTO thread_items VALUES ('thread-solo', $NOW_MS);"
+sqlite3 "$FAKE_HOME/state_5.sqlite" "INSERT INTO threads VALUES ('thread-solo',0,'/tmp/elsewhere','solo',1);"
+discover
+check_eq "discovery: unique recent session is detected" "0" "$D_RC"
+check_eq "discovery: detected the right session" "thread-solo" "$(printf '%s' "$D_OUT" | cut -f1)"
 
-sqlite3 "$FAKE_HOME/state_5.sqlite" \
-    "INSERT INTO threads VALUES ('thread-project',0,'$PROJ','project',500);"
+# archived sessions are never returned
+sqlite3 "$FAKE_HOME/state_5.sqlite" "UPDATE threads SET archived=1 WHERE id='thread-solo';"
+discover
+check_eq "discovery: archived-only -> exit 1" "1" "$D_RC"
+
+# unique project-cwd match wins among several recent sessions
 sqlite3 "$FAKE_HOME/thread_history_1.sqlite" \
-    "INSERT INTO thread_items VALUES ('thread-project', 500000);"
-discovered="$(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --print-session 2>/dev/null | cut -f1)"
-check_eq "auto-discovery prefers a session rooted at this project" "thread-project" "$discovered"
+    "INSERT INTO thread_items VALUES ('thread-other', $((NOW_MS + 1000))), ('thread-project', $((NOW_MS - 1000)));"
+sqlite3 "$FAKE_HOME/state_5.sqlite" \
+    "INSERT INTO threads VALUES ('thread-other',0,'/tmp/elsewhere','other',2),
+                                ('thread-project',0,'$PROJ','project',3);"
+discover
+check_eq "discovery: unique project-cwd match wins" "0" "$D_RC"
+check_eq "discovery: detected the project session" "thread-project" "$(printf '%s' "$D_OUT" | cut -f1)"
 
-# --- 7. uninstall safety (dry-run only) -------------------------------------------
+# two recent sessions for the same project -> refuse to guess (H04)
+sqlite3 "$FAKE_HOME/state_5.sqlite" "UPDATE threads SET archived=0 WHERE id IN ('thread-solo','thread-other','thread-project');
+                                      UPDATE threads SET cwd='$PROJ' WHERE id IN ('thread-other','thread-project');"
+discover
+check_eq "discovery: ambiguous sessions -> exit 3 (refuse to guess)" "3" "$D_RC"
+
+# the handoff command must refuse to run on an ambiguous session
+rm -f "$repo/.agent/current/RESULT.md"
+NOTIFY_RC=0
+(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --mode implement --task-id OFF2) >"$OUT_DIR/notify-ambiguous.log" 2>&1 || NOTIFY_RC=$?
+check_eq "worker-notify: ambiguous session -> exit 13" "13" "$NOTIFY_RC"
+check "worker-notify: ambiguity message is explicit" grep -q 'refusing to guess' "$OUT_DIR/notify-ambiguous.log"
+
+# old activity outside the window is not considered
+sqlite3 "$FAKE_HOME/thread_history_1.sqlite" "DELETE FROM thread_items;"
+sqlite3 "$FAKE_HOME/thread_history_1.sqlite" "INSERT INTO thread_items VALUES ('thread-old', $OLD_MS);"
+discover
+check_eq "discovery: stale activity -> exit 1" "1" "$D_RC"
+
+# --- 6d. run-worker.sh safety harness (fake opencode, offline) --------------------
+HARNESS="$repo/.harness"
+rm -rf "$HARNESS"
+mkdir -p "$HARNESS/bin"
+cp "$SMOKE_DIR/assets/fake-opencode.sh" "$HARNESS/bin/opencode"
+chmod +x "$HARNESS/bin/opencode"
+
+hrepo="$(new_repo smoke-harness)"
+CLEANUP_DIRS+=("$hrepo")
+write_task "$hrepo" "H01" "implement" "harness objective" "existing behavior" "desired behavior" \
+    "- app.py" "- app.py" "- any other file" "- [ ] works" '`python3 app.py` exits 0' "none"
+printf 'print("hi")\n' >"$hrepo/app.py"
+commit_all "$hrepo" "harness baseline"
+HROOT="$(cd "$hrepo" && pwd -P)"
+HRUN="$HOME/.agents/skills/cheap-worker/scripts/run-worker.sh"
+
+run_fake() {  # run_fake <mode> <exit> [args...] -> sets FAKE_RC
+    local mode="$1" xc="$2"; shift 2
+    FAKE_RC=0
+    ( cd "$hrepo" && PATH="$HARNESS/bin:$PATH" \
+        FAKE_OPENCODE_MODE="$mode" FAKE_OPENCODE_EXIT="$xc" \
+        FAKE_TASK_ID="H01" FAKE_OPENCODE_CWD_LOG="$HARNESS/cwd.log" \
+        "$HRUN" "$@" ) >"$OUT_DIR/fake-run.log" 2>&1 || FAKE_RC=$?
+}
+
+run_fake result 0 --allow-dirty --mode implement
+check_eq "harness: valid RESULT -> exit 0" "0" "$FAKE_RC"
+check "harness: STATE says result_written" grep -q '"status": "result_written"' "$hrepo/.agent/current/STATE.json"
+check "harness: report is kept in current/" test -s "$hrepo/.agent/current/RESULT.md"
+check "harness: BASELINE.md written" test -s "$hrepo/.agent/current/BASELINE.md"
+check_eq "harness: opencode ran with cwd = project root" "$HROOT" "$(tail -1 "$HARNESS/cwd.log")"
+
+run_fake wrong-id 0 --allow-dirty --mode implement
+check_eq "harness: RESULT for another Task -> exit 6" "6" "$FAKE_RC"
+
+run_fake invalid 0 --allow-dirty --mode implement
+check_eq "harness: RESULT without Status -> exit 6" "6" "$FAKE_RC"
+
+run_fake escalation 0 --allow-dirty --mode implement
+check_eq "harness: valid ESCALATION -> exit 10" "10" "$FAKE_RC"
+
+run_fake both 0 --allow-dirty --mode implement
+check_eq "harness: both reports -> exit 4" "4" "$FAKE_RC"
+
+run_fake result 9 --allow-dirty --mode implement
+check_eq "harness: RESULT after opencode failure -> exit 5" "5" "$FAKE_RC"
+
+# a pre-existing report must be quarantined, never accepted
+cat >"$hrepo/.agent/current/RESULT.md" <<'EOF'
+# Result
+
+## Task ID
+H01
+
+## Status
+DONE
+
+## Summary
+stale report from an earlier attempt
+EOF
+touch -t 202001010000 "$hrepo/.agent/current/RESULT.md"
+run_fake none 0 --allow-dirty --mode implement
+check_eq "harness: stale report quarantined, no report -> exit 3" "3" "$FAKE_RC"
+check "harness: stale report moved to attempts/" bash -c "grep -rl 'stale report from an earlier attempt' '$hrepo/.agent/history/attempts' >/dev/null 2>&1"
+check "harness: current/RESULT.md is gone" bash -c "! test -e '$hrepo/.agent/current/RESULT.md'"
+
+# single-run lock (H03)
+sleep 30 &
+LOCKER=$!
+mkdir -p "$hrepo/.agent/current/.worker.lock"
+printf 'pid=%s\nrun_id=live\n' "$LOCKER" >"$hrepo/.agent/current/.worker.lock/info"
+run_fake result 0 --allow-dirty --mode implement
+check_eq "harness: live lock refuses a second worker -> exit 7" "7" "$FAKE_RC"
+kill "$LOCKER" 2>/dev/null || true
+wait "$LOCKER" 2>/dev/null || true
+printf 'pid=999999\nrun_id=dead\n' >"$hrepo/.agent/current/.worker.lock/info"
+run_fake result 0 --allow-dirty --mode implement
+check_eq "harness: stale lock is taken over -> exit 0" "0" "$FAKE_RC"
+check "harness: stale lock moved aside" bash -c "ls -d '$hrepo'/.agent/history/attempts/stale-locks/* >/dev/null 2>&1"
+check "harness: lock released after the run" bash -c "! test -e '$hrepo/.agent/current/.worker.lock'"
+
+# TASK.md validation (M02)
+cp "$hrepo/.agent/current/TASK.md" "$HARNESS/TASK.good"
+printf '# Task\n\n## Task ID\nH01\n\n## Mode\nimplement\n' >"$hrepo/.agent/current/TASK.md"
+run_fake result 0 --allow-dirty --mode implement
+check_eq "harness: incomplete TASK.md -> exit 1" "1" "$FAKE_RC"
+cp "$HARNESS/TASK.good" "$hrepo/.agent/current/TASK.md"
+run_fake result 0 --allow-dirty --mode implement --task-id OTHER
+check_eq "harness: --task-id mismatch -> exit 1" "1" "$FAKE_RC"
+run_fake result 0 --allow-dirty --mode verify
+check_eq "harness: --mode mismatch -> exit 1" "1" "$FAKE_RC"
+
+# dirty tree handling + baseline evidence (M01)
+printf 'print("local change")\n' >>"$hrepo/app.py"
+run_fake result 0 --mode implement
+check_eq "harness: dirty tree without --allow-dirty -> exit 1" "1" "$FAKE_RC"
+run_fake result 0 --allow-dirty --mode implement
+check_eq "harness: dirty tree with --allow-dirty -> exit 0" "0" "$FAKE_RC"
+check "harness: BASELINE.md lists the dirty file" grep -q 'M app.py' "$hrepo/.agent/current/BASELINE.md"
+
+# cwd pinning when invoked from elsewhere (H02)
+OTHER="$(new_repo smoke-caller)"
+CLEANUP_DIRS+=("$OTHER")
+rm -f "$HARNESS/cwd.log"
+FAKE_RC=0
+( cd "$OTHER" && PATH="$HARNESS/bin:$PATH" \
+    FAKE_OPENCODE_MODE="result" FAKE_OPENCODE_EXIT=0 \
+    FAKE_TASK_ID="H01" FAKE_OPENCODE_CWD_LOG="$HARNESS/cwd.log" \
+    "$HRUN" --root "$hrepo" --allow-dirty --mode implement ) >"$OUT_DIR/fake-run2.log" 2>&1 || FAKE_RC=$?
+check_eq "harness: --root run succeeds from another directory" "0" "$FAKE_RC"
+check_eq "harness: opencode still ran in the project root" "$HROOT" "$(tail -1 "$HARNESS/cwd.log")"
+
+# --- 7. collect-result conflict + installer boundaries -----------------------------
+cat >"$repo/.agent/current/RESULT.md" <<'EOF'
+# Result
+
+## Task ID
+OFF3
+
+## Status
+DONE
+EOF
+cat >"$repo/.agent/current/ESCALATION.md" <<'EOF'
+# Escalation
+
+## Task ID
+OFF3
+
+## Current Blocker
+fixture
+EOF
+CR_RC=0
+(cd "$repo" && "$HOME/.agents/skills/cheap-worker/scripts/collect-result.sh") >"$OUT_DIR/collect-both.log" 2>&1 || CR_RC=$?
+check_eq "collect-result: both reports -> exit 4" "4" "$CR_RC"
+check "collect-result: prints the RESULT body" grep -q 'Status' "$OUT_DIR/collect-both.log"
+check "collect-result: prints the ESCALATION body" grep -q 'Current Blocker' "$OUT_DIR/collect-both.log"
+rm -f "$repo/.agent/current/RESULT.md" "$repo/.agent/current/ESCALATION.md"
+
+# --target is a test-only mechanism
+if (AGENT_ORCHESTRATION_TEST_TARGET=0 "$PROJECT_ROOT/scripts/install-skills.sh" --target "$OUT_DIR/forbidden-target/skills" --quiet) >"$OUT_DIR/install-target-gate.log" 2>&1; then
+    fail "installer --target must be refused without the test env var"
+else
+    pass "installer --target is refused without AGENT_ORCHESTRATION_TEST_TARGET=1"
+fi
+check "installer target gate message" grep -q 'test-only mechanism' "$OUT_DIR/install-target-gate.log"
+
+# a fresh HOME must install (L01)
+FRESH_HOME="$(mktemp -d "$TMP_BASE/fresh-home.XXXXXX")"
+CLEANUP_DIRS+=("$FRESH_HOME")
+if HOME="$FRESH_HOME" "$PROJECT_ROOT/scripts/install-skills.sh" --quiet >"$OUT_DIR/install-fresh-home.log" 2>&1; then
+    pass "installer works on a fresh HOME"
+else
+    fail "installer failed on a fresh HOME (see $OUT_DIR/install-fresh-home.log)"
+fi
+check "fresh HOME install created both skills" test -f "$FRESH_HOME/.agents/skills/phase-runner/SKILL.md"
+
+# --- 8. uninstall safety (dry-run only) -------------------------------------------
 if "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" --dry-run >"$OUT_DIR/uninstall-dry.log" 2>&1; then
     pass "uninstall --dry-run exits 0"
 else

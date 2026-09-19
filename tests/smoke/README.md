@@ -6,13 +6,19 @@ committed to this repository.
 
 | Script | What it covers | Model calls |
 | --- | --- | --- |
-| `run-offline.sh` | script-level contracts: doctor, frontmatter, fail-fast, dry-run, status, collect-result, archive, uninstall safety, sibling skills untouched | no |
+| `run-offline.sh` | script-level contracts with fake workers: doctor, frontmatter, fail-fast, dry-run, status, collect-result, archive, worker-notify (message wording, fake-codex delivery, NOTIFY_FAILED hints, detached notify), session discovery (fixture DBs: unique / archived / project-cwd / ambiguous / stale), the run-worker safety harness (fake opencode: report validation, stale-report quarantine, single-run lock, TASK.md validation, dirty baseline, cwd pinning), uninstall safety, sibling skills untouched | no |
 | `run-a-single-task.sh` | A: one implement Task ("hello" -> "hello worker"): edit, run, verify, RESULT.md, clean diff | yes |
 | `run-b-investigate.sh` | B: investigate mode: finding reported, zero business code changes | yes |
-| `run-c-escalation.sh` | C: contradictory frozen test forces ESCALATION.md, no edits, exit 10 | yes |
-| `run-d-phase-runner.sh` | D+E: 3-Task queue executed by a supervisor driver, resume from A02 (A01 never re-run), stops at `awaiting_human_qa`; `--rework` also exercises the REWORK path | yes |
-| `run-live.sh` | convenience wrapper: `a`, `b`, `c`, `d`, or all | - |
+| `run-c-escalation.sh` | C: a genuinely contradictory frozen stdout test forces ESCALATION.md, no edits, exit 10 (the fixture is proven contradictory before the run) | yes |
+| `run-d-phase-runner.sh` | D: 3-Task queue executed by the deterministic driver, resume from A02, archive-then-done, real phase verification; `--rework` forces a corrective round on the same Task before ACCEPT | yes |
+| `run-e-resume.sh` | E: an interrupted `in_progress` Task is resumed (A01 never re-run); `--template` covers the blank-TASK.md window | yes |
+| `run-live.sh` | convenience wrapper: `a`, `b`, `c`, `d`, `e`, or all | - |
 | `run-all.sh` | offline, then all live | - |
+
+The `lib/phase-driver.sh` used by D/E is a **deterministic test double** for the
+Codex Supervisor, not the Supervisor itself. It proves what the scripts do under a
+given sequence; it cannot prove that Codex follows the skill text. Mock/fake
+verification and live-model verification are labelled separately in the output.
 
 ## Running
 
