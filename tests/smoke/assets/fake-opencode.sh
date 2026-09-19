@@ -21,6 +21,13 @@ if [[ "${1:-}" == "--version" ]]; then
     exit 0
 fi
 
+# The harness validates CHEAP_WORKER_MODELS with `opencode models`; report the
+# list the fixtures expect (the two valid entries only).
+if [[ "${1:-}" == "models" ]]; then
+    printf '%s\n' "opencode/muse-spark-1.3-contributor-free" "deepseek/deepseek-flash" "opencode/nemotron-3.5-lightning-free"
+    exit 0
+fi
+
 cat >/dev/null
 
 if [[ -n "${FAKE_OPENCODE_CWD_LOG:-}" ]]; then
@@ -37,9 +44,34 @@ if [[ -n "${FAKE_OPENCODE_WAIT_FILE:-}" ]]; then
     done
 fi
 
+if [[ -n "${FAKE_OPENCODE_ARGS_LOG:-}" ]]; then
+    printf '%s\n' "$*" >>"$FAKE_OPENCODE_ARGS_LOG"
+fi
+
+# quota-always: every invocation reports a rate limit (for the exhausted case).
+if [[ "${FAKE_OPENCODE_MODE:-none}" == "quota-always" ]]; then
+    printf '{"type":"error","error":{"type":"provider.quota","message":"Rate limit exceeded. Please try again later.","status":429}}\n'
+    exit 1
+fi
+
+# quota-once: the first invocation reports a rate limit, later ones succeed.
+if [[ "${FAKE_OPENCODE_MODE:-none}" == "quota-once" ]]; then
+    n=0
+    if [[ -n "${FAKE_OPENCODE_COUNTER:-}" && -f "${FAKE_OPENCODE_COUNTER}" ]]; then
+        n="$(cat "$FAKE_OPENCODE_COUNTER")"
+    fi
+    n=$((n + 1))
+    [[ -n "${FAKE_OPENCODE_COUNTER:-}" ]] && printf '%s' "$n" >"$FAKE_OPENCODE_COUNTER"
+    if [[ "$n" -eq 1 ]]; then
+        printf '{"type":"error","error":{"type":"provider.quota","message":"Rate limit exceeded. Please try again later.","status":429}}\n'
+        exit 1
+    fi
+    FMODE="result"
+fi
+
 printf '{"type":"text","sessionID":"ses_fake_offline_0001","part":{"text":"fake worker"}}\n'
 
-mode="${FAKE_OPENCODE_MODE:-none}"
+mode="${FMODE:-${FAKE_OPENCODE_MODE:-none}}"
 task_id="${FAKE_TASK_ID:-UNKNOWN}"
 current=".agent/current"
 
