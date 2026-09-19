@@ -68,29 +68,39 @@ for skill in "${SKILLS[@]}"; do
     [[ -f "$SRC_ROOT/$skill/SKILL.md" ]] || die "missing source SKILL.md: $SRC_ROOT/$skill/SKILL.md"
 done
 
-# Create the target (and any missing parents, e.g. a fresh ~/.agents) unless
-# this is a dry run, then resolve it physically for the boundary checks.
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    mkdir -p "$TARGET_ROOT" || die "cannot create $TARGET_ROOT"
-fi
+# Resolve the prospective physical target BEFORE creating anything (M05):
+# walk up to the deepest existing ancestor, canonicalize it, and append the
+# not-yet-existing remainder.
 if [[ -e "$TARGET_ROOT" ]]; then
-    TR_RESOLVED="$(cd "$TARGET_ROOT" && pwd -P)"
+    PROPOSED_RESOLVED="$(cd "$TARGET_ROOT" && pwd -P)"
 else
     ANC="$TARGET_ROOT"
     while [[ ! -e "$ANC" && "$ANC" != "/" ]]; do ANC="$(dirname "$ANC")"; done
-    TR_RESOLVED="$(cd "$ANC" && pwd -P)${TARGET_ROOT#"$ANC"}"
+    PROPOSED_RESOLVED="$(cd "$ANC" && pwd -P)${TARGET_ROOT#"$ANC"}"
 fi
+
+# Never let the target be the source tree or a parent of it.
 RD="$(cd "$REPO_ROOT" && pwd -P)"
-[[ "$TR_RESOLVED" != "$RD" ]] || die "target root equals the source repo"
-case "$RD" in "$TR_RESOLVED"/*) die "target root is inside the source repo: $TR_RESOLVED" ;; esac
-case "$TR_RESOLVED" in "$RD"/*) die "target root contains the source repo: $TR_RESOLVED" ;; esac
+[[ "$PROPOSED_RESOLVED" != "$RD" ]] || die "target root equals the source repo"
+case "$RD" in "$PROPOSED_RESOLVED"/*) die "target root is inside the source repo: $PROPOSED_RESOLVED" ;; esac
+case "$PROPOSED_RESOLVED" in "$RD"/*) die "target root contains the source repo: $PROPOSED_RESOLVED" ;; esac
 
 # Physical target policy: the managed target lives under $HOME. A parent symlink
 # that resolves outside home is refused (test redirects need the explicit gate).
 HOME_PHYS_TR="$(cd "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
-if [[ "$TR_RESOLVED" != "$HOME"/* && "$TR_RESOLVED" != "$HOME_PHYS_TR"/* && "${AGENT_ORCHESTRATION_TEST_TARGET:-0}" != "1" ]]; then
-    die "resolved target $TR_RESOLVED is outside \$HOME; parent-symlink escapes are refused (test-only gate: AGENT_ORCHESTRATION_TEST_TARGET=1)"
+if [[ "$PROPOSED_RESOLVED" != "$HOME"/* && "$PROPOSED_RESOLVED" != "$HOME_PHYS_TR"/* && "${AGENT_ORCHESTRATION_TEST_TARGET:-0}" != "1" ]]; then
+    die "resolved target $PROPOSED_RESOLVED is outside \$HOME; parent-symlink escapes are refused (test-only gate: AGENT_ORCHESTRATION_TEST_TARGET=1)"
 fi
+
+# Only now create the target (and any missing parents, e.g. a fresh ~/.agents).
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p "$TARGET_ROOT" || die "cannot create $TARGET_ROOT"
+fi
+TR_RESOLVED="$PROPOSED_RESOLVED"
+if [[ -e "$TARGET_ROOT" ]]; then
+    TR_RESOLVED="$(cd "$TARGET_ROOT" && pwd -P)"
+fi
+[[ "$TR_RESOLVED" == "$PROPOSED_RESOLVED" ]] || die "target changed while creating it ($TR_RESOLVED != $PROPOSED_RESOLVED); refusing"
 
 # ---------------------------------------------------------------------------
 # Install

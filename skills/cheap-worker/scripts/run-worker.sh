@@ -53,6 +53,7 @@ OPENCODE_AGENT="${OPENCODE_AGENT:-build}"
 
 LOCK_OWNED=0
 RUN_ID=""
+WORKER_PID=""
 RUN_STARTED_EPOCH=0
 
 die() { printf 'run-worker: %s\n' "$*" >&2; exit 1; }
@@ -348,7 +349,31 @@ main() {
         LOCK_OWNED=1
     }
     acquire_lock
-    trap 'release_lock; exit 130' INT TERM
+    # Cancellation is fail-safe: stop the worker we started, then KEEP the lock.
+    # The wrapper dying is not proof that the execution is over, so the next run
+    # must verify and pass --break-lock instead of taking the lock over silently.
+    on_signal() {
+        local sig="$1"
+        printf 'run-worker: %s received; stopping the worker and KEEPING the lock\n' "$sig" >&2
+        if [[ -n "$WORKER_PID" ]] && kill -0 "$WORKER_PID" 2>/dev/null; then
+            kill -TERM "$WORKER_PID" 2>/dev/null || true
+            local i=0
+            while [[ "$i" -lt 50 ]] && kill -0 "$WORKER_PID" 2>/dev/null; do
+                sleep 0.2
+                i=$((i + 1))
+            done
+            if kill -0 "$WORKER_PID" 2>/dev/null; then
+                printf 'run-worker: worker pid %s did not stop within 10s; lock retained\n' "$WORKER_PID" >&2
+            else
+                printf 'run-worker: worker stopped; lock retained on purpose after a signal\n' >&2
+            fi
+        fi
+        printf 'cancelled_by=%s\ncancelled_at=%s\n' "$sig" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >>"$LOCK_DIR/info" 2>/dev/null || true
+        printf 'run-worker: after verifying nothing is running, re-run with --break-lock\n' >&2
+        exit 130
+    }
+    trap 'on_signal INT' INT
+    trap 'on_signal TERM' TERM
 
     # --- quarantine previous run evidence (H01) --------------------------------
     local prev_run=""
@@ -378,7 +403,14 @@ main() {
         git -C "$project_root" diff --cached --stat 2>/dev/null || true
         printf '```\n\n## Full pre-run patch\n\nThe complete `git diff HEAD --binary` (tracked changes) is stored next to this\nfile as `BASELINE.patch`, so the Supervisor can separate pre-existing changes\nfrom the changes of this run.\n'
     } >"$agent_dir/BASELINE.md"
-    git -C "$project_root" diff --binary HEAD >"$agent_dir/BASELINE.patch" 2>/dev/null || : >"$agent_dir/BASELINE.patch"
+    if [[ -n "$baseline" ]]; then
+        git -C "$project_root" diff --binary HEAD >"$agent_dir/BASELINE.patch" 2>/dev/null || : >"$agent_dir/BASELINE.patch"
+    else
+        {
+            printf 'no HEAD yet: BASELINE.patch cannot be produced (there is nothing to diff against).\n'
+            printf 'Repositories without a commit are outside the pre-run recovery guarantee (M01).\n'
+        } >"$agent_dir/BASELINE.patch"
+    fi
 
     local log_file="$agent_dir/logs/worker-${RUN_ID}-${task_id}.jsonl"
     local started_at

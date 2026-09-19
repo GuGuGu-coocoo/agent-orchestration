@@ -395,11 +395,42 @@ run_fake result 0 --allow-dirty --mode implement
 check_eq "harness: unprovable stale lock -> exit 8" "8" "$FAKE_RC"
 check "harness: exit 8 explains --break-lock" grep -q -- '--break-lock' "$OUT_DIR/fake-run.log"
 
-# explicit --break-lock takes over and the lock is released afterwards
+# cancellation must KEEP the lock until execution is proven stopped (H03)
+SLOWBIN="$HARNESS/slowbin"
+mkdir -p "$SLOWBIN"
+cp "$SMOKE_DIR/assets/fake-opencode.sh" "$SLOWBIN/opencode"
+chmod +x "$SLOWBIN/opencode"
+PIDLOG="$HARNESS/slow.pids"
+RELEASE="$HARNESS/slow.release"
+rm -f "$PIDLOG" "$RELEASE"
+rm -rf "$hrepo/.agent/current/.worker.lock"
+( cd "$hrepo" && exec env PATH="$SLOWBIN:$PATH" FAKE_OPENCODE_MODE=result FAKE_TASK_ID=H01 \
+    FAKE_OPENCODE_PID_LOG="$PIDLOG" FAKE_OPENCODE_WAIT_FILE="$RELEASE" \
+    "$HRUN" --allow-dirty --mode implement ) >"$OUT_DIR/sigterm-first.log" 2>&1 &
+WRAPPER=$!
+i=0
+while [[ ! -s "$PIDLOG" && "$i" -lt 100 ]]; do sleep 0.1; i=$((i + 1)); done
+if [[ -s "$PIDLOG" ]]; then
+    pass "SIGTERM fixture: the slow worker actually started"
+else
+    fail "SIGTERM fixture: the slow worker never started"
+fi
+kill -TERM "$WRAPPER" 2>/dev/null || true
+SIGRC=0
+wait "$WRAPPER" || SIGRC=$?
+check_eq "wrapper exits 130 after SIGTERM" "130" "$SIGRC"
+check "the lock is RETAINED after SIGTERM" test -d "$hrepo/.agent/current/.worker.lock"
+check "lock info records the cancellation" grep -q '^cancelled_by=TERM' "$hrepo/.agent/current/.worker.lock/info"
+run_fake result 0 --allow-dirty --mode implement
+check_eq "run after SIGTERM refuses without --break-lock -> exit 8" "8" "$FAKE_RC"
 run_fake result 0 --allow-dirty --mode implement --break-lock
-check_eq "harness: --break-lock takes over -> exit 0" "0" "$FAKE_RC"
-check "harness: stale lock moved aside" bash -c "ls -d '$hrepo'/.agent/history/attempts/stale-locks/* >/dev/null 2>&1"
-check "harness: lock released after the run" bash -c "! test -e '$hrepo/.agent/current/.worker.lock'"
+check_eq "--break-lock after verification proceeds -> exit 0" "0" "$FAKE_RC"
+check "stale lock moved aside" bash -c "ls -d '$hrepo'/.agent/history/attempts/stale-locks/* >/dev/null 2>&1"
+check "lock released after a normal run" bash -c "! test -e '$hrepo/.agent/current/.worker.lock'"
+touch "$RELEASE" 2>/dev/null || true
+if [[ -s "$PIDLOG" ]]; then
+    while IFS= read -r p; do kill -TERM "$p" 2>/dev/null || true; done <"$PIDLOG"
+fi
 
 # TASK.md validation (M02)
 cp "$hrepo/.agent/current/TASK.md" "$HARNESS/TASK.good"
@@ -549,7 +580,7 @@ sstate '{broken' '{"current_phase":"A","current_task":"A02","status":"running"}'
 CS_RC=0
 (cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-badjson.log" 2>&1 || CS_RC=$?
 check_eq "check-state: broken queue JSON -> exit 1" "1" "$CS_RC"
-check "check-state: broken JSON is reported" grep -q 'not valid JSON' "$OUT_DIR/cs-badjson.log"
+check "check-state: broken JSON is reported" grep -qE 'not a JSON object|not valid JSON' "$OUT_DIR/cs-badjson.log"
 
 sstate '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
        '{"current_phase":"A","current_task":"WRONG","status":"running"}' \
@@ -584,6 +615,90 @@ CS_RC=0
 (cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-archived-not-done.log" 2>&1 || CS_RC=$?
 check_eq "check-state: archive without done -> exit 1" "1" "$CS_RC"
 check "check-state: suggests marking done" grep -q 'mark it done' "$OUT_DIR/cs-archived-not-done.log"
+
+# --- 7c. check-state fail-closed matrix (round-3 M03) ------------------------------
+cs_case() {  # cs_case <name> <queue-file-content-or-> <runstate-content> [result-content]
+    local name="$1" q="$2" rs="$3" res="${4:-}"
+    printf '%s' "$q" >"$CSREPO/.agent/phases/A/TASK_QUEUE.json"
+    printf '%s' "$rs" >"$CSREPO/.agent/RUN_STATE.json"
+    printf '# Task\n\n## Task ID\nA02\n' >"$CSREPO/.agent/current/TASK.md"
+    printf '%s' '{"task_id":"A02","run_id":"r1","status":"running"}' >"$CSREPO/.agent/current/STATE.json"
+    rm -f "$CSREPO/.agent/current/RESULT.md" "$CSREPO/.agent/current/ESCALATION.md"
+    [[ -n "$res" ]] && printf '%s' "$res" >"$CSREPO/.agent/current/RESULT.md"
+    CS_RC=0
+    (cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-${name}.log" 2>&1 || CS_RC=$?
+}
+
+cs_case empty-runstate '{"tasks":[{"id":"A02","status":"in_progress"}]}' ''
+check_eq "check-state: empty RUN_STATE -> exit 1" "1" "$CS_RC"
+check "check-state: empty RUN_STATE reported" grep -q 'empty or not a JSON object' "$OUT_DIR/cs-empty-runstate.log"
+
+cs_case null-queue 'null' '{"current_phase":"A","current_task":"A02","status":"running"}'
+check_eq "check-state: null queue -> exit 1" "1" "$CS_RC"
+check "check-state: null queue reported" grep -q 'not a JSON object' "$OUT_DIR/cs-null-queue.log"
+
+rm -f "$CSREPO/.agent/phases/A/TASK_QUEUE.json"
+printf '%s' '{"current_phase":"A","current_task":"A02","status":"running"}' >"$CSREPO/.agent/RUN_STATE.json"
+CS_RC=0
+(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-missing-queue.log" 2>&1 || CS_RC=$?
+check_eq "check-state: missing queue while running -> exit 1" "1" "$CS_RC"
+check "check-state: missing queue reported" grep -q 'is missing' "$OUT_DIR/cs-missing-queue.log"
+
+cs_case escalated '{"tasks":[{"id":"A02","status":"escalated"}]}' '{"current_phase":"A","current_task":"A02","status":"running"}'
+check_eq "check-state: escalated task -> exit 1" "1" "$CS_RC"
+check "check-state: escalated verdict" grep -q 'verdict: ESCALATED' "$OUT_DIR/cs-escalated.log"
+
+cs_case checkpoint '{"tasks":[{"id":"A02","status":"pending"}]}' '{"current_phase":"A","current_task":"","status":"awaiting_human_qa"}'
+check_eq "check-state: checkpoint with pending -> exit 1" "1" "$CS_RC"
+check "check-state: checkpoint verdict" grep -q 'verdict: CHECKPOINT' "$OUT_DIR/cs-checkpoint.log"
+check "check-state: checkpoint contradiction reported" grep -q 'still has pending' "$OUT_DIR/cs-checkpoint.log"
+
+cs_case bad-result '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
+    '{"current_phase":"A","current_task":"A02","status":"running"}' \
+    '# Result
+
+## Task ID
+A02
+
+## Status
+FAILED'
+check_eq "check-state: RESULT not DONE -> exit 1" "1" "$CS_RC"
+check "check-state: unacceptable report reported" grep -q 'not acceptable' "$OUT_DIR/cs-bad-result.log"
+
+# survivor lock: a live worker_pid must produce WORKER_RUNNING, not "stale"
+sleep 30 &
+SURV=$!
+mkdir -p "$CSREPO/.agent/current/.worker.lock"
+printf 'pid=999999\nworker_pid=%s\nrun_id=survivor\n' "$SURV" >"$CSREPO/.agent/current/.worker.lock/info"
+cs_case survivor-lock '{"tasks":[{"id":"A02","status":"in_progress"}]}' '{"current_phase":"A","current_task":"A02","status":"running"}'
+check_eq "check-state: live worker_pid -> exit 1" "1" "$CS_RC"
+check "check-state: live worker_pid verdict" grep -q 'verdict: WORKER_RUNNING' "$OUT_DIR/cs-survivor-lock.log"
+rm -rf "$CSREPO/.agent/current/.worker.lock"
+kill "$SURV" 2>/dev/null || true
+wait "$SURV" 2>/dev/null || true
+
+# --- 7d. phase-driver obeys check-state (offline, no model calls) -------------------
+DREPO="$(new_repo smoke-driver-gate)"
+CLEANUP_DIRS+=("$DREPO")
+mkdir -p "$DREPO/.agent/phases/A/history" "$DREPO/.agent/current"
+printf '%s' '{"tasks":[{"id":"A02","status":"pending"}]}' >"$DREPO/.agent/phases/A/TASK_QUEUE.json"
+printf '%s' '{"current_phase":"A","current_task":"","status":"awaiting_human_qa"}' >"$DREPO/.agent/RUN_STATE.json"
+printf '# Phase A\n' >"$DREPO/.agent/phases/A/PHASE.md"
+DG_RC=0
+REPO="$DREPO" SMOKE_DIR="$SMOKE_DIR" REWORK_MODE=0 \
+    bash "$SMOKE_DIR/lib/phase-driver.sh" >"$OUT_DIR/driver-gate.log" 2>&1 || DG_RC=$?
+check_eq "driver stops on a checkpoint verdict -> exit 2" "2" "$DG_RC"
+check "driver logged the stop" grep -q 'check-state says stop' "$OUT_DIR/driver-gate.log"
+
+# --- 7e. installer must not create a target it will refuse (M05 LOW) ----------------
+ESCAPE_HOME="$(mktemp -d "$TMP_BASE/escape-home.XXXXXX")"
+ESCAPE_OUT="$(mktemp -d "$TMP_BASE/escape-out.XXXXXX")"
+CLEANUP_DIRS+=("$ESCAPE_HOME" "$ESCAPE_OUT")
+ln -s "$ESCAPE_OUT" "$ESCAPE_HOME/.agents"
+ES_RC=0
+HOME="$ESCAPE_HOME" "$PROJECT_ROOT/scripts/install-skills.sh" --quiet >"$OUT_DIR/install-escape.log" 2>&1 || ES_RC=$?
+check_eq "installer refuses a parent symlink escape" "1" "$ES_RC"
+check "installer did not create the refused target" bash -c "! test -e '$ESCAPE_OUT/skills'"
 
 # --- 8. uninstall safety (dry-run only) -------------------------------------------
 if "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" --dry-run >"$OUT_DIR/uninstall-dry.log" 2>&1; then

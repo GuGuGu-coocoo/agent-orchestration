@@ -31,11 +31,7 @@ CURRENT="$REPO/.agent/current"
 
 log() { printf '[phase-driver] %s\n' "$*"; }
 
-# The skill says to consult check-state before resuming; the double logs it too.
-if [[ -x "$HOME/.agents/skills/cheap-worker/scripts/check-state.sh" ]]; then
-    log "check-state verdict:"
-    (cd "$REPO" && "$HOME/.agents/skills/cheap-worker/scripts/check-state.sh" 2>&1 | grep -E 'verdict:|ISSUE' | sed 's/^/  /') || true
-fi
+# (the check-state gate lives after the function definitions, before the loop)
 
 archive_current() {
     local id="$1" decision="$2"
@@ -193,6 +189,38 @@ review_task() {
     esac
 }
 
+# The skill says to consult check-state before resuming; the double OBEYS it:
+# an actionable verdict proceeds, a stop verdict ends the run (with one
+# reconciliation attempt: re-rendering TASK.md from the queue definition).
+CHECK_STATE="$HOME/.agents/skills/cheap-worker/scripts/check-state.sh"
+if [[ -x "$CHECK_STATE" ]]; then
+    cs_rc=0
+    cs_out="$(cd "$REPO" && "$CHECK_STATE" 2>&1)" || cs_rc=$?
+    log "check-state rc=$cs_rc verdict=$(printf '%s' "$cs_out" | awk -F': ' '/^verdict: /{print $2}' | awk '{print $1}')"
+    cs_issues="$(printf '%s\n' "$cs_out" | grep -E '^  ISSUE' || true)"
+    if [[ -n "$cs_issues" ]]; then
+        printf '%s\n' "$cs_issues" | sed 's/^/  [check-state]/' | while IFS= read -r line; do log "$line"; done
+    fi
+    if [[ "$cs_rc" -ne 0 ]]; then
+        ip="$(jq -r '[.tasks[] | select(.status=="in_progress")][0].id // empty' "$QUEUE")"
+        esc="$(jq -r '[.tasks[] | select(.status=="escalated")][0].id // empty' "$QUEUE")"
+        if [[ -n "$ip" && -z "$esc" ]]; then
+            log "reconciliation: re-rendering TASK.md for $ip from the queue definition"
+            render_task "$ip" || { log "reconciliation failed (unknown Task); stopping"; exit 2; }
+            cs_rc2=0
+            (cd "$REPO" && "$CHECK_STATE" >/dev/null 2>&1) || cs_rc2=$?
+            log "check-state after reconciliation: rc=$cs_rc2"
+            if [[ "$cs_rc2" -ne 0 ]]; then
+                log "still inconsistent after reconciliation; stopping"
+                exit 2
+            fi
+        else
+            log "check-state says stop and no reconciliation applies; stopping"
+            exit 2
+        fi
+    fi
+fi
+
 while :; do
     esc="$(escalated_task)"
     if [[ -n "$esc" ]]; then
@@ -257,7 +285,6 @@ EOF
             update_run_state "blocked" "$next_id"
             exit 2
         fi
-        rm -f "$CURRENT/REVIEW.md"
         if ! review_task "$next_id"; then
             log "$next_id still wrong after rework; stopping"
             jq_update_task "$next_id" ".status = \"escalated\""
@@ -320,7 +347,6 @@ EOF
         jq --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
             '(.tasks[] | select(.id=="A02")) |= (.history += [{at: $now, decision: "REWORK", note: "edge case shutdown(0) required"}])' \
             "$QUEUE" >"$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
-        rm -f "$CURRENT/REVIEW.md"
     fi
 
     log "ACCEPT $next_id (archive first, then mark done)"

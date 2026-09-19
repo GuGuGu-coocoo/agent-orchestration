@@ -145,7 +145,9 @@ Safety behaviours on every run:
 
 - a project-level lock (`.agent/current/.worker.lock`) records **both the wrapper
   pid and the worker pid**, refuses a second worker (`7`), and **never takes over a
-  stale lock automatically**: use `--break-lock` after verifying nothing runs (`8`)
+  stale lock automatically**: use `--break-lock` after verifying nothing runs (`8`).
+  A cancelled run (Ctrl-C / SIGTERM) stops its worker and **keeps the lock**; the
+  next run must verify and pass `--break-lock`.
 - previous `RESULT.md`/`ESCALATION.md`/`BASELINE.*` are quarantined to
   `.agent/history/attempts/<task>/` so a stale report can never be mistaken for
   this run's output
@@ -155,8 +157,13 @@ Safety behaviours on every run:
   missing; `--task-id`/`--mode` must match the file; a `REVIEW.md` must carry the
   same Task ID
 - `--allow-dirty` records the pre-run tracked/staged/untracked status in
-  `.agent/current/BASELINE.md` plus the full `git diff HEAD --binary` in
-  `BASELINE.patch`
+  `.agent/current/BASELINE.md` plus `git diff HEAD --binary` in `BASELINE.patch`
+  (tracked content only; untracked file **contents** and repositories without a
+  commit are outside this guarantee)
+- `check-state.sh` is fail-closed: empty/unreadable/misspelled state is an issue,
+  not a default; it distinguishes actionable verdicts (`NEXT`, `REVIEW_OR_RESUME`,
+  `PHASE_COMPLETE`) from stop verdicts (`WORKER_RUNNING`, `ESCALATED`, `BLOCKED`,
+  `CHECKPOINT`, `INCONSISTENT`)
 - opencode always runs with `cwd` = project root, even when invoked elsewhere
 
 Other helper scripts:
@@ -297,7 +304,7 @@ project has an `AGENTS.md`, the worker must read it.
 never touches real projects. See `tests/smoke/README.md`.
 
 ```sh
-tests/smoke/run-offline.sh                  # no model calls (125 checks)
+tests/smoke/run-offline.sh                  # no model calls (149 checks)
 tests/smoke/run-live.sh                     # all live tests (OpenCode default model)
 SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh  # keep the generated repos
 ```

@@ -27,6 +27,16 @@ if [[ -n "${FAKE_OPENCODE_CWD_LOG:-}" ]]; then
     printf '%s\n' "$PWD" >>"$FAKE_OPENCODE_CWD_LOG"
 fi
 
+# Slow mode: record the pid, then wait for the release file (used by signal tests).
+if [[ -n "${FAKE_OPENCODE_PID_LOG:-}" ]]; then
+    printf '%s\n' "$$" >>"$FAKE_OPENCODE_PID_LOG"
+fi
+if [[ -n "${FAKE_OPENCODE_WAIT_FILE:-}" ]]; then
+    while [[ ! -f "$FAKE_OPENCODE_WAIT_FILE" ]]; do
+        sleep 0.1
+    done
+fi
+
 printf '{"type":"text","sessionID":"ses_fake_offline_0001","part":{"text":"fake worker"}}\n'
 
 mode="${FAKE_OPENCODE_MODE:-none}"

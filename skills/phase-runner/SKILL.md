@@ -145,7 +145,10 @@ Details and sizing rules: `references/phase-planning.md`.
 15. If new evidence invalidates a future Task, revise the queue now and append the
     reason to `TASK_QUEUE.json` -> `adjustments`. Never silently drop a Task.
 16. If `run-worker.sh` returns `7`, another worker is running: do not start a
-    second one. Run `check-state.sh`, wait for the report or wake-up, then review.
+    second one. If it returns `8`, the previous run could not be proven dead (for
+    example after a cancellation): verify with `check-state.sh`/`ps`, then rerun
+    with `--break-lock`. A cancelled run (Ctrl-C/SIGTERM) intentionally keeps the
+    lock.
 
 ### 3. Phase completion
 
@@ -181,12 +184,19 @@ Any time a session starts, before anything else:
 
 | check-state verdict | action |
 | --- | --- |
-| `WORKER_RUNNING` | do not start another worker; wait for the report or the `[worker-notify]` message |
+| `WORKER_RUNNING` | a wrapper or worker process is alive: do not start another; wait for the report or the `[worker-notify]` message |
+| `ESCALATED` | a Task is escalated: read the report/queue history and decide (product decisions go to the human) |
+| `BLOCKED` | resolve the recorded blocker before resuming |
+| `CHECKPOINT` | `awaiting_human_qa`: stop; the human decides the next Phase |
 | `INCONSISTENT` | fix the listed issues first (rewrite TASK.md from the saved definition, archive missing done Tasks, resolve double reports) |
-| `REVIEW_OR_RESUME` | report ready -> review (step 13); no report -> re-run the same Task (`run-worker.sh --allow-dirty`) |
+| `REVIEW_OR_RESUME` | report acceptable -> review; otherwise re-run the same Task (`run-worker.sh --allow-dirty`) |
 | `NEXT` | hand off the pending Task (step 10) |
 | `PHASE_COMPLETE` | run the phase final review (step 17), then stop at the checkpoint |
-| `EMPTY` | no queue: start from phase intake |
+| `EMPTY` | no queue state (fresh project): start from phase intake |
+
+Exit codes: `0` = actionable verdict, `1` = stop. A missing archive for a `done`
+Task is only a warning (the Task is skipped anyway); an archive for an
+`in_progress` Task is blocking.
 
 Never restart a completed Task. Never re-plan from scratch if the queue is valid;
 only revise pending Tasks with recorded reasons.
