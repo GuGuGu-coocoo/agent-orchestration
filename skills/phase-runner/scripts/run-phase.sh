@@ -201,6 +201,7 @@ PHASE_LOCK_DIR_NAME=".phase.lock"
 
 acquire_phase_lock() {
     local break_lock="$1" lock="$ROOT/.agent/current/$PHASE_LOCK_DIR_NAME" lpid="" info=""
+    mkdir -p "$(dirname "$lock")" 2>/dev/null || true
     if mkdir "$lock" 2>/dev/null; then
         printf 'pid=%s\nrun_id=%s\nphase=%s\nstarted_at=%s\n' \
             "$$" "$RUN_ID" "$PHASE" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$lock/info"
@@ -310,6 +311,33 @@ render_task_md() {
     fi
 }
 
+# Render TASK.md only when it is missing, still a template, or belongs to another
+# Task (the resume repair). Never overwrite a Task definition that already matches:
+# a run that is refused must not lose the file it found.
+repair_task_md() {
+    local id="$1" present=""
+    if [[ -f "$CURRENT/TASK.md" ]]; then
+        present="$(awk '/^## Task ID[[:space:]]*$/{getline; gsub(/[[:space:]]/,""); print; exit}' "$CURRENT/TASK.md")"
+    fi
+    if [[ -n "$present" && "$present" != *"<"* && "$present" == "$id" ]]; then
+        return 0
+    fi
+    render_task_md "$id" "$CURRENT/TASK.md"
+}
+
+# check_state_issues_repairable (stdin: check-state output) - true when every
+# ISSUE is one the pre-flight can repair itself: a TASK.md that does not match the
+# Task in flight, or a report left over from another Task. Anything else is a real
+# inconsistency and the run is refused without touching a single file.
+check_state_issues_repairable() {
+    local issues other
+    issues="$(grep -E '^  ISSUE' || true)"
+    [[ -n "$issues" ]] || return 1
+    other="$(printf '%s\n' "$issues" | grep -vE \
+        'queue says in_progress=.* but current/TASK\.md is|(ESCALATION|RESULT)\.md belongs to task .* but the (queue is on|current Task is)' || true)"
+    [[ -z "$other" ]]
+}
+
 # quarantine_stale_reports <keep-task-id> - move a report left over from another
 # Task aside, exactly like run-worker.sh does before a run, so the resume
 # diagnostics see a coherent current/ directory.
@@ -331,17 +359,89 @@ quarantine_stale_reports() {
 # Evidence gate
 # ---------------------------------------------------------------------------
 
-git_paths() {  # changed paths, .agent/ excluded, sorted
-    git -C "$ROOT" status --porcelain=v1 -uall 2>/dev/null | while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        local p="${line:3}"
-        case "$line" in *" -> "*) p="${p##* -> }" ;; esac
+# ---------------------------------------------------------------------------
+# Working-tree fingerprints
+#
+# The scope gate must catch ANY change this Task made, including a second edit to
+# a file that was already dirty before the Task started. Comparing sets of dirty
+# path names is not enough: an already-dirty file edited again keeps its name, so
+# the change stays invisible. Every path git reports as changed (tracked
+# modifications, staged changes, deletions, untracked files) is fingerprinted
+# (content + mode + existence) before and after the worker runs, and the two
+# snapshots are compared per path. Nothing is subtracted.
+# ---------------------------------------------------------------------------
+
+NL="$(printf '\nX')"; NL="${NL%X}"
+TAB_CHAR="$(printf '\t')"
+UNREPRESENTABLE="!unrepresentable-path"
+
+file_mode() {
+    stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf '?'
+}
+
+# dirty_paths - every path git reports as changed, .agent/.git excluded, sorted.
+# A name that cannot be represented line-wise (newline or tab in it) is reported
+# as a marker line so the caller can fail closed instead of guessing.
+dirty_paths() {
+    local p
+    {
+        git -C "$ROOT" diff --no-renames --name-only -z 2>/dev/null || true
+        git -C "$ROOT" diff --no-renames --cached --name-only -z 2>/dev/null || true
+        git -C "$ROOT" ls-files --others --exclude-standard -z 2>/dev/null || true
+    } | while IFS= read -r -d '' p; do
+        [[ -n "$p" ]] || continue
         case "$p" in
-            \"*\") p="${p#\"}"; p="${p%\"}" ;;
+            .agent/*|.git/*) continue ;;
+            *"$NL"*|*"$TAB_CHAR"*)
+                printf '%s\n' "$UNREPRESENTABLE"
+                continue ;;
         esac
-        case "$p" in .agent/*|.git/*) continue ;; esac
-        [[ -n "$p" ]] && printf '%s\n' "$p"
+        printf '%s\n' "$p"
     done | LC_ALL=C sort -u
+}
+
+# path_fingerprint <path> - content, mode and existence in one token
+path_fingerprint() {
+    local p="$1"
+    if junk_path "$p"; then printf 'junk'; return 0; fi
+    if [[ -L "$ROOT/$p" ]]; then
+        printf 'link:%s' "$(readlink "$ROOT/$p" 2>/dev/null || true)"
+        return 0
+    fi
+    if [[ -d "$ROOT/$p" ]]; then printf 'dir'; return 0; fi
+    if [[ -f "$ROOT/$p" ]]; then
+        printf 'file:%s:%s' "$(file_mode "$ROOT/$p")" "$(hash_file "$ROOT/$p")"
+        return 0
+    fi
+    printf 'absent'
+}
+
+# snapshot_tree <outfile> - "<path>\t<fingerprint>" per dirty path, sorted
+snapshot_tree() {
+    local out="$1" p
+    : >"$out"
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        printf '%s\t%s\n' "$p" "$(path_fingerprint "$p")" >>"$out"
+    done < <(dirty_paths)
+    return 0
+}
+
+# changed_paths <before-snapshot> <after-snapshot> - paths whose content, mode or
+# existence differs between the two snapshots (either direction)
+changed_paths() {
+    awk -F"$TAB_CHAR" '
+        FNR == NR { before[$1] = $2; next }
+        { after[$1] = $2 }
+        END {
+            for (p in before) if (!(p in after) || after[p] != before[p]) print p
+            for (p in after)  if (!(p in before)) print p
+        }
+    ' "$1" "$2" | LC_ALL=C sort
+}
+
+has_unrepresentable_path() {
+    grep -qF -- "$UNREPRESENTABLE" "$1" 2>/dev/null
 }
 
 snapshot_hashes() {  # Supervisor artifacts the worker must never edit
@@ -408,9 +508,9 @@ run_check() {
     esac
 }
 
-# gate_task <id> <run-started-epoch> <before-paths> <before-hashes> <worker-rc>
+# gate_task <id> <run-started-epoch> <before-tree-snapshot> <before-hashes> <worker-rc>
 gate_task() {
-    local id="$1" started="$2" before_paths="$3" before_hashes="$4" worker_rc="$5"
+    local id="$1" started="$2" before_tree="$3" before_hashes="$4" worker_rc="$5"
     GATE_FAILURES=""
     GATE_NOTES=""
     local result="$CURRENT/RESULT.md"
@@ -462,11 +562,14 @@ $(printf '%s' "$CHECK_OUTPUT" | tail -30)
     done
 
     # --- scope gate ---------------------------------------------------------------------
-    local after_paths changed
-    after_paths="$(mktemp)"
-    git_paths >"$after_paths"
-    changed="$(comm -13 "$before_paths" "$after_paths" 2>/dev/null | grep -v '^$' || true)"
-    rm -f "$after_paths"
+    local after_tree changed
+    after_tree="$(mktemp)"
+    snapshot_tree "$after_tree"
+    if has_unrepresentable_path "$before_tree" || has_unrepresentable_path "$after_tree"; then
+        gate_fail "a changed path contains a newline or tab; the diff-scope check cannot be trusted"
+    fi
+    changed="$(changed_paths "$before_tree" "$after_tree")"
+    rm -f "$after_tree"
 
     local allowed=() forbidden=()
     while IFS= read -r line; do [[ -n "$line" ]] && allowed+=("$line"); done \
@@ -541,6 +644,16 @@ $(printf '%s' "$CHECK_OUTPUT" | tail -30)
 # ---------------------------------------------------------------------------
 # Stops
 # ---------------------------------------------------------------------------
+
+# refuse_phase <exit-code> <message> - a refusal BEFORE or INSTEAD of running the
+# loop. Unlike stop_phase it must not change any file: a rejection leaves the
+# state exactly as it found it (no RUN_STATE write, no TASK.md rewrite).
+refuse_phase() {
+    local code="$1" message="$2"
+    printf 'run-phase: REFUSED: %s\n' "$message" >&2
+    release_phase_lock
+    exit "$code"
+}
 
 stop_phase() {  # stop_phase <exit-code> <run-state-status> <reason> <message>
     local code="$1" status="$2" reason="$3" message="$4"
@@ -633,15 +746,13 @@ main() {
 
     RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
     local phase_log="$CURRENT/logs/phase-${PHASE}-${RUN_ID}.log"
-    mkdir -p "$CURRENT/logs" "$PHASE_DIR/history"
 
     log "phase=$PHASE status=$state_status tasks: $(jq -r '[.tasks[]|select(.status=="done")]|length' "$QUEUE") done, $(jq -r '[.tasks[]|select(.status=="pending")]|length' "$QUEUE") pending, $(jq -r '[.tasks[]|select(.status=="in_progress")]|length' "$QUEUE") in_progress"
     log "phase verification: $(jq -r '(.phase_verification // []) | map(.cmd) | join(" ; ")' "$QUEUE")"
     log "log=$phase_log"
 
     if [[ -n "$escalated" ]]; then
-        STOP_TASK="${escalated%%,*}"
-        stop_phase 3 escalated "escalated_task" "Task(s) $escalated are escalated; Codex must resolve them in the queue (revise, split or drop) before the loop runs again"
+        refuse_phase 3 "Task(s) $escalated are escalated; Codex must resolve them in the queue (revise, split or drop) before the loop runs again"
     fi
 
     if [[ "$dry_run" -eq 1 ]]; then
@@ -650,30 +761,59 @@ main() {
         exit 0
     fi
 
-    # --- resume diagnostics run BEFORE the loop lock is taken: check-state must
-    #     never see this process's own .phase.lock as "another loop is alive".
+    # --- resume diagnostics (READ-ONLY: a refused run must not change anything) -----
+    # check-state also reports a live worker/loop lock; this runs before the loop
+    # takes its own lock and before any file is touched, so a live run is never
+    # disturbed and a rejection leaves the state intact.
+    local cs_out="" cs_verdict="" need_repair=0
     if [[ -n "$CHECK_STATE" ]]; then
-        local preflight
-        preflight="$(next_task_id)"
-        if [[ -n "$preflight" ]]; then
-            # Render TASK.md for the Task about to run and move any report left
-            # over from another Task aside, so the diagnostics see the state the
-            # loop is actually resuming from (the loop re-renders, idempotently).
-            render_task_md "$preflight" "$CURRENT/TASK.md"
-            quarantine_stale_reports "$preflight"
-        fi
-        local cs_out="" cs_rc=0 cs_verdict
-        cs_out="$(cd "$ROOT" && "$CHECK_STATE" 2>&1)" || cs_rc=$?
+        cs_out="$(cd "$ROOT" && "$CHECK_STATE" 2>&1)" || true
         cs_verdict="$(printf '%s' "$cs_out" | awk -F': ' '/^verdict: /{print $2}' | awk '{print $1}')"
         case "$cs_verdict" in
-            INCONSISTENT|WORKER_RUNNING)
+            WORKER_RUNNING)
                 printf '%s\n' "$cs_out" >&2
-                stop_phase 5 checkpoint "state_inconsistent" "check-state verdict $cs_verdict: fix the state before the loop runs" ;;
+                refuse_phase 5 "a worker or another phase loop is live: nothing was started and no state was changed" ;;
+            INCONSISTENT)
+                if ! printf '%s\n' "$cs_out" | check_state_issues_repairable; then
+                    printf '%s\n' "$cs_out" >&2
+                    refuse_phase 5 "check-state verdict INCONSISTENT: fix the state before the loop runs (no state was changed)"
+                fi
+                need_repair=1 ;;
         esac
     fi
 
     acquire_phase_lock "$break_lock"
     trap 'release_phase_lock' EXIT
+
+    # --- the only repairs made before the loop starts (both need the lock above):
+    #     a missing/template TASK.md, and reports left over from another Task --------
+    if [[ "$need_repair" -eq 1 ]]; then
+        local preflight
+        preflight="$(next_task_id)"
+        if [[ -n "$preflight" ]]; then
+            repair_task_md "$preflight"
+            quarantine_stale_reports "$preflight"
+        fi
+        cs_out="$(cd "$ROOT" && "$CHECK_STATE" --ignore-phase-lock-pid "$$" 2>&1)" || true
+        cs_verdict="$(printf '%s' "$cs_out" | awk -F': ' '/^verdict: /{print $2}' | awk '{print $1}')"
+        case "$cs_verdict" in
+            WORKER_RUNNING|INCONSISTENT)
+                printf '%s\n' "$cs_out" >&2
+                refuse_phase 5 "check-state is still $cs_verdict after the TASK.md repair; fix the state (RUN_STATE was not changed)" ;;
+        esac
+    fi
+
+    # --- fail closed on paths the diff-scope check cannot represent -----------------
+    local tree_check
+    tree_check="$(mktemp)"
+    snapshot_tree "$tree_check"
+    if has_unrepresentable_path "$tree_check"; then
+        rm -f "$tree_check"
+        refuse_phase 5 "a changed path in this project contains a newline or tab; the diff-scope check cannot be trusted"
+    fi
+    rm -f "$tree_check"
+
+    mkdir -p "$CURRENT/logs" "$PHASE_DIR/history"
 
     # --- task loop -------------------------------------------------------------------------
     local ran=0
@@ -704,10 +844,10 @@ main() {
         log "$next_id start (mode=$mode risk=$risk resumed=$resumed): $title"
 
         # 3. one Task = one OpenCode session
-        local before_paths before_hashes started rc=0
-        before_paths="$(mktemp)"
+        local before_tree before_hashes started rc=0
+        before_tree="$(mktemp)"
         before_hashes="$(mktemp)"
-        git_paths >"$before_paths"
+        snapshot_tree "$before_tree"
         snapshot_hashes >"$before_hashes"
         started="$(date +%s)"
         "$WORKER" --root "$ROOT" --allow-dirty --mode "$mode" --task-id "$next_id" --title "$title" \
@@ -718,15 +858,15 @@ main() {
         local gate_ok=0
         case "$rc" in
         0)
-            gate_task "$next_id" "$started" "$before_paths" "$before_hashes" "$rc" && gate_ok=1 || gate_ok=0
+            gate_task "$next_id" "$started" "$before_tree" "$before_hashes" "$rc" && gate_ok=1 || gate_ok=0
             ;;
         5)
-            gate_task "$next_id" "$started" "$before_paths" "$before_hashes" "$rc" || true
-            rm -f "$before_paths" "$before_hashes"
+            gate_task "$next_id" "$started" "$before_tree" "$before_hashes" "$rc" || true
+            rm -f "$before_tree" "$before_hashes"
             stop_phase 2 checkpoint "worker_exit_5" "$next_id wrote a RESULT.md but opencode exited non-zero; read .agent/current/RESULT.md and VERIFY.md before accepting"
             ;;
         10)
-            rm -f "$before_paths" "$before_hashes"
+            rm -f "$before_tree" "$before_hashes"
             local esc_class
             esc_class="$(awk '/^## Class[[:space:]]*$/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' "$CURRENT/ESCALATION.md")"
             esc_class="${esc_class:-ESCALATE}"
@@ -741,23 +881,23 @@ main() {
             esac
             ;;
         4|6)
-            rm -f "$before_paths" "$before_hashes"
+            rm -f "$before_tree" "$before_hashes"
             stop_phase 5 checkpoint "report_inconsistent" "$next_id produced a stale, malformed or conflicting report (exit $rc); inspect .agent/current/ and history/attempts/"
             ;;
         7|8)
-            rm -f "$before_paths" "$before_hashes"
+            rm -f "$before_tree" "$before_hashes"
             stop_phase 5 checkpoint "worker_lock" "$next_id could not start (exit $rc): another worker or an unproven stale lock; run check-state.sh, then retry"
             ;;
         2|3)
-            rm -f "$before_paths" "$before_hashes"
+            rm -f "$before_tree" "$before_hashes"
             stop_phase 5 checkpoint "worker_plumbing" "$next_id produced no report (opencode exit=$rc, plumbing); see $phase_log"
             ;;
         *)
-            rm -f "$before_paths" "$before_hashes"
+            rm -f "$before_tree" "$before_hashes"
             stop_phase 2 checkpoint "worker_precondition" "$next_id could not run (exit $rc); fix the Task/state, then run the loop again"
             ;;
         esac
-        rm -f "$before_paths" "$before_hashes"
+        rm -f "$before_tree" "$before_hashes"
 
         if [[ "$gate_ok" -ne 1 ]]; then
             queue_update_task "$next_id" '.status = "escalated"'

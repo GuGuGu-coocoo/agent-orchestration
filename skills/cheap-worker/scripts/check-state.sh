@@ -29,7 +29,11 @@
 # Exit codes: 0 = actionable (RUNNING / QUEUE_COMPLETE / EMPTY), 1 = stop (the rest).
 #
 # Usage:
-#   check-state.sh [--root DIR]
+#   check-state.sh [--root DIR] [--ignore-phase-lock-pid PID]
+#
+# --ignore-phase-lock-pid PID is used by run-phase.sh, which holds its own
+# .phase.lock while it calls this script: without it, the loop would see itself
+# as "another phase loop is alive".
 
 set -euo pipefail
 
@@ -105,10 +109,11 @@ set_verdict() { VERDICT="$1"; case "$1" in RUNNING|EMPTY|QUEUE_COMPLETE) STOP=0 
 KNOWN_STATES="idle running checkpoint escalated awaiting_phase_review awaiting_human_qa"
 
 main() {
-    local root_arg=""
+    local root_arg="" ignore_phase_pid=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --root) root_arg="${2:-}"; shift 2 ;;
+            --ignore-phase-lock-pid) ignore_phase_pid="${2:-}"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) printf 'check-state: unknown argument %s\n' "$1" >&2; exit 1 ;;
         esac
@@ -126,9 +131,14 @@ main() {
     fi
 
     # --- live processes -----------------------------------------------------------------
-    local worker_live="" phase_live=""
+    local worker_live="" phase_live="" phase_ignored=0
     worker_live="$(live_pid_in "$current/.worker.lock" || true)"
     phase_live="$(live_pid_in "$current/.phase.lock" || true)"
+    if [[ -n "$phase_live" && -n "$ignore_phase_pid" ]]; then
+        case "$phase_live" in
+            "wrapper:$ignore_phase_pid") phase_ignored=1; phase_live="" ;;
+        esac
+    fi
     if [[ -n "$worker_live" ]]; then
         ok "worker lock held by a LIVE process ($worker_live): $(tr '\n' ' ' <"$current/.worker.lock/info")"
     elif [[ -d "$current/.worker.lock" ]]; then
@@ -138,6 +148,8 @@ main() {
     fi
     if [[ -n "$phase_live" ]]; then
         ok "phase lock held by a LIVE loop ($phase_live): $(tr '\n' ' ' <"$current/.phase.lock/info")"
+    elif [[ "$phase_ignored" -eq 1 ]]; then
+        ok "phase lock is this loop's own (pid $ignore_phase_pid), ignored"
     elif [[ -d "$current/.phase.lock" ]]; then
         warn "stale phase lock (no live pid); run-phase refuses until --break-lock is passed after verification"
     fi

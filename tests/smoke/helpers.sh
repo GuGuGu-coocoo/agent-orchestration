@@ -174,6 +174,7 @@ run_phase_fake() {
         PATH="$bin:$PATH" \
         FAKE_OPENCODE_MODE="script" \
         FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" \
+        FAKE_TASK_DIR="${FAKE_TASK_DIR:-}" \
             "$RUN_PHASE" "$@" >"$log" 2>&1 || prc=$?
         printf '%s' "$prc" >"$rc_out"
         exit 0

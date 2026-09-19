@@ -12,7 +12,7 @@ is.
 | `guarded_task_review` | a `guarded` Task was accepted | review that Task's diff yourself (architecture / public API / schema / security / deployment); then run the loop again |
 | `worker_checkpoint` | the worker asked a question (`ESCALATION.md`, Class CHECKPOINT) | answer it: revise the Task, split it, write `REVIEW.md` corrections, or ask the human |
 | `worker_escalation`, `escalated_task`, `verification_failed` | blocked | fix the Task definition or the plan in the queue, then run the loop |
-| `state_inconsistent`, `report_inconsistent`, `worker_plumbing`, `worker_lock`, `worker_precondition`, `worker_exit_5`, `phase_verification_failed` | plumbing / state | inspect, fix the state, then run the loop |
+| `state_inconsistent` (only from a stop *inside* the loop), `report_inconsistent`, `worker_plumbing`, `worker_lock`, `worker_precondition`, `worker_exit_5`, `phase_verification_failed` | plumbing / state | inspect, fix the state, then run the loop |
 
 ## 1. `worker_checkpoint` - the worker asked for a decision
 
@@ -59,9 +59,17 @@ human-owned decision does not slip through unreviewed.
 
 ## 4. Plumbing and inconsistent stops
 
+A **refusal before the loop starts** (exit 5: a live worker or another phase loop,
+an inconsistent state, a path the scope check cannot represent) changes nothing:
+no `RUN_STATE.json` write, no `TASK.md` rewrite, no logs directory. It reports what
+it found and leaves the project exactly as it was, so a live run is never disturbed.
+Fix the cause, then run the loop again.
+
+Stops **inside** the loop do record their state (`stop_reason`):
+
 `worker_plumbing` (opencode failed, no report), `worker_lock` (another worker or
 an unproven stale lock), `report_inconsistent` (stale/malformed/conflicting
-report), `state_inconsistent` (check-state verdict INCONSISTENT),
+report), `state_inconsistent` (check-state verdict INCONSISTENT found mid-loop),
 `worker_precondition` (TASK.md invalid, dirty tree, id mismatch),
 `worker_exit_5` (valid RESULT but opencode exited non-zero),
 `archive_failed`, `phase_verification_failed`.

@@ -142,10 +142,16 @@ cd /path/to/target-project
 | 2 | stopped at a checkpoint (Codex decision needed) |
 | 3 | stopped at an escalation (blocked) |
 | 4 | refused: the Phase is at a gate (`awaiting_phase_review` / `awaiting_human_qa`) |
-| 5 | stopped at an inconsistent/plumbing state (report, lock, state) |
+| 5 | refused before the loop started (live worker/loop, inconsistent state) or stopped at an inconsistent/plumbing state — a **refusal never changes any file** |
 
 Flags: `--root DIR`, `--max-tasks N` (safety cap), `--dry-run`, `--break-lock`
 (clear a provably dead loop lock), `--no-check-state`.
+
+Before it touches anything, the loop (1) validates the plan and the state
+read-only, (2) asks `check-state.sh` whether a worker or another loop is live —
+**a refusal leaves `RUN_STATE.json`, `TASK_QUEUE.json` and `TASK.md` byte-identical**,
+(3) takes its own `.phase.lock`, and only then repairs a missing/template `TASK.md`
+or quarantines a report left over from another Task.
 
 The Phase review is recorded with:
 
@@ -163,8 +169,11 @@ For every Task the loop re-runs, itself, deterministically:
 - `RESULT.md` is fresh, belongs to this Task, `Status: DONE`, no unticked criteria;
 - every `verification` command from the queue re-runs and meets its expectation
   (`exit 0`, `exit N`, or `contains:<text>`);
-- the changed files are inside `allowed_changes` and outside `forbidden_changes`
-  (tool artifacts such as `__pycache__`/`.pytest_cache` are ignored);
+- every file git reports as dirty (tracked, staged, deleted, untracked) is
+  fingerprinted — content, file mode and existence — before and after the Task,
+  and the two snapshots are compared per path: a second edit to a file that was
+  **already dirty** when the Task started is caught too (nothing is subtracted);
+  tool artifacts such as `__pycache__`/`.pytest_cache` are ignored;
 - `TASK_QUEUE.json`, `RUN_STATE.json`, `PHASE.md` and `TASK.md` were not touched by
   the worker.
 

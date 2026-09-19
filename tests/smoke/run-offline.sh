@@ -1027,6 +1027,284 @@ check_eq "gate: a worker edit of the queue -> exit 3" "3" "$LAST_EXIT"
 check "gate: the tampering is named" grep -q 'Supervisor artifact' "$KREPO/.agent/current/VERIFY.md"
 
 # ---------------------------------------------------------------------------
+# 7c. the diff-scope gate must catch changes to ALREADY DIRTY files
+#     (review finding HIGH: a forbidden tracked file that was dirty before the
+#     Task, then overwritten by it, used to be auto-accepted)
+# ---------------------------------------------------------------------------
+info "scope gate: already-dirty files (regression)"
+
+# G1: no-HEAD repo, forbidden file already dirty (untracked) and overwritten
+G1="$(new_repo smoke-scope-g1)"
+CLEANUP_DIRS+=("$G1")
+G1FIX="$(mktemp -d "$TMP_BASE/smoke-fix-g1.XXXXXX")"
+CLEANUP_DIRS+=("$G1FIX")
+printf 'existing user work\n' >"$G1/forbidden.txt"
+printf 'old\n' >"$G1/allowed.txt"
+write_phase_md "$G1" "A"
+write_run_state "$G1" "A" "idle" >/dev/null
+G1Q="$G1FIX/tasks.jsonl"
+queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' \
+    "allowed.txt" "forbidden.txt" >>"$G1Q"
+write_queue "$G1" "A" "$G1Q" 'test "$(cat allowed.txt)" = ok'
+cat >"$G1FIX/A01.sh" <<'EOF'
+printf 'ok\n' > allowed.txt
+printf 'overwritten\n' > forbidden.txt
+EOF
+FAKE_TASK_DIR="$G1FIX" run_phase_fake "$G1" "$FAKEBIN"
+check_eq "G1: overwriting an already-dirty forbidden file -> exit 3" "3" "$LAST_EXIT"
+check "G1: the Task was NOT auto-accepted" bash -c "! ls -d '$G1'/.agent/history/*A01 >/dev/null 2>&1"
+check "G1: the queue did not mark it done" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"A01\")][0].status != \"done\"' '$G1/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "G1: VERIFY.md names the forbidden file" grep -q 'forbidden.txt' "$G1/.agent/current/VERIFY.md"
+check "G1: VERIFY.md records the FAIL" grep -q '^FAIL' "$G1/.agent/current/VERIFY.md"
+
+# G2: same with a HEAD and a tracked, already-dirty forbidden file
+G2="$(new_repo smoke-scope-g2)"
+CLEANUP_DIRS+=("$G2")
+G2FIX="$(mktemp -d "$TMP_BASE/smoke-fix-g2.XXXXXX")"
+CLEANUP_DIRS+=("$G2FIX")
+printf 'existing user work\n' >"$G2/forbidden.txt"
+printf 'old\n' >"$G2/allowed.txt"
+write_phase_md "$G2" "A"
+write_run_state "$G2" "A" "idle" >/dev/null
+G2Q="$G2FIX/tasks.jsonl"
+queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' \
+    "allowed.txt" "forbidden.txt" >>"$G2Q"
+write_queue "$G2" "A" "$G2Q" 'test "$(cat allowed.txt)" = ok'
+commit_all "$G2" "baseline"
+printf 'local uncommitted user work\n' >"$G2/forbidden.txt"
+check "G2: fixture really has a HEAD and a dirty forbidden file" bash -c \
+    "git -C '$G2' rev-parse -q --verify HEAD >/dev/null && ! git -C '$G2' diff --quiet -- forbidden.txt"
+cat >"$G2FIX/A01.sh" <<'EOF'
+printf 'ok\n' > allowed.txt
+printf 'overwritten\n' > forbidden.txt
+EOF
+FAKE_TASK_DIR="$G2FIX" run_phase_fake "$G2" "$FAKEBIN"
+check_eq "G2: tracked+dirty forbidden file overwritten -> exit 3" "3" "$LAST_EXIT"
+check "G2: the Task was NOT auto-accepted" bash -c "! ls -d '$G2'/.agent/history/*A01 >/dev/null 2>&1"
+check "G2: VERIFY.md names the forbidden file" grep -q 'forbidden.txt' "$G2/.agent/current/VERIFY.md"
+
+# G3: an already-dirty file that IS allowed may be edited again (no over-blocking)
+G3="$(new_repo smoke-scope-g3)"
+CLEANUP_DIRS+=("$G3")
+G3FIX="$(mktemp -d "$TMP_BASE/smoke-fix-g3.XXXXXX")"
+CLEANUP_DIRS+=("$G3FIX")
+printf 'old\n' >"$G3/allowed.txt"
+printf 'untouched user work\n' >"$G3/unrelated.txt"
+write_phase_md "$G3" "A"
+write_run_state "$G3" "A" "idle" >/dev/null
+G3Q="$G3FIX/tasks.jsonl"
+queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' \
+    "allowed.txt" "" >>"$G3Q"
+write_queue "$G3" "A" "$G3Q" 'test "$(cat allowed.txt)" = ok'
+cat >"$G3FIX/A01.sh" <<'EOF'
+printf 'ok\n' > allowed.txt
+EOF
+commit_all "$G3" "baseline"
+FAKE_TASK_DIR="$G3FIX" run_phase_fake "$G3" "$FAKEBIN"
+check_eq "G3: re-editing an already-dirty ALLOWED file -> exit 0" "0" "$LAST_EXIT"
+check "G3: the Task was accepted" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"A01\")][0].status == \"done\"' '$G3/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "G3: the untouched dirty file was not blamed on the Task" bash -c \
+    "! grep -q 'unrelated.txt' '$G3/.agent/current/VERIFY.md'"
+
+# G4: deleting a tracked file outside Allowed Changes is a scope violation
+G4="$(new_repo smoke-scope-g4)"
+CLEANUP_DIRS+=("$G4")
+G4FIX="$(mktemp -d "$TMP_BASE/smoke-fix-g4.XXXXXX")"
+CLEANUP_DIRS+=("$G4FIX")
+printf 'old\n' >"$G4/allowed.txt"
+printf 'keep me\n' >"$G4/keep.txt"
+write_phase_md "$G4" "A"
+write_run_state "$G4" "A" "idle" >/dev/null
+G4Q="$G4FIX/tasks.jsonl"
+queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' \
+    "allowed.txt" "" >>"$G4Q"
+write_queue "$G4" "A" "$G4Q" 'test "$(cat allowed.txt)" = ok'
+cat >"$G4FIX/A01.sh" <<'EOF'
+printf 'ok\n' > allowed.txt
+rm -f keep.txt
+EOF
+commit_all "$G4" "baseline"
+FAKE_TASK_DIR="$G4FIX" run_phase_fake "$G4" "$FAKEBIN"
+check_eq "G4: deleting a file outside Allowed Changes -> exit 3" "3" "$LAST_EXIT"
+check "G4: VERIFY.md names the deleted file" grep -q 'keep.txt' "$G4/.agent/current/VERIFY.md"
+
+# G5: deleting a tracked file that IS allowed is fine
+G5="$(new_repo smoke-scope-g5)"
+CLEANUP_DIRS+=("$G5")
+G5FIX="$(mktemp -d "$TMP_BASE/smoke-fix-g5.XXXXXX")"
+CLEANUP_DIRS+=("$G5FIX")
+printf 'old\n' >"$G5/obsolete.txt"
+write_phase_md "$G5" "A"
+write_run_state "$G5" "A" "idle" >/dev/null
+G5Q="$G5FIX/tasks.jsonl"
+queue_task_json A01 "remove the obsolete file" low pending 'test ! -e obsolete.txt' \
+    "obsolete.txt" "" >>"$G5Q"
+write_queue "$G5" "A" "$G5Q" 'test ! -e obsolete.txt'
+cat >"$G5FIX/A01.sh" <<'EOF'
+rm -f obsolete.txt
+EOF
+commit_all "$G5" "baseline"
+FAKE_TASK_DIR="$G5FIX" run_phase_fake "$G5" "$FAKEBIN"
+check_eq "G5: deleting an ALLOWED tracked file -> exit 0" "0" "$LAST_EXIT"
+check "G5: the Task was accepted" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"A01\")][0].status == \"done\"' '$G5/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+
+# ---------------------------------------------------------------------------
+# 7d. a live run is never disturbed: refusal is read-only
+#     (review finding HIGH: startup rewrote TASK.md and RUN_STATE while a worker
+#     was still live)
+# ---------------------------------------------------------------------------
+info "startup: read-only refusal while a run is live (regression)"
+
+H1="$(new_repo smoke-live-h1)"
+CLEANUP_DIRS+=("$H1")
+H1FIX="$(mktemp -d "$TMP_BASE/smoke-fix-h1.XXXXXX")"
+CLEANUP_DIRS+=("$H1FIX")
+printf 'old\n' >"$H1/allowed.txt"
+write_phase_md "$H1" "A"
+write_run_state "$H1" "A" "running" >/dev/null
+H1Q="$H1FIX/tasks.jsonl"
+queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' "allowed.txt" "" >>"$H1Q"
+write_queue "$H1" "A" "$H1Q" 'test "$(cat allowed.txt)" = ok'
+mkdir -p "$H1/.agent/current"
+cat >"$H1/.agent/current/TASK.md" <<'EOF'
+# Task
+
+## Task ID
+A01
+
+## Marker
+AUDIT ORIGINAL DEFINITION
+EOF
+printf '%s' '{"task_id":"A01","run_id":"r1","status":"running"}' >"$H1/.agent/current/STATE.json"
+commit_all "$H1" "live fixture"
+sleep 30 &
+H1PID=$!
+mkdir -p "$H1/.agent/current/.worker.lock"
+printf 'pid=%s\nworker_pid=\nrun_id=live\n' "$H1PID" >"$H1/.agent/current/.worker.lock/info"
+H1_BEFORE_TASK="$(shasum "$H1/.agent/current/TASK.md" | awk '{print $1}')"
+H1_BEFORE_RS="$(shasum "$H1/.agent/RUN_STATE.json" | awk '{print $1}')"
+H1_BEFORE_Q="$(shasum "$H1/.agent/phases/A/TASK_QUEUE.json" | awk '{print $1}')"
+run_phase_fake "$H1" "$FAKEBIN"
+check_eq "H1: a live worker lock refuses the loop -> exit 5" "5" "$LAST_EXIT"
+check "H1: the refusal says a worker is live" grep -q 'is live' "$OUT_DIR/phase-${TEST_NAME}.log"
+check_eq "H1: TASK.md is byte-identical after the refusal" "$H1_BEFORE_TASK" \
+    "$(shasum "$H1/.agent/current/TASK.md" | awk '{print $1}')"
+check "H1: the original Task definition survived" grep -q 'AUDIT ORIGINAL DEFINITION' "$H1/.agent/current/TASK.md"
+check_eq "H1: RUN_STATE.json is byte-identical after the refusal" "$H1_BEFORE_RS" \
+    "$(shasum "$H1/.agent/RUN_STATE.json" | awk '{print $1}')"
+check_eq "H1: TASK_QUEUE.json is byte-identical after the refusal" "$H1_BEFORE_Q" \
+    "$(shasum "$H1/.agent/phases/A/TASK_QUEUE.json" | awk '{print $1}')"
+check "H1: RUN_STATE still says running" bash -c "jq -e '.status == \"running\"' '$H1/.agent/RUN_STATE.json' >/dev/null"
+check "H1: no phase log directory was created" bash -c "! test -d '$H1/.agent/current/logs'"
+check "H1: no phase lock was left behind" bash -c "! test -e '$H1/.agent/current/.phase.lock'"
+kill "$H1PID" 2>/dev/null || true
+wait "$H1PID" 2>/dev/null || true
+rm -rf "$H1/.agent/current/.worker.lock"
+
+# H2: a live phase loop (another run-phase) refuses without touching anything
+H2="$(new_repo smoke-live-h2)"
+CLEANUP_DIRS+=("$H2")
+H2FIX="$(mktemp -d "$TMP_BASE/smoke-fix-h2.XXXXXX")"
+CLEANUP_DIRS+=("$H2FIX")
+printf 'old\n' >"$H2/allowed.txt"
+write_phase_md "$H2" "A"
+write_run_state "$H2" "A" "running" >/dev/null
+H2Q="$H2FIX/tasks.jsonl"
+queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' "allowed.txt" "" >>"$H2Q"
+write_queue "$H2" "A" "$H2Q" 'test "$(cat allowed.txt)" = ok'
+cat >"$H2FIX/A01.sh" <<'EOF'
+printf 'ok\n' > allowed.txt
+EOF
+commit_all "$H2" "live loop fixture"
+sleep 30 &
+H2PID=$!
+mkdir -p "$H2/.agent/current/.phase.lock"
+printf 'pid=%s\nrun_id=other\nphase=A\n' "$H2PID" >"$H2/.agent/current/.phase.lock/info"
+H2_BEFORE_RS="$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+run_phase_fake "$H2" "$FAKEBIN"
+check_eq "H2: a live phase loop refuses a second loop -> exit 5" "5" "$LAST_EXIT"
+check_eq "H2: RUN_STATE.json is byte-identical" "$H2_BEFORE_RS" \
+    "$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+check "H2: the other loop's lock was left in place" test -d "$H2/.agent/current/.phase.lock"
+kill "$H2PID" 2>/dev/null || true
+wait "$H2PID" 2>/dev/null || true
+
+# H3: a stale phase lock refuses read-only, and --break-lock is the way out
+H3_BEFORE_RS="$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+printf 'pid=999999\nrun_id=dead\nphase=A\n' >"$H2/.agent/current/.phase.lock/info"
+run_phase_fake "$H2" "$FAKEBIN"
+check_eq "H3: an unprovable stale phase lock -> exit 5" "5" "$LAST_EXIT"
+check_eq "H3: RUN_STATE.json is byte-identical" "$H3_BEFORE_RS" \
+    "$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+check "H3: the stale lock is still there" test -d "$H2/.agent/current/.phase.lock"
+FAKE_TASK_DIR="$H2FIX" run_phase_fake "$H2" "$FAKEBIN" --break-lock
+check_eq "H3: --break-lock lets the loop proceed -> exit 0" "0" "$LAST_EXIT"
+check "H3: the stale lock was archived" bash -c "ls -d '$H2'/.agent/history/attempts/stale-locks/* >/dev/null 2>&1"
+
+# ---------------------------------------------------------------------------
+# 7e. gate text is data, never jq filter source
+#     (review finding MEDIUM: a quoted --note broke the transition)
+# ---------------------------------------------------------------------------
+info "phase-gate: quoted notes/reasons (regression)"
+
+I1="$(new_repo smoke-gate-i1)"
+CLEANUP_DIRS+=("$I1")
+write_phase_md "$I1" "A"
+mkdir -p "$I1/.agent"
+printf '%s' '{"current_phase":"A","status":"awaiting_human_qa"}' >"$I1/.agent/RUN_STATE.json"
+I1_RC=0
+(cd "$I1" && "$PHASE_GATE" qa-pass --note '确认 "登录" 正常') >"$OUT_DIR/gate-quoted-qa.log" 2>&1 || I1_RC=$?
+check_eq "I1: qa-pass with a quoted note -> exit 0" "0" "$I1_RC"
+check "I1: RUN_STATE is valid JSON" bash -c "jq empty '$I1/.agent/RUN_STATE.json'"
+check "I1: the verdict was recorded" bash -c "jq -e '.human_qa == \"passed\"' '$I1/.agent/RUN_STATE.json' >/dev/null"
+check "I1: the note text survived verbatim" bash -c "jq -r '.notes' '$I1/.agent/RUN_STATE.json' | grep -q '登录'"
+check "I1: the quotes survived" bash -c "jq -r '.notes' '$I1/.agent/RUN_STATE.json' | grep -qF '\"登录\"'"
+
+# review-pass with a summary that contains quotes and a newline
+I2="$(new_repo smoke-gate-i2)"
+CLEANUP_DIRS+=("$I2")
+printf 'old\n' >"$I2/allowed.txt"
+write_phase_md "$I2" "A"
+write_run_state "$I2" "A" "idle" >/dev/null
+I2Q="$I2/tasks.jsonl"
+queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' "allowed.txt" "" >>"$I2Q"
+write_queue "$I2" "A" "$I2Q" 'test "$(cat allowed.txt)" = ok'
+I2FIX="$(mktemp -d "$TMP_BASE/smoke-fix-i2.XXXXXX")"
+CLEANUP_DIRS+=("$I2FIX")
+cat >"$I2FIX/A01.sh" <<'EOF'
+printf 'ok\n' > allowed.txt
+EOF
+commit_all "$I2" "baseline"
+FAKE_TASK_DIR="$I2FIX" run_phase_fake "$I2" "$FAKEBIN"
+check_eq "I2: fixture reached awaiting_phase_review" "0" "$LAST_EXIT"
+I2_RC=0
+(cd "$I2" && "$PHASE_GATE" review-pass --summary 'reviewed "the diff"
+and re-ran everything') >"$OUT_DIR/gate-quoted-review.log" 2>&1 || I2_RC=$?
+check_eq "I2: review-pass with quotes and a newline -> exit 0" "0" "$I2_RC"
+check "I2: RUN_STATE is valid JSON" bash -c "jq empty '$I2/.agent/RUN_STATE.json'"
+check "I2: the state moved to human QA" bash -c "jq -e '.status == \"awaiting_human_qa\"' '$I2/.agent/RUN_STATE.json' >/dev/null"
+check "I2: only the first summary line is in notes" bash -c \
+    "jq -r '.notes' '$I2/.agent/RUN_STATE.json' | grep -qF 'reviewed \"the diff\"'"
+check "I2: PHASE.md has the Result section" grep -q 'Reviewed by: Codex phase review' "$I2/.agent/phases/A/PHASE.md"
+
+# review-fail with a quoted reason (adjustment + notes)
+I3_RC=0
+(cd "$I2" && "$PHASE_GATE" qa-fail --note 'defect: "export" button') >"$OUT_DIR/gate-quoted-qa-fail.log" 2>&1 || I3_RC=$?
+check_eq "I3: qa-fail with a quoted note -> exit 0" "0" "$I3_RC"
+check "I3: RUN_STATE is valid JSON" bash -c "jq empty '$I2/.agent/RUN_STATE.json'"
+check "I3: the queue is valid JSON" bash -c "jq empty '$I2/.agent/phases/A/TASK_QUEUE.json'"
+check "I3: the adjustment kept the text" bash -c \
+    "jq -r '[.adjustments[] | .reason] | join(\" \")' '$I2/.agent/phases/A/TASK_QUEUE.json' | grep -qF '\"export\"'"
+check "I3: the state was reopened" bash -c "jq -e '.status == \"running\"' '$I2/.agent/RUN_STATE.json' >/dev/null"
+I4_RC=0
+(cd "$I2" && "$PHASE_GATE" review-fail --reason 'needs "one" more Task') >"$OUT_DIR/gate-quoted-review-fail.log" 2>&1 || I4_RC=$?
+check_eq "I4: review-fail in the wrong state -> exit 1" "1" "$I4_RC"
+
+
+# ---------------------------------------------------------------------------
 # 8. check-state fail-closed matrix (new states)
 # ---------------------------------------------------------------------------
 info "check-state matrix"

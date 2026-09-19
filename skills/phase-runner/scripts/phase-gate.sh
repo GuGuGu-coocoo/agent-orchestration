@@ -57,15 +57,36 @@ jqv() {
     printf '%s' "$fallback"
 }
 
-update_run_state() {  # update_run_state <jq-expr>
-    local expr="$1" tmp
+# state_patch <status|-> <stop_reason|-> <notes|-> [<extra-json-object>]
+#
+# Every value is passed to jq with --arg: note/summary/reason text is data, never
+# filter source, so quotes, backslashes and newlines cannot break the transition.
+# "-" leaves a field unchanged.
+state_patch() {
+    local status="$1" reason="$2" notes="$3" extra="${4:-}" tmp
+    [[ -n "$extra" ]] || extra='{}'
     tmp="$(mktemp)"
-    if jq --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" ".updated_at = \$now | ($expr)" "$RUN_STATE" >"$tmp"; then
+    if jq --arg s "$status" --arg r "$reason" --arg n "$notes" --argjson x "$extra" \
+        --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+        .updated_at = $now
+        | (if $s == "-" then . else .status = $s end)
+        | (if $r == "-" then . else .stop_reason = $r end)
+        | (if $n == "-" then . else .notes = $n end)
+        | . + $x
+      ' "$RUN_STATE" >"$tmp"; then
         mv "$tmp" "$RUN_STATE"
     else
         rm -f "$tmp"
         die "cannot update $RUN_STATE"
     fi
+}
+
+first_line() {  # first_line <text> [max-chars]
+    printf '%s' "$1" | head -1 | cut -c1-"${2:-200}"
+}
+
+json_obj() {  # json_obj <jq-args...> - build an object safely from --arg values
+    jq -nc "$@"
 }
 
 append_adjustment() {  # append_adjustment <change> <reason>
@@ -191,8 +212,9 @@ $(printf '%s' "$CHECK_OUTPUT" | tail -40)
     mv "$tmp" "$PHASE_DIR/PHASE.md"
 
     local note
-    note="$(printf '%s' "$summary" | head -1 | cut -c1-200)"
-    update_run_state ".status = \"awaiting_human_qa\" | .stop_reason = \"\" | .phase_review = \"passed\" | .phase_reviewed_at = \$now | .notes = \"phase review passed: $note\""
+    note="$(first_line "$summary")"
+    state_patch "awaiting_human_qa" "" "phase review passed: $note" \
+        "$(json_obj --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '{phase_review: "passed", phase_reviewed_at: $at}')"
     log "phase $PHASE accepted by the review; state=awaiting_human_qa"
     log "STOP for human QA: nothing starts automatically. Tell the human what to test (PHASE.md '## Human QA Required')."
     log "After the human confirms: phase-gate.sh qa-pass --note \"...\""
@@ -207,7 +229,7 @@ do_review_fail() {
     require_state "awaiting_phase_review" "only a Phase waiting for review can be sent back"
     require_phase_context
     append_adjustment "phase review failed; corrective Tasks required" "$reason"
-    update_run_state ".status = \"running\" | .stop_reason = \"phase_review_failed\" | .notes = \"review-fail: $(printf '%s' "$reason" | head -1 | cut -c1-200)\""
+    state_patch "running" "phase_review_failed" "review-fail: $(first_line "$reason")"
     log "phase $PHASE reopened (queue status running)"
     log "next: append the corrective Tasks to $QUEUE, then run run-phase.sh"
     exit 0
@@ -218,7 +240,8 @@ do_qa_pass() {
     local note="$1"
     [[ -n "$note" ]] || die "qa-pass needs --note \"how the human confirmed it\""
     require_state "awaiting_human_qa" "only a Phase awaiting human QA can be confirmed"
-    update_run_state ".status = \"idle\" | .stop_reason = \"\" | .human_qa = \"passed\" | .human_qa_at = \$now | .notes = \"human QA passed: $(printf '%s' "$note" | head -1 | cut -c1-200)\""
+    state_patch "idle" "" "human QA passed: $(first_line "$note")" \
+        "$(json_obj --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '{human_qa: "passed", human_qa_at: $at}')"
     log "human QA recorded as passed for phase $(jqv "$RUN_STATE" '.current_phase')"
     log "The next Phase is a deliberate new decision: plan it (PHASE.md + TASK_QUEUE.json), then run run-phase.sh."
     exit 0
@@ -231,7 +254,8 @@ do_qa_fail() {
     require_state "awaiting_human_qa" "only a Phase awaiting human QA can be sent back"
     require_phase_context
     append_adjustment "human QA reported defects" "$note"
-    update_run_state ".status = \"running\" | .stop_reason = \"human_qa_failed\" | .human_qa = \"failed\" | .notes = \"human QA defects: $(printf '%s' "$note" | head -1 | cut -c1-200)\""
+    state_patch "running" "human_qa_failed" "human QA defects: $(first_line "$note")" \
+        "$(json_obj '{human_qa: "failed"}')"
     log "phase $PHASE reopened after human QA"
     log "next: convert each reported defect into a Task in $QUEUE, then run run-phase.sh"
     exit 0
