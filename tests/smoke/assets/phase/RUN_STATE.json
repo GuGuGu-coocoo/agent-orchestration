@@ -1,0 +1,9 @@
+{
+  "target_phase": "A",
+  "current_phase": "A",
+  "current_task": "A02",
+  "status": "running",
+  "human_checkpoint": "after_phase_A",
+  "updated_at": "2026-09-19T00:00:00Z",
+  "notes": "A01 done before this session; resume at A02"
+}

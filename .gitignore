@@ -1,0 +1,12 @@
+# Agent orchestration runtime state (per-project Task/RESULT/state files)
+.agent/
+
+# Logs
+*.log
+*.jsonl
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

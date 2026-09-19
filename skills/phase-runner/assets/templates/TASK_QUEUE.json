@@ -1,0 +1,28 @@
+{
+  "phase": "X",
+  "status": "planning",
+  "human_checkpoint_after": true,
+  "created_at": "",
+  "updated_at": "",
+  "tasks": [
+    {
+      "id": "X01",
+      "title": "<short imperative title>",
+      "mode": "implement",
+      "status": "pending",
+      "acceptance_summary": "<one line the final review can check>",
+      "depends_on": [],
+      "history": []
+    },
+    {
+      "id": "X02",
+      "title": "<short imperative title>",
+      "mode": "implement",
+      "status": "pending",
+      "acceptance_summary": "<one line the final review can check>",
+      "depends_on": ["X01"],
+      "history": []
+    }
+  ],
+  "adjustments": []
+}
