@@ -75,8 +75,26 @@ Priority: **Correctness > minimal change > verifiability > elegance.**
   `references/worker-prompt.md`
 - When to stop and escalate: `references/escalation-policy.md`
 - Default safety boundaries: `references/safety-policy.md`
-- Scripts: `scripts/doctor.sh`, `scripts/run-worker.sh`, `scripts/status.sh`,
-  `scripts/collect-result.sh`, `scripts/archive-task.sh`
+- Scripts: `scripts/doctor.sh`, `scripts/run-worker.sh`, `scripts/worker-notify.sh`,
+  `scripts/status.sh`, `scripts/collect-result.sh`, `scripts/archive-task.sh`
+
+## Background handoff (worker-notify.sh)
+
+`run-worker.sh` blocks until the Task is done, which suits the Supervisor when it
+wants to watch live. `worker-notify.sh` is the non-blocking variant: it detaches,
+holds a `caffeinate` no-sleep assertion while the worker runs, and then delivers a
+short message to a Codex session with `codex queue`, so the Supervisor can end its
+turn and be woken up when there is something to review.
+
+```sh
+~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
+  --codex-thread "编排" --mode implement --task-id C01 --title "Coarse task title"
+```
+
+It forwards every other option to `run-worker.sh`, and writes
+`.agent/current/NOTIFY_FAILED.md` (plus a desktop notification) if the Codex
+session cannot be reached - for example when the app is closed or the session is
+archived. Keep the orchestration session open for wake-up to work.
 
 ## Backend and observability
 

@@ -89,6 +89,27 @@ main() {
         fi
     fi
 
+    printf 'notify backend (optional: background handoff + Codex wake-up)\n'
+    local codex_bin=""
+    if [[ -n "${CODEX_BIN:-}" && -x "${CODEX_BIN:-}" ]]; then
+        codex_bin="$CODEX_BIN"
+    elif command -v codex >/dev/null 2>&1; then
+        codex_bin="$(command -v codex)"
+    elif [[ -x "/Applications/ChatGPT.app/Contents/Resources/codex" ]]; then
+        codex_bin="/Applications/ChatGPT.app/Contents/Resources/codex"
+    fi
+    if [[ -n "$codex_bin" ]]; then
+        ok "codex CLI found: $codex_bin"
+        if "$codex_bin" queue --help >/dev/null 2>&1; then
+            ok "codex queue available (wake-up supported)"
+        else
+            warn "codex CLI found but 'queue' is unavailable; worker-notify will fall back to NOTIFY_FAILED.md"
+        fi
+    else
+        warn "codex CLI not found; worker-notify will write NOTIFY_FAILED.md instead of waking a session"
+    fi
+    command -v caffeinate >/dev/null 2>&1 && ok "caffeinate available (no-sleep assertion while a worker runs)" || warn "caffeinate not found (macOS sleep may pause unattended runs)"
+
     printf 'skill files\n'
     local sk
     if sk="$(skill_root)"; then
@@ -98,7 +119,7 @@ main() {
         [[ -f "$sk/references/worker-prompt.md" ]]           && ok "references/worker-prompt.md"       || bad "references/worker-prompt.md missing"
         [[ -f "$sk/references/safety-policy.md" ]]           && ok "references/safety-policy.md"       || bad "references/safety-policy.md missing"
         [[ -f "$sk/references/escalation-policy.md" ]]       && ok "references/escalation-policy.md"   || bad "references/escalation-policy.md missing"
-        for s in doctor.sh run-worker.sh status.sh collect-result.sh archive-task.sh; do
+        for s in doctor.sh run-worker.sh worker-notify.sh status.sh collect-result.sh archive-task.sh; do
             [[ -f "$sk/scripts/$s" ]] && ok "scripts/$s" || bad "scripts/$s missing"
         done
         if [[ "$sk" == "$HOME/.agents/skills/cheap-worker" ]]; then

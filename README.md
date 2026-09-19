@@ -52,7 +52,8 @@ agent-orchestration/
 │   │   ├── SKILL.md
 │   │   ├── scripts/
 │   │   │   ├── doctor.sh              # environment health check
-│   │   │   ├── run-worker.sh          # run exactly one Task via `opencode run`
+│   │   │   ├── run-worker.sh          # run exactly one Task (blocking)
+│   │   │   ├── worker-notify.sh       # run one Task in background + wake Codex
 │   │   │   ├── status.sh              # read-only status of the current Task
 │   │   │   ├── collect-result.sh      # print RESULT/ESCALATION (+ git diff)
 │   │   │   └── archive-task.sh        # move finished Task artifacts to history
@@ -142,6 +143,10 @@ Other helper scripts:
 ~/.agents/skills/cheap-worker/scripts/status.sh
 ~/.agents/skills/cheap-worker/scripts/collect-result.sh --diff
 ~/.agents/skills/cheap-worker/scripts/archive-task.sh --yes --decision ACCEPT
+
+# non-blocking variant: run in background and wake a Codex session when done
+~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
+  --codex-thread "编排" --mode implement --task-id C01 --title "Add retry queue"
 ```
 
 ## phase-runner usage
@@ -194,26 +199,40 @@ for you).
 ln -sfn ~/.agents/skills/phase-runner ~/.codex/skills/phase-runner
 ```
 
-Then in a new Codex conversation, say:
+Then in a new Codex conversation, name the session (e.g. `编排`) and say:
 
 > 用 $phase-runner 按现有 roadmap 做到 Phase C。
-> 你负责拆 Task，每个 Task 用 shell 调用
-> `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode implement --task-id C01 --title "..."`，
-> 等它结束后读 `.agent/current/RESULT.md` 和 git diff 验收，然后自动下一个 Task。
+> 我的会话名是「编排」；每个 Task 用后台方式投递：
+> `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --codex-thread "编排" --mode implement --task-id C01 --title "..."`
+> 投递完就结束回合，收到通知后再验收。
 > 普通技术问题不要问我。Phase C 验收通过后停止，我来人工测试。
+
+### Two handoff modes
+
+| Mode | Command | Codex behavior | Use when |
+| --- | --- | --- | --- |
+| Blocking | `run-worker.sh ...` | waits inside the turn, then continues | watching live, or no session name |
+| Background + wake-up | `worker-notify.sh --codex-thread "<name>" ...` | returns immediately and ends the turn; `codex queue` wakes the SAME session when the Task ends | unattended / long Tasks (default) |
+
+Wake-up details:
+
+- Requires the ChatGPT/Codex desktop app to stay open **with the orchestration
+  session open**: an open session can be woken; a closed or archived one cannot
+  (the message waits in the queue, and the helper writes `NOTIFY_FAILED.md` with a
+  hint when delivery fails).
+- The wake-up message is a short `[worker-notify] ...` user message in the same
+  session. It enters the context, so keep it short.
+- While the worker runs, the helper holds a `caffeinate -i` assertion so the Mac
+  does not idle-sleep. It cannot prevent lid-close sleep: for unattended runs, plug
+  in and keep the lid open.
 
 How the loop actually runs:
 
-- Codex calls `run-worker.sh` with its shell tool; that call blocks until the
-  OpenCode worker finishes. When it returns, Codex continues in the same turn -
-  that is what makes "ACCEPT -> next Task" automatic without the human typing
-  "continue".
-- There is no cross-process callback: nothing pushes a notification into Codex.
-  If Codex's turn ends (or its shell timeout fires on a long Task), the human has
-  to nudge it once.
-- A worker Task can run for minutes; if Codex's command timeout is too short, run
-  the worker in the background (`nohup ... &`) and poll for
-  `.agent/current/RESULT.md`.
+- In blocking mode, Codex blocks on the shell call and continues in the same turn
+  when it returns - that is what makes "ACCEPT -> next Task" automatic.
+- In wake-up mode, Codex ends its turn immediately; the `codex queue` message
+  starts a new turn in the same session so Codex can review and hand off the next
+  Task. No polling, no third process.
 - Implementation tokens are paid by OpenCode's model, not by Codex; Codex only
   spends on phase/task planning, the small handoff commands, and reviewing
   RESULT/diff/test output. That is the intended usage saving.
@@ -284,9 +303,12 @@ Defects reported during manual QA become new Tasks with the same loop. See
   rate-limited or unreachable, the worker fails with a plumbing error (exit 2)
   and the Supervisor decides. There is no fallback and no router.
 - The Supervisor loop is played by the current Codex/Astra session; there is no
-  separate orchestrator daemon.
+  separate orchestrator daemon. Wake-up mode requires the ChatGPT/Codex desktop app
+  to stay open with the orchestration session open (its daemon owns the session and
+  the message queue; closed or archived sessions cannot be woken).
 - `run-worker.sh` has no built-in wall-clock timeout (OpenCode's own behavior and
-  the caller's timeout apply).
+  the caller's timeout apply). `worker-notify.sh` solves the timeout problem by
+  detaching, but it cannot prevent lid-close sleep or a manual shutdown.
 - Reports are model-written Markdown; they can be wrong. The diff and command
   output are the evidence.
 - The worker prompt embeds the contract, so the worker never needs to read the

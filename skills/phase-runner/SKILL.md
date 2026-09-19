@@ -38,6 +38,31 @@ Phase C
 7. **One Task = one OpenCode session.** The worker runs on the shared background
    service so the human can watch it in OpenCode Desktop; never pass `--standalone`
    or `--model`, and give each session a clear title.
+8. **Wake-up handoff is allowed and preferred when the human names a session.** The
+   helper `worker-notify.sh` runs the worker in the background and wakes THIS Codex
+   session with `codex queue` when the Task ends. That is the sanctioned way for the
+   Supervisor to stop occupying its turn while the worker runs - not a callback the
+   Supervisor has to build.
+
+## Background handoff (wake-up mode)
+
+Prerequisites: the human names this Codex session (e.g. `编排`) and keeps the
+ChatGPT/Codex desktop app running **with that session open**. An open session can
+be woken by `codex queue`; a closed or archived one cannot (the message stays
+queued, or the helper writes `NOTIFY_FAILED.md`).
+
+Handoff: run `worker-notify.sh --codex-thread "<name>" ...`, report the plan in one
+line, and end your turn. You will receive a short `[worker-notify]` message when the
+Task ends:
+
+- `完成` -> do the normal review (step 14-15) and hand off the next Task.
+- `需要你决策` -> read `ESCALATION.md`, resolve or ask the human, then continue.
+- `失败` -> inspect `STATE.json` and the logs, then retry or escalate.
+
+If the app was closed or the session could not be reached, the helper writes
+`.agent/current/NOTIFY_FAILED.md` with the message; read it on your next turn to see
+what ended. Keep wake-up messages short - they enter this conversation as a user
+message and cost tokens on every wake-up.
 
 ## Workflow
 
@@ -75,12 +100,19 @@ Details and sizing rules: `references/phase-planning.md`.
 11. Render it into `.agent/current/TASK.md` using the TASK contract (keep a copy in
     `.agent/phases/<PHASE>/history/` for traceability).
 12. Record the git baseline: `git status`, `git rev-parse HEAD`.
-13. Invoke the worker exactly once per attempt:
-    `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode> --task-id <id> --title "<queue title>"`
-    Model choice belongs to OpenCode's own configuration; the worker script never
-    passes `--model` and never starts a private server. One Task = one OpenCode
-    session, visible in OpenCode Desktop.
-    Exit codes: `0` RESULT, `10` ESCALATION, `2/3/4` plumbing failures.
+13. Hand off the Task to the worker - exactly one Task at a time - in one of two modes:
+    - **Background + wake-up (default when the human named a Supervisor session)**:
+      `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --codex-thread "<session name>" --mode <mode> --task-id <id> --title "<queue title>"`
+      The command returns immediately. End your turn and wait. When the worker
+      finishes, `codex queue` delivers a short message into THIS session and you
+      wake up to review it.
+    - **Blocking (fallback: no session name, or the human wants to watch live)**:
+      `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode> --task-id <id> --title "<queue title>"`
+      This blocks until the worker finishes, then continue in the same turn.
+    Model choice belongs to OpenCode's own configuration; neither script passes
+    `--model` and neither starts a private server. One Task = one OpenCode session,
+    visible in OpenCode Desktop. Worker exit codes: `0` RESULT, `10` ESCALATION,
+    `2/3/4` plumbing failures.
 14. Review the result per `references/task-review.md`: read `TASK.md`, `RESULT.md`,
     `git diff --stat`/`git diff`, test output, plus only the files that changed.
 15. Decide exactly one of:

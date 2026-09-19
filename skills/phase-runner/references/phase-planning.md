@@ -17,26 +17,33 @@ before any worker runs: *Plan upfront, revise when evidence requires it.*
 
 ## Task sizing rules
 
+**Coarse by default.** Prefer a handful of substantial Tasks over many tiny ones;
+every Task costs a Supervisor review round.
+
 A good Task is:
 
-- **One coherent change** - a reviewer can describe it in one sentence.
-- **Independently verifiable** - it has at least one exact command and expected result.
-- **Small** - a cheap worker completes it in one run (roughly minutes, not hours).
+- **One coherent behavior** - a reviewer can describe it in one sentence.
+- **One subsystem/module** - usually 1-5 files. Implementation and its tests belong
+  to the SAME Task when they cover one behavior; do not split them mechanically.
+- **Minutes to ~30 minutes of worker time** - the worker may run unattended, so a
+  Task that needs hours is too big.
+- **Independently verifiable** - at least one exact command with an expected result.
 - **Bounded** - `Allowed Changes` lists files/dirs; `Forbidden Changes` closes the rest.
 - **Self-contained** - everything needed is in the Task or readable in the repo.
 
-Split a Task when it:
+Split only when:
 
-- contains "and" joining unrelated behaviors,
-- needs planning inside the worker,
-- would touch unrelated subsystems,
-- cannot be verified without another Task landing first.
+- the pieces are unrelated behaviors joined by "and",
+- the worker would have to plan inside the Task,
+- the pieces touch different subsystems,
+- one piece cannot be verified until another lands.
 
 Do not split when the pieces share one verification and one coherent purpose.
+Aim for roughly 3-8 Tasks per Phase; if the queue grows past ~10, merge related Tasks.
 
 ## Suggested Task archetypes
 
-Common shapes (not mandatory, not a template to force):
+Only when a Phase genuinely has stages, the common shapes are (not a template to force):
 
 1. base implementation / wiring
 2. integration with existing behavior

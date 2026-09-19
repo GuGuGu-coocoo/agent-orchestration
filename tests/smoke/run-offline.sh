@@ -154,6 +154,103 @@ check "decision record written" bash -c "grep -q 'Decision: ACCEPT' '$repo'/\.ag
 check "current workspace re-seeded with blank TASK.md" bash -c "grep -q '<PHASE>-<NN>' '$repo/.agent/current/TASK.md'"
 check "current RESULT.md cleared" bash -c "! test -e '$repo/.agent/current/RESULT.md'"
 
+# --- 6b. worker-notify.sh --------------------------------------------------------
+NOTIFY="$HOME/.agents/skills/cheap-worker/scripts/worker-notify.sh"
+
+if "$NOTIFY" --help >"$OUT_DIR/notify-help.log" 2>&1; then
+    pass "worker-notify.sh --help exits 0"
+else
+    fail "worker-notify.sh --help failed"
+fi
+
+if (cd "$repo" && "$NOTIFY" --mode implement) >"$OUT_DIR/notify-no-thread.log" 2>&1; then
+    fail "worker-notify.sh should require --codex-thread"
+else
+    pass "worker-notify.sh requires --codex-thread"
+fi
+check "requirement message is clear" grep -q 'codex-thread NAME is required' "$OUT_DIR/notify-no-thread.log"
+
+(cd "$repo" && "$NOTIFY" --print-message --simulate-exit 0 --task-id OFF2) >"$OUT_DIR/notify-msg-0.log" 2>&1 || true
+(cd "$repo" && "$NOTIFY" --print-message --simulate-exit 10 --task-id OFF2) >"$OUT_DIR/notify-msg-10.log" 2>&1 || true
+(cd "$repo" && "$NOTIFY" --print-message --simulate-exit 2 --task-id OFF2) >"$OUT_DIR/notify-msg-2.log" 2>&1 || true
+check "success message asks for review" grep -q '验收' "$OUT_DIR/notify-msg-0.log"
+check "escalation message asks for a decision" grep -q '决策' "$OUT_DIR/notify-msg-10.log"
+check "failure message names the exit code" grep -q 'exit=2' "$OUT_DIR/notify-msg-2.log"
+check "message carries absolute paths" grep -q '/\.agent/current/RESULT.md' "$OUT_DIR/notify-msg-0.log"
+
+# fake worker + fake codex: exercise the notify path offline
+cat >"$repo/.fake-worker.sh" <<'FAKEEOF'
+#!/usr/bin/env bash
+echo "fake-worker: $*"
+exit 0
+FAKEEOF
+cat >"$repo/.fake-codex" <<FAKEEOF
+#!/usr/bin/env bash
+echo "\$*" >>"$OUT_DIR/fake-codex-calls.log"
+exit 0
+FAKEEOF
+chmod +x "$repo/.fake-worker.sh" "$repo/.fake-codex"
+rm -f "$OUT_DIR/fake-codex-calls.log"
+
+if (cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-worker.sh" "$NOTIFY" \
+        --foreground --codex-thread "smoke-thread" --codex-bin "$repo/.fake-codex" \
+        --mode implement --task-id OFF2) >"$OUT_DIR/notify-foreground.log" 2>&1; then
+    pass "worker-notify.sh foreground run exits 0"
+else
+    fail "worker-notify.sh foreground run failed (see $OUT_DIR/notify-foreground.log)"
+fi
+check "fake codex received a queue call" grep -q '^queue --thread smoke-thread --message' "$OUT_DIR/fake-codex-calls.log"
+check "queued message mentions the task" grep -q 'OFF2' "$OUT_DIR/fake-codex-calls.log"
+
+# unreachable session -> NOTIFY_FAILED.md + non-zero worker code propagates
+cat >"$repo/.fake-codex-fail" <<'FAKEEOF'
+#!/usr/bin/env bash
+exit 1
+FAKEEOF
+chmod +x "$repo/.fake-codex-fail"
+rm -f "$repo/.agent/current/NOTIFY_FAILED.md"
+(cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-worker.sh" "$NOTIFY" \
+    --foreground --codex-thread "smoke-thread" --codex-bin "$repo/.fake-codex-fail" \
+    --mode implement --task-id OFF2) >"$OUT_DIR/notify-fail.log" 2>&1 || true
+check "failed wake-up writes NOTIFY_FAILED.md" test -s "$repo/.agent/current/NOTIFY_FAILED.md"
+check "NOTIFY_FAILED.md contains the message" grep -q '\[worker-notify\]' "$repo/.agent/current/NOTIFY_FAILED.md"
+
+# archived/failed queue output must add a remediation hint
+cat >"$repo/.fake-codex-archived" <<'FAKEEOF'
+#!/usr/bin/env bash
+echo "Error: failed to queue session message: session abc is archived. Run 'codex unarchive abc' first." >&2
+exit 1
+FAKEEOF
+chmod +x "$repo/.fake-codex-archived"
+rm -f "$repo/.agent/current/NOTIFY_FAILED.md"
+(cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-worker.sh" "$NOTIFY" \
+    --foreground --codex-thread "smoke-thread" --codex-bin "$repo/.fake-codex-archived" \
+    --mode implement --task-id OFF2) >"$OUT_DIR/notify-archived.log" 2>&1 || true
+check "archived session produces a hint" grep -q 'hint: .*archived' "$repo/.agent/current/NOTIFY_FAILED.md"
+
+# detached launch returns immediately and the background job still notifies
+rm -f "$OUT_DIR/fake-codex-calls.log"
+if (cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-worker.sh" "$NOTIFY" \
+        --codex-thread "smoke-thread" --codex-bin "$repo/.fake-codex" \
+        --mode implement --task-id OFF2) >"$OUT_DIR/notify-detach.log" 2>&1; then
+    pass "worker-notify.sh detached launch exits 0"
+else
+    fail "worker-notify.sh detached launch failed"
+fi
+check "detached launch reports a pid" grep -q 'background worker started (pid' "$OUT_DIR/notify-detach.log"
+detached_ok=0
+i=0
+while [[ "$i" -lt 10 ]]; do
+    if grep -q '^queue --thread smoke-thread' "$OUT_DIR/fake-codex-calls.log" 2>/dev/null; then detached_ok=1; break; fi
+    sleep 1
+    i=$((i + 1))
+done
+if [[ "$detached_ok" -eq 1 ]]; then
+    pass "detached worker notified Codex in the background"
+else
+    fail "detached worker did not notify within 10s"
+fi
+
 # --- 7. uninstall safety (dry-run only) -------------------------------------------
 if "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" --dry-run >"$OUT_DIR/uninstall-dry.log" 2>&1; then
     pass "uninstall --dry-run exits 0"
