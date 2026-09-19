@@ -102,6 +102,11 @@ idempotent, verifies `SKILL.md` after install, and writes a
 
 Exact literal paths only, explicit confirmation required, refuses unmarked
 directories unless `--force`, and never removes `~/.agents/skills` itself.
+If you linked the skill into Codex, remove that link too:
+
+```sh
+rm ~/.codex/skills/phase-runner
+```
 
 ## cheap-worker usage
 
@@ -179,6 +184,40 @@ so you can watch it in OpenCode Desktop:
 
 Check the service with `opencode service status` (the `doctor.sh` script does it
 for you).
+
+## Using with Codex (desktop app)
+
+`phase-runner` is the Supervisor skill, so Codex needs it; `cheap-worker` stays in
+`~/.agents/skills/` where the OpenCode worker picks it up (Codex never loads it).
+
+```sh
+ln -sfn ~/.agents/skills/phase-runner ~/.codex/skills/phase-runner
+```
+
+Then in a new Codex conversation, say:
+
+> 用 $phase-runner 按现有 roadmap 做到 Phase C。
+> 你负责拆 Task，每个 Task 用 shell 调用
+> `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode implement --task-id C01 --title "..."`，
+> 等它结束后读 `.agent/current/RESULT.md` 和 git diff 验收，然后自动下一个 Task。
+> 普通技术问题不要问我。Phase C 验收通过后停止，我来人工测试。
+
+How the loop actually runs:
+
+- Codex calls `run-worker.sh` with its shell tool; that call blocks until the
+  OpenCode worker finishes. When it returns, Codex continues in the same turn -
+  that is what makes "ACCEPT -> next Task" automatic without the human typing
+  "continue".
+- There is no cross-process callback: nothing pushes a notification into Codex.
+  If Codex's turn ends (or its shell timeout fires on a long Task), the human has
+  to nudge it once.
+- A worker Task can run for minutes; if Codex's command timeout is too short, run
+  the worker in the background (`nohup ... &`) and poll for
+  `.agent/current/RESULT.md`.
+- Implementation tokens are paid by OpenCode's model, not by Codex; Codex only
+  spends on phase/task planning, the small handoff commands, and reviewing
+  RESULT/diff/test output. That is the intended usage saving.
+- Worker sessions are visible in OpenCode Desktop, not in Codex.
 
 ## Project runtime directory
 

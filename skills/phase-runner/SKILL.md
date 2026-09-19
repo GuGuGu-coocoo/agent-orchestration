@@ -1,12 +1,8 @@
 ---
 name: phase-runner
 description: Use when the Codex/Astra Supervisor is asked to execute one Phase from an existing roadmap by decomposing it into atomic Tasks, handing exactly one Task at a time to the cheap-worker skill, reviewing each report, and stopping at the human checkpoint. Covers phase intake, upfront task queue planning, task handoff, ACCEPT/REWORK/ESCALATE review, phase-level verification, RUN_STATE bookkeeping and resume. It is neither a worker nor a second agent and never launches another Supervisor session.
-license: MIT
-compatibility: opencode
 metadata:
-  role: supervisor
-  layer: planning+review
-  v1: "true"
+  short-description: Run a roadmap Phase with the cheap worker
 ---
 
 # phase-runner
