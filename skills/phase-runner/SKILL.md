@@ -1,6 +1,6 @@
 ---
 name: phase-runner
-description: Use when the Codex/Astra Supervisor is asked to execute one Phase from an existing roadmap by decomposing it into atomic Tasks, handing exactly one Task at a time to the cheap-worker skill, reviewing each report, and stopping at the human checkpoint. Covers phase intake, upfront task queue planning, task handoff, ACCEPT/REWORK/ESCALATE review, phase-level verification, RUN_STATE bookkeeping and resume. Not a worker and not a second agent: it never launches another Supervisor session.
+description: Use when the Codex/Astra Supervisor is asked to execute one Phase from an existing roadmap by decomposing it into atomic Tasks, handing exactly one Task at a time to the cheap-worker skill, reviewing each report, and stopping at the human checkpoint. Covers phase intake, upfront task queue planning, task handoff, ACCEPT/REWORK/ESCALATE review, phase-level verification, RUN_STATE bookkeeping and resume. It is neither a worker nor a second agent and never launches another Supervisor session.
 license: MIT
 compatibility: opencode
 metadata:
@@ -39,6 +39,9 @@ Phase C
    session loss, terminal close and reboot. Chat history is not state.
 6. **V1 has no automation glue:** the Supervisor performs each loop step explicitly
    with its own tools. Do not build daemons, schedulers, watchers or swarms.
+7. **One Task = one OpenCode session.** The worker runs on the shared background
+   service so the human can watch it in OpenCode Desktop; never pass `--standalone`
+   or `--model`, and give each session a clear title.
 
 ## Workflow
 
@@ -77,8 +80,10 @@ Details and sizing rules: `references/phase-planning.md`.
     `.agent/phases/<PHASE>/history/` for traceability).
 12. Record the git baseline: `git status`, `git rev-parse HEAD`.
 13. Invoke the worker exactly once per attempt:
-    `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode>`
-    (model comes from `CHEAP_WORKER_MODEL`; see the cheap-worker skill).
+    `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode> --task-id <id> --title "<queue title>"`
+    Model choice belongs to OpenCode's own configuration; the worker script never
+    passes `--model` and never starts a private server. One Task = one OpenCode
+    session, visible in OpenCode Desktop.
     Exit codes: `0` RESULT, `10` ESCALATION, `2/3/4` plumbing failures.
 14. Review the result per `references/task-review.md`: read `TASK.md`, `RESULT.md`,
     `git diff --stat`/`git diff`, test output, plus only the files that changed.

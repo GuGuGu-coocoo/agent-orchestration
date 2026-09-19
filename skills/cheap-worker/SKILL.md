@@ -1,6 +1,6 @@
 ---
 name: cheap-worker
-description: Use when acting as the cheap worker agent (Muse Spark or DeepSeek) that executes exactly one already-defined Task handed over by a Codex/Astra Supervisor. Use for single-task implement / investigate / fix / verify work, and for reporting status. Do NOT use to plan a whole Phase, decompose a roadmap, choose the next Task, or make architecture decisions.
+description: Use when acting as the cheap worker agent that executes exactly one already-defined Task handed over by a Codex/Astra Supervisor. Use for single-task implement / investigate / fix / verify work, and for reporting status. Runs in its own OpenCode session so it is observable in OpenCode Desktop. Do NOT use to plan a whole Phase, decompose a roadmap, choose the next Task, or make architecture decisions.
 license: MIT
 compatibility: opencode
 metadata:
@@ -25,8 +25,9 @@ Executes a single, already-defined Task from `.agent/current/TASK.md` and writes
 back a single result file: `.agent/current/RESULT.md` or `.agent/current/ESCALATION.md`.
 
 The non-interactive entry point is `scripts/run-worker.sh`, which drives
-`opencode run` with the configured worker model and the worker contract from
-`references/worker-contract.md`.
+`opencode run` on the shared background service (one session per Task) with the
+worker contract from `references/worker-contract.md` embedded in the prompt. The
+model is whatever OpenCode itself is configured to use.
 
 ## Hard rules
 
@@ -77,17 +78,16 @@ Priority: **Correctness > minimal change > verifiability > elegance.**
 - Scripts: `scripts/doctor.sh`, `scripts/run-worker.sh`, `scripts/status.sh`,
   `scripts/collect-result.sh`, `scripts/archive-task.sh`
 
-## Model selection
+## Backend and observability
 
-The backend is configurable and never hardcoded:
-
-```sh
-export CHEAP_WORKER_MODEL="opencode/muse-spark-1.3-contributor-free"  # free default
-export CHEAP_WORKER_MODEL="deepseek/deepseek-flash"                  # paid fallback
-```
-
-`scripts/run-worker.sh --model <provider/model>` overrides the env var. Model IDs
-must be verified with `opencode models` (do not guess them).
+- The model is chosen entirely by OpenCode's own configuration. `run-worker.sh`
+  never passes `--model` and has no model configuration of its own.
+- Every run uses the shared OpenCode background service (never `--standalone`),
+  so the session shows up in OpenCode Desktop.
+- One Task = one OpenCode session, titled `cheap-worker · <task-id> · <title>`,
+  so Desktop can be used to watch Read / Search / Edit / Bash / tests live.
+- Open `OpenCode Desktop` and pick the session by title to inspect a Task; no
+  separate dashboard, log UI or monitoring is part of this skill.
 
 ## Project state directory
 
@@ -95,7 +95,6 @@ The worker only ever touches `.agent/` in the *task* project:
 
 ```
 .agent/current/{TASK.md,RESULT.md,ESCALATION.md,STATE.json,logs/}
-.agent/history/
 ```
 
 `.agent/` is runtime state, never a replacement for roadmap, architecture, product

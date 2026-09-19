@@ -13,7 +13,7 @@ source "$SMOKE_DIR/helpers.sh"
 
 require_live_env
 TEST_NAME="A-single-task"
-printf '== live test A: single implement task (model: %s) ==\n' "$SMOKE_MODEL"
+printf '== live test A: single implement task (OpenCode default model) ==\n'
 
 repo="$(new_repo smoke-A)"
 CLEANUP_DIRS+=("$repo")
@@ -45,7 +45,7 @@ check "test_app.py passes" bash -c "cd '$repo' && python3 test_app.py"
 changed_files="$(cd "$repo" && git status --porcelain -- . ':!.agent' | awk '{print $2}' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 check_eq "diff touches only app.py" "app.py" "$changed_files"
 check "RESULT.md mentions the task id" grep -q 'A01' "$repo/.agent/current/RESULT.md"
-check "STATE.json recorded the model" grep -q "$SMOKE_MODEL" "$repo/.agent/current/STATE.json"
+check "STATE.json recorded a session id" bash -c "jq -e '.session_id != \"\"' '$repo/.agent/current/STATE.json' >/dev/null"
 
 if [[ "$FAIL_COUNT" -gt 0 ]]; then
     printf '\n--- worker log tail ---\n'

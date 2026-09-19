@@ -14,7 +14,7 @@ source "$SMOKE_DIR/helpers.sh"
 
 require_live_env
 TEST_NAME="C-escalation"
-printf '== live test C: forced escalation (model: %s) ==\n' "$SMOKE_MODEL"
+printf '== live test C: forced escalation (OpenCode default model) ==\n'
 
 repo="$(new_repo smoke-C)"
 CLEANUP_DIRS+=("$repo")

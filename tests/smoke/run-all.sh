@@ -3,7 +3,7 @@
 #
 # Usage:
 #   tests/smoke/run-all.sh
-#   SMOKE_MODEL=deepseek/deepseek-flash tests/smoke/run-all.sh
+# (live tests use OpenCode's configured default model)
 
 set -euo pipefail
 

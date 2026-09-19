@@ -22,15 +22,32 @@ tests/smoke/run-all.sh
 tests/smoke/run-live.sh d
 tests/smoke/run-d-phase-runner.sh --rework
 
-# paid model instead of the free default
-SMOKE_MODEL=deepseek/deepseek-flash tests/smoke/run-all.sh
-
 # keep the generated repos for inspection
 SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh
 ```
 
+Live tests use OpenCode's configured default model (there is no test-side model
+override). If your default model is not reachable, live tests fail with the
+provider error - that is the same behavior the worker would have.
+
+To run live tests against a specific model without changing your global config,
+point `TMPDIR` at a directory with a project-local OpenCode config (OpenCode's
+config discovery walks up from each repo):
+
+```sh
+mkdir -p /tmp/oc-live/.opencode
+printf '{"model":"<provider/model>"}' > /tmp/oc-live/.opencode/opencode.json
+TMPDIR=/tmp/oc-live tests/smoke/run-live.sh
+```
+
+This is test scaffolding only - the worker itself never passes `--model`.
+
 Outputs (worker JSON event logs, driver logs, doctor output) land in
 `tests/smoke/.out/` and can be deleted at any time.
+
+Each worker run creates one titled OpenCode session (`cheap-worker · <task> · ...`)
+on the shared background service, so live test runs are also visible in OpenCode
+Desktop.
 
 ## The phase driver
 

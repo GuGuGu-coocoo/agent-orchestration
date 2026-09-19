@@ -2,12 +2,12 @@
 # doctor.sh - environment health check for the cheap-worker skill.
 #
 # Usage:
-#   doctor.sh [--root DIR] [--model provider/model]
+#   doctor.sh [--root DIR]
 #
 # Reports (never changes anything):
-#   - opencode version and non-interactive flags that the worker relies on
+#   - opencode version and the non-interactive flags the worker relies on
+#   - the shared background service used for OpenCode Desktop observability
 #   - git / jq / python3 availability
-#   - the configured worker model(s) against the real `opencode models` output
 #   - skill install location and required files
 #   - current .agent state for the project (if any)
 #
@@ -24,7 +24,7 @@ warn() { printf '  warn    %s\n' "$*"; WARNINGS=$((WARNINGS + 1)); }
 bad()  { printf '  FAIL    %s\n' "$*"; PROBLEMS=$((PROBLEMS + 1)); }
 die()  { printf 'doctor: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 skill_root() {
     local root="$SCRIPT_DIR/.."
@@ -33,26 +33,11 @@ skill_root() {
     return 1
 }
 
-check_model() {
-    local model="$1" label="$2" list="$3"
-    local lookup="${model%%#*}"
-    if [[ -z "$model" ]]; then
-        warn "$label not configured"
-        return 0
-    fi
-    if printf '%s\n' "$list" | grep -qxF "$lookup"; then
-        ok "$label '$model' present in opencode models"
-    else
-        bad "$label '$model' NOT in 'opencode models' (fix CHEAP_WORKER_MODEL)"
-    fi
-}
-
 main() {
-    local root_arg="" model_arg=""
+    local root_arg=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --root)  root_arg="${2:-}"; shift 2 ;;
-            --model) model_arg="${2:-}"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown argument '$1' (try --help)" ;;
         esac
@@ -66,7 +51,7 @@ main() {
         local ov
         ov="$(opencode --version 2>/dev/null | head -1)"
         ok "opencode $ov ($(command -v opencode))"
-        for flag in --model --agent --format; do
+        for flag in --title --agent --format; do
             if opencode run --help 2>&1 | grep -q -- "$flag"; then
                 ok "opencode run supports $flag"
             else
@@ -80,20 +65,28 @@ main() {
     command -v jq     >/dev/null 2>&1 && ok "jq $(jq --version)"                            || bad "jq not found (required)"
     command -v python3 >/dev/null 2>&1 && ok "python3 $(python3 --version 2>&1 | awk '{print $2}')" || warn "python3 not found (only needed for python projects)"
 
-    printf 'models\n'
-    local model_list
+    printf 'backend (OpenCode shared service, used for Desktop observability)\n'
     if command -v opencode >/dev/null 2>&1; then
-        model_list="$(opencode models 2>/dev/null || true)"
-    else
-        model_list=""
-    fi
-    local default_model="${CHEAP_WORKER_MODEL:-opencode/muse-spark-1.3-contributor-free}"
-    check_model "$default_model" "default worker model" "$model_list"
-    [[ -n "$model_arg" ]] && check_model "$model_arg" "--model override" "$model_list"
-    if printf '%s\n' "$model_list" | grep -qxF 'deepseek/deepseek-flash'; then
-        ok "paid fallback 'deepseek/deepseek-flash' (DeepSeek V4.1 Flash) present"
-    else
-        warn "paid fallback 'deepseek/deepseek-flash' not present"
+        local svc
+        if svc="$(opencode service status 2>/dev/null)" && [[ -n "$svc" ]]; then
+            ok "background service reachable at $svc"
+            ok "worker sessions appear in OpenCode Desktop"
+        else
+            warn "background service not reachable; 'opencode service start' may be needed"
+        fi
+        # Check the actual code, ignoring comments that name the forbidden flags.
+        local rw_code=""
+        [[ -f "$SCRIPT_DIR/run-worker.sh" ]] && rw_code="$(grep -v '^[[:space:]]*#' "$SCRIPT_DIR/run-worker.sh" || true)"
+        if printf '%s\n' "$rw_code" | grep -q -- '--standalone'; then
+            bad "run-worker.sh passes --standalone; the worker must use the shared service"
+        else
+            ok "run-worker.sh never uses --standalone"
+        fi
+        if printf '%s\n' "$rw_code" | grep -q -- '--model'; then
+            bad "run-worker.sh passes --model; the worker must use OpenCode's configured default model"
+        else
+            ok "run-worker.sh never passes --model (model comes from OpenCode config)"
+        fi
     fi
 
     printf 'skill files\n'

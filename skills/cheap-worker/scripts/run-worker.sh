@@ -1,21 +1,30 @@
 #!/usr/bin/env bash
-# run-worker.sh - run exactly one cheap-worker Task via the non-interactive OpenCode CLI.
+# run-worker.sh - run exactly one cheap-worker Task via `opencode run`.
+#
+# V1 design:
+#   - One Task = one OpenCode session, created on the shared background service,
+#     so the session is observable in OpenCode Desktop.
+#   - The model is whatever OpenCode's own configuration selects. This script
+#     never passes --model and never starts a private server (no --standalone).
+#   - The worker prompt embeds the contract, so the worker never needs to read
+#     files outside the project root (OpenCode's external_directory permission
+#     defaults to "ask" and auto-rejects in non-interactive runs).
 #
 # Usage:
-#   run-worker.sh [--mode implement|investigate|fix|verify] [--root DIR] [--model provider/model]
-#                 [--task-id ID] [--allow-dirty] [--dry-run]
+#   run-worker.sh [--mode implement|investigate|fix|verify] [--root DIR]
+#                 [--task-id ID] [--title SHORT_TITLE] [--allow-dirty] [--dry-run]
 #
-# Environment:
-#   CHEAP_WORKER_MODEL   model ID (default: opencode/muse-spark-1.3-contributor-free)
-#   CHEAP_WORKER_AGENT   opencode agent to run as (default: build)
+# --title is the short Task title (e.g. "Add retry queue"). The OpenCode session
+# title becomes "cheap-worker · <task-id> · <SHORT_TITLE>", or "cheap-worker ·
+# <task-id>" when --title is omitted (then it is derived from the Objective).
 #
 # Exit codes:
 #   0  worker wrote RESULT.md (DONE)
-#   10 worker wrote ESCALATION.md (stopped, needs Supervisor)
+#   10 worker wrote ESCALATION.md (Supervisor decision required)
 #   1  invalid invocation / precondition failure
-#   2  opencode could not be executed successfully
-#   3  opencode ran but wrote neither RESULT.md nor ESCALATION.md
-#   4  opencode ran and wrote both (inconsistent)
+#   2  opencode failed and wrote no report
+#   3  opencode finished but wrote neither report
+#   4  opencode ran and wrote both reports (inconsistent)
 #
 # This script never commits, pushes, merges or deletes anything.
 
@@ -23,14 +32,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DEFAULT_MODEL="${CHEAP_WORKER_MODEL:-opencode/muse-spark-1.3-contributor-free}"
-DEFAULT_AGENT="${CHEAP_WORKER_AGENT:-build}"
+# The standard primary agent; the worker needs read/search/edit/bash/test tools.
+OPENCODE_AGENT="${OPENCODE_AGENT:-build}"
 
 die() { printf 'run-worker: %s\n' "$*" >&2; exit 1; }
 
-usage() {
-    sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-}
+usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,16 +67,15 @@ resolve_project_root() {
     pwd
 }
 
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found"
-}
-
-opencode_env() {
-    printf 'env -u OPENCODE_CONFIG -u OPENCODE_CONFIG_CONTENT -u OPENCODE_CONFIG_DIR -u OPENCODE_PERMISSION %s' "$1"
-}
-
 todo_count() {
     grep -c '^- \[ \]' "$1" 2>/dev/null || true
+}
+
+# derive_title <task-file> - first non-empty line of the ## Objective section.
+derive_title() {
+    local line
+    line="$(awk '/^## Objective[[:space:]]*$/{f=1;next} f&&/^## /{exit} f&&NF{print;exit}' "$1")"
+    printf '%s' "$line" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | cut -c1-48
 }
 
 # ---------------------------------------------------------------------------
@@ -77,14 +83,14 @@ todo_count() {
 # ---------------------------------------------------------------------------
 
 main() {
-    local mode="" root_arg="" model="" task_id_arg="" allow_dirty=0 dry_run=0
+    local mode="" root_arg="" task_id_arg="" title_arg="" allow_dirty=0 dry_run=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --mode)       mode="${2:-}"; shift 2 ;;
             --root)       root_arg="${2:-}"; shift 2 ;;
-            --model)      model="${2:-}"; shift 2 ;;
             --task-id)    task_id_arg="${2:-}"; shift 2 ;;
+            --title)      title_arg="${2:-}"; shift 2 ;;
             --allow-dirty) allow_dirty=1; shift ;;
             --dry-run)    dry_run=1; shift ;;
             -h|--help)    usage; exit 0 ;;
@@ -96,6 +102,7 @@ main() {
         die "invalid --mode '$mode' (expected implement|investigate|fix|verify)"
     fi
 
+    require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found"; }
     require_cmd opencode
     require_cmd git
     require_cmd jq
@@ -118,22 +125,12 @@ main() {
     [[ -n "$mode" ]] || die "could not determine mode (set --mode or the '## Mode' section)"
     [[ "$mode" =~ ^(implement|investigate|fix|verify)$ ]] || die "invalid mode '$mode' derived from TASK.md (use --mode)"
 
-    # Model resolution: flag > env > default. Never hardcoded per backend.
-    [[ -n "$model" ]] || model="$DEFAULT_MODEL"
-    local model_lookup="${model%%#*}"
-    # `opencode models` can transiently return a partial list while the background
-    # server is busy, so retry before rejecting a model.
-    local attempt model_list=""
-    for attempt in 1 2 3; do
-        model_list="$(opencode models 2>/dev/null || true)"
-        if printf '%s\n' "$model_list" | grep -qxF "$model_lookup"; then
-            break
-        fi
-        sleep 2
-    done
-    if ! printf '%s\n' "$model_list" | grep -qxF "$model_lookup"; then
-        die "model '$model_lookup' is not in 'opencode models' output; fix CHEAP_WORKER_MODEL/--model (never guess model IDs)"
-    fi
+    # Session title, shown in OpenCode Desktop: "cheap-worker · C01 · short title".
+    # Tolerate a caller passing the full form ("cheap-worker · C01 · title").
+    local short_title="${title_arg:-$(derive_title "$task_file")}"
+    short_title="${short_title#cheap-worker · $task_id · }"
+    local session_title="cheap-worker · $task_id"
+    [[ -n "$short_title" ]] && session_title="$session_title · $short_title"
 
     # Git baseline (best effort: a non-git project or a fresh repo without commits
     # still works, with a warning).
@@ -159,7 +156,6 @@ main() {
     local opencode_version
     opencode_version="$(opencode --version 2>/dev/null | head -1)"
 
-    # Review file: optional REWORK corrections for this Task.
     local has_review="no"
     [[ -f "$agent_dir/REVIEW.md" ]] && has_review="yes"
     local has_agents_md="no"
@@ -168,10 +164,8 @@ main() {
     local todo_before
     todo_before="$(todo_count "$task_file")"
 
-    # Render the worker prompt. The contract and safety policy are embedded so the
-    # worker never needs to read files outside the project root (OpenCode's
-    # external_directory permission defaults to "ask" and auto-rejects in
-    # non-interactive runs).
+    # Render the worker prompt: static prompt + embedded contract and safety
+    # policy + per-run facts.
     local prompt_file
     prompt_file="$(mktemp "${TMPDIR:-/tmp}/cheap-worker-prompt.XXXXXX")"
     trap 'rm -f "$prompt_file"' EXIT
@@ -191,9 +185,9 @@ main() {
 - Task ID: $task_id
 - Review file present: $has_review
 - AGENTS.md present: $has_agents_md
-- Model: $model
 - Unticked acceptance items at handoff: ${todo_before:-0}
 - Baseline commit: ${baseline:-<no git>}
+- This run is one OpenCode session titled "$session_title" (visible in OpenCode Desktop).
 
 Hard boundary: unless TASK.md explicitly allows it, do not modify any file outside
 $project_root, and do not read files outside the project root (references are
@@ -207,13 +201,13 @@ EOF
         printf 'run-worker (dry-run)\n'
         printf '  project root : %s\n' "$project_root"
         printf '  task         : %s (mode=%s)\n' "$task_id" "$mode"
-        printf '  model        : %s\n' "$model"
-        printf '  agent        : %s\n' "$DEFAULT_AGENT"
+        printf '  session title: %s\n' "$session_title"
+        printf '  agent        : %s\n' "$OPENCODE_AGENT"
         printf '  baseline     : %s\n' "${baseline:-<none>}"
         printf '  opencode     : %s\n' "$opencode_version"
         printf '  review       : %s\n' "$has_review"
         printf '  prompt file  : %s\n' "$prompt_file"
-        printf '  command      : opencode run --model %s --agent %s --format json --title %s\n' "$model" "$DEFAULT_AGENT" "cheap-worker $task_id"
+        printf '  command      : opencode run --agent %s --format json --title %s\n' "$OPENCODE_AGENT" "$session_title"
         exit 0
     fi
 
@@ -221,35 +215,35 @@ EOF
     started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     local log_file="$agent_dir/logs/worker-$(date -u '+%Y%m%dT%H%M%SZ')-${task_id}.jsonl"
 
-    printf 'run-worker: task=%s mode=%s model=%s\n' "$task_id" "$mode" "$model"
+    printf 'run-worker: task=%s mode=%s\n' "$task_id" "$mode"
+    printf 'run-worker: session title=%s\n' "$session_title"
     printf 'run-worker: project=%s\n' "$project_root"
     printf 'run-worker: baseline=%s\n' "${baseline:-<none>}"
     printf 'run-worker: log=%s\n' "$log_file"
+    printf 'run-worker: model=OpenCode default (not passed explicitly)\n'
 
     # Pre-write STATE.json so an interrupted run is still resumable.
     jq -n \
         --arg task_id "$task_id" \
         --arg mode "$mode" \
-        --arg model "$model" \
         --arg project_root "$project_root" \
         --arg baseline_commit "$baseline" \
         --arg opencode_version "$opencode_version" \
         --arg started_at "$started_at" \
         --arg log_file "$log_file" \
-        '{task_id: $task_id, mode: $mode, status: "running", model: $model,
+        '{task_id: $task_id, mode: $mode, status: "running",
           project_root: $project_root, baseline_commit: $baseline_commit,
           opencode_version: $opencode_version, session_id: "",
           started_at: $started_at, finished_at: "", last_result: "",
           attempt_count: 0, log_file: $log_file}' >"$agent_dir/STATE.json"
 
-    # Non-interactive run: stdin prompt, structured JSON event stream to the log.
+    # Non-interactive run on the shared background service (never --standalone),
+    # one session per Task, structured JSON event stream to the log.
     local rc=0
-    # shellcheck disable=SC2086
-    $(opencode_env opencode) run \
-        --model "$model" \
-        --agent "$DEFAULT_AGENT" \
+    opencode run \
+        --agent "$OPENCODE_AGENT" \
         --format json \
-        --title "cheap-worker $task_id" \
+        --title "$session_title" \
         <"$prompt_file" >"$log_file" 2>&1 || rc=$?
 
     local session_id=""
@@ -283,7 +277,6 @@ EOF
     jq -n \
         --arg task_id "$task_id" \
         --arg mode "$mode" \
-        --arg model "$model" \
         --arg project_root "$project_root" \
         --arg baseline_commit "$baseline" \
         --arg opencode_version "$opencode_version" \
@@ -294,7 +287,7 @@ EOF
         --arg last_result "$last_result" \
         --arg log_file "$log_file" \
         --argjson rc "$rc" \
-        '{task_id: $task_id, mode: $mode, status: $status, model: $model,
+        '{task_id: $task_id, mode: $mode, status: $status,
           project_root: $project_root, baseline_commit: $baseline_commit,
           opencode_version: $opencode_version, session_id: $session_id,
           started_at: $started_at, finished_at: $finished_at,

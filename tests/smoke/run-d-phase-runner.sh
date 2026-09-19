@@ -21,8 +21,8 @@ REWORK_MODE=0
 
 require_live_env
 TEST_NAME="D-phase-runner"
-printf '== live test D+E: phase queue + resume (model: %s)%s ==\n' \
-    "$SMOKE_MODEL" "$([[ $REWORK_MODE -eq 1 ]] && printf ' [rework mode]')"
+printf '== live test D+E: phase queue + resume (OpenCode default model)%s ==\n' \
+    "$([[ $REWORK_MODE -eq 1 ]] && printf ' [rework mode]')"
 
 repo="$(new_repo smoke-D)"
 CLEANUP_DIRS+=("$repo")
@@ -83,7 +83,6 @@ EOF
 commit_all "$repo" "phase A scaffolding"
 
 # --- Run the supervisor driver ------------------------------------------------
-SMOKE_MODEL="$SMOKE_MODEL" \
 SMOKE_DIR="$SMOKE_DIR" \
 REPO="$repo" \
 REWORK_MODE="$REWORK_MODE" \

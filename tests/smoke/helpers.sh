@@ -18,11 +18,9 @@ WORKER="$HOME/.agents/skills/cheap-worker/scripts/run-worker.sh"
 OUT_DIR="$SMOKE_DIR/.out"
 TMP_BASE="${TMPDIR:-/tmp}"
 
-# Model for live tests: override with SMOKE_MODEL=...
-# Default is DeepSeek V4.1 Flash: reliable for back-to-back test runs.
-# The free Muse Spark default is supported but rate-limits under rapid runs:
-#   SMOKE_MODEL=opencode/muse-spark-1.3-contributor-free tests/smoke/run-live.sh
-SMOKE_MODEL="${SMOKE_MODEL:-deepseek/deepseek-flash}"
+# Model: live tests use OpenCode's configured default model, exactly like the
+# worker does in production. There is no model override here on purpose; to test
+# against a specific model, change OpenCode's own configuration first.
 
 TEST_NAME="test"
 PASS_COUNT=0
@@ -102,7 +100,7 @@ run_worker_live() {
         (
             cd "$repo" || exit 1
             local wrc=0
-            CHEAP_WORKER_MODEL="$SMOKE_MODEL" "$WORKER" "$@" >"$log" 2>&1 || wrc=$?
+            "$WORKER" "$@" >"$log" 2>&1 || wrc=$?
             printf '%s' "$wrc" >"$rc_out"
             exit 0
         ) || true

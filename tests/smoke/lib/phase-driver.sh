@@ -10,11 +10,10 @@
 # rework loop works and the task id is not re-run from scratch.
 #
 # Inputs (environment):
-#   SMOKE_MODEL, SMOKE_DIR, REPO, REWORK_MODE
+#   SMOKE_DIR, REPO, REWORK_MODE
 
 set -euo pipefail
 
-SMOKE_MODEL="${SMOKE_MODEL:?}"
 SMOKE_DIR="${SMOKE_DIR:?}"
 REPO="${REPO:?}"
 REWORK_MODE="${REWORK_MODE:-0}"
@@ -109,15 +108,18 @@ update_run_state() {
 }
 
 run_one_task() {
-    local id="$1" mode="$2" use_review="$3" extra="${4:-}"
+    local id="$1" mode="$2" use_review="$3" extra="${4:-}" title="${5:-}"
     log "running $id (mode=$mode${use_review:+, with REVIEW.md})"
+    local title_args=()
+    [[ -n "$title" ]] && title_args=(--title "$title")
     local rc=0 attempt=0
     while :; do
         attempt=$((attempt + 1))
         set +e
         # shellcheck disable=SC2086
-        (cd "$REPO" && CHEAP_WORKER_MODEL="$SMOKE_MODEL" "$WORKER" \
-            --mode "$mode" --task-id "$id" --allow-dirty $extra) >>"$SMOKE_DIR/.out/phase-driver-${id}.log" 2>&1
+        (cd "$REPO" && "$WORKER" \
+            --mode "$mode" --task-id "$id" ${title_args[@]+"${title_args[@]}"} \
+            --allow-dirty $extra) >>"$SMOKE_DIR/.out/phase-driver-${id}.log" 2>&1
         rc=$?
         set -e
         log "$id attempt=$attempt exit=$rc"
@@ -172,7 +174,7 @@ while :; do
     update_run_state "running" "$next_id"
 
     rc=0
-    run_one_task "$next_id" "implement" "" " " || rc=$?
+    run_one_task "$next_id" "implement" "" " " "$(jq -r --arg id "$next_id" '.tasks[] | select(.id==$id) | .title' "$QUEUE")" || rc=$?
 
     if [[ "$rc" -ne 0 ]]; then
         log "$next_id did not produce a RESULT (exit $rc); stopping like a real Supervisor would"
@@ -211,7 +213,7 @@ EOF
                     "$QUEUE" >"$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
 
                 rc2=0
-                run_one_task "A02" "implement" "yes" || rc2=$?
+                run_one_task "A02" "implement" "yes" "" "add shutdown(seconds)" || rc2=$?
                 if [[ "$rc2" -ne 0 ]]; then
                     log "reworked A02 still failed (exit $rc2); stopping"
                     jq_update_task "A02" ".status = \"escalated\""
@@ -276,7 +278,7 @@ REWORK
 - uppercase() and shutdown(5) behavior must stay correct.
 EOF
         rc3=0
-        run_one_task "A02" "fix" "yes" || rc3=$?
+        run_one_task "A02" "fix" "yes" "" "add shutdown(seconds)" || rc3=$?
         if [[ "$rc3" -ne 0 ]]; then
             log "REWORK_MODE corrective round failed (exit $rc3)"
             jq_update_task "A02" ".status = \"escalated\""

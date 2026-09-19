@@ -6,7 +6,7 @@
 #
 # Reports:
 #   - project root, current Task ID and mode
-#   - selected worker model and current state (STATE.json)
+#   - current state (STATE.json) and the OpenCode session id
 #   - OpenCode version
 #   - whether RESULT.md / ESCALATION.md / REVIEW.md exist
 #   - the latest worker log
@@ -56,13 +56,13 @@ main() {
     current="$root/.agent/current"
     state="$current/STATE.json"
 
-    local task_id mode model status baseline finished
+    local task_id mode status baseline finished session
     task_id="$(jqv "$state" '.task_id' '-')"
     mode="$(jqv "$state" '.mode' '-')"
-    model="$(jqv "$state" '.model' '-')"
     status="$(jqv "$state" '.status' 'idle')"
     baseline="$(jqv "$state" '.baseline_commit' '-')"
     finished="$(jqv "$state" '.finished_at' '-')"
+    session="$(jqv "$state" '.session_id' '-')"
 
     if [[ "$task_id" == "-" && -f "$current/TASK.md" ]]; then
         task_id="$(awk '/^## Task ID[[:space:]]*$/{getline; gsub(/[[:space:]]/,""); print; exit}' "$current/TASK.md")"
@@ -74,9 +74,10 @@ main() {
     printf '  task id      : %s\n' "${task_id:--}"
     printf '  mode         : %s\n' "${mode:--}"
     printf '  state        : %s\n' "$status"
-    printf '  model        : %s\n' "${model:--}"
     printf '  baseline     : %s\n' "${baseline:--}"
     printf '  finished at  : %s\n' "${finished:--}"
+    printf '  session      : %s\n' "${session:--}"
+    printf '  model        : OpenCode default (not selected by this skill)\n'
     if command -v opencode >/dev/null 2>&1; then
         printf '  opencode     : %s\n' "$(opencode --version 2>/dev/null | head -1)"
     else

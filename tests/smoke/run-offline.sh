@@ -2,10 +2,11 @@
 # run-offline.sh - script-level smoke tests. No model calls, nothing is installed.
 #
 # Verifies:
-#   - doctor.sh passes
+#   - doctor.sh passes and checks the shared service
 #   - SKILL.md frontmatter is valid for both skills
-#   - run-worker.sh fails fast without a Task / with an unknown model
-#   - run-worker.sh --dry-run renders the prompt and resolves project/model correctly
+#   - run-worker.sh fails fast without a Task and has no --model flag
+#   - run-worker.sh never passes --model or --standalone to opencode
+#   - run-worker.sh --dry-run renders the prompt, session title and command
 #   - status.sh, collect-result.sh, archive-task.sh behave as specified
 #
 # Usage: tests/smoke/run-offline.sh
@@ -44,7 +45,9 @@ else
     fail "doctor.sh exited non-zero (see $OUT_DIR/doctor.log)"
 fi
 check "doctor.sh reports no problems" grep -q 'result: 0 problem' "$OUT_DIR/doctor.log"
-check "doctor.sh checks the models" grep -q 'deepseek/deepseek-flash' "$OUT_DIR/doctor.log"
+check "doctor.sh checks the shared background service" grep -q 'background service' "$OUT_DIR/doctor.log"
+check "doctor.sh verifies no --model is passed" grep -q 'never passes --model' "$OUT_DIR/doctor.log"
+check "doctor.sh verifies no --standalone is used" grep -q 'never uses --standalone' "$OUT_DIR/doctor.log"
 
 # --- 3. run-worker.sh precondition failures ------------------------------------
 repo="$(new_repo smoke-offline)"
@@ -61,12 +64,25 @@ write_task "$repo" "OFF1" "implement" "objective" "existing" "desired" \
     "- app.py" "- app.py" "- everything else" \
     "- [ ] done" '`python3 app.py` exits 0' "none"
 
-if (cd "$repo" && "$WORKER" --mode implement --model no/such-model) >"$OUT_DIR/bad-model.log" 2>&1; then
-    fail "run-worker.sh should fail for unknown model"
+# --- 3b. no model configuration layer ------------------------------------------
+worker_code="$(grep -v '^[[:space:]]*#' "$WORKER")"
+if printf '%s\n' "$worker_code" | grep -q -- '--model'; then
+    fail "run-worker.sh must not pass --model"
 else
-    pass "run-worker.sh fails for unknown model"
+    pass "run-worker.sh never passes --model"
 fi
-check "failure message mentions models" grep -q "not in 'opencode models'" "$OUT_DIR/bad-model.log"
+if printf '%s\n' "$worker_code" | grep -q -- '--standalone'; then
+    fail "run-worker.sh must not use --standalone"
+else
+    pass "run-worker.sh never uses --standalone"
+fi
+
+if (cd "$repo" && "$WORKER" --mode implement --model foo/bar) >"$OUT_DIR/model-flag.log" 2>&1; then
+    fail "run-worker.sh should reject an unknown --model flag"
+else
+    pass "run-worker.sh rejects --model (no model layer in V1)"
+fi
+check "rejection message names the unknown argument" grep -q "unknown argument '--model'" "$OUT_DIR/model-flag.log"
 
 # --- 4. dry-run ----------------------------------------------------------------
 if (cd "$repo" && "$WORKER" --mode implement --dry-run) >"$OUT_DIR/dryrun.log" 2>&1; then
@@ -75,8 +91,13 @@ else
     fail "dry-run failed"
 fi
 check "dry-run reports the task" grep -q 'task         : OFF1' "$OUT_DIR/dryrun.log"
-check "dry-run reports the model" grep -q 'model        : opencode/' "$OUT_DIR/dryrun.log"
-check "dry-run reports the opencode command" grep -q 'opencode run --model' "$OUT_DIR/dryrun.log"
+check "dry-run reports a session title" grep -q 'session title: cheap-worker · OFF1' "$OUT_DIR/dryrun.log"
+check "dry-run reports the opencode command" grep -q 'opencode run --agent' "$OUT_DIR/dryrun.log"
+if grep -q -- '--model' "$OUT_DIR/dryrun.log" 2>/dev/null; then
+    fail "dry-run must not mention --model"
+else
+    pass "dry-run command has no --model"
+fi
 
 # --- 5. status / collect-result -------------------------------------------------
 if (cd "$repo" && "$HOME/.agents/skills/cheap-worker/scripts/status.sh") >"$OUT_DIR/status.log" 2>&1; then

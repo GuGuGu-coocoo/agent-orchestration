@@ -2,8 +2,9 @@
 # run-live.sh - run the live end-to-end smoke tests in throwaway repos.
 #
 # Every test creates its own temp git repo; nothing touches a real project.
-# Model calls are real. Default model is the free Muse Spark; override with:
-#   SMOKE_MODEL=deepseek/deepseek-flash tests/smoke/run-live.sh
+# Model calls are real and use OpenCode's configured default model, exactly like
+# the worker does in production. To test a specific model, change OpenCode's own
+# configuration first (opencode.json "model").
 #
 # Usage:
 #   tests/smoke/run-live.sh [a|b|c|d]     # run one test

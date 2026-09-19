@@ -13,7 +13,7 @@ source "$SMOKE_DIR/helpers.sh"
 
 require_live_env
 TEST_NAME="B-investigate"
-printf '== live test B: investigate mode, no code changes (model: %s) ==\n' "$SMOKE_MODEL"
+printf '== live test B: investigate mode, no code changes (OpenCode default model) ==\n'
 
 repo="$(new_repo smoke-B)"
 CLEANUP_DIRS+=("$repo")
