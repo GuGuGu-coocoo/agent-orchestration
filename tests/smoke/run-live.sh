@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # run-live.sh - run the live end-to-end smoke tests in throwaway repos.
 #
-# Every test creates its own temp git repo; nothing touches a real project.
+# Every test creates its own temp git repo; nothing touches a real project, and
+# the scripts under test are the ones in this source tree (not ~/.agents/skills).
 # Model calls are real and use OpenCode's configured default model, exactly like
 # the worker does in production. To test a specific model, change OpenCode's own
 # configuration first (opencode.json "model").
 #
 # Usage:
-#   tests/smoke/run-live.sh [a|b|c|d]     # run one test
+#   tests/smoke/run-live.sh [a|b|c|d|e]   # run one test
 #   tests/smoke/run-live.sh              # run all live tests
 #   SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh   # keep temp repos for inspection
+#
+#   a: one Task end to end          d: the Phase loop + review/human gates
+#   b: investigate mode             e: resume an interrupted Phase
+#   c: escalation
 
 set -euo pipefail
 

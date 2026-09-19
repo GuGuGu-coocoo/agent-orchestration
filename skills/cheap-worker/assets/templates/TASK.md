@@ -1,10 +1,19 @@
 # Task
 
+<!-- Rendered by phase-runner/scripts/run-phase.sh from the Phase's
+     TASK_QUEUE.json. Do not hand-edit a rendered Task: change the queue entry
+     instead, so the definition and what the worker saw stay identical. -->
+
 ## Task ID
 <PHASE>-<NN>            <!-- e.g. C01 -->
 
 ## Mode
 implement | investigate | fix | verify
+
+## Risk
+low | guarded      <!-- guarded: architecture / public API / schema / security /
+                         deployment. The loop stops for a Codex review right
+                         after a guarded Task is accepted. -->
 
 ## Objective
 <one or two sentences: what must be true when this Task is done>
@@ -22,11 +31,11 @@ implement | investigate | fix | verify
 - <path> - <why it matters>
 
 ## Allowed Changes
-- <exact files/directories the worker may modify>
+- <exact files/directories/globs the worker may modify; the evidence gate checks the diff against this list>
 - <what kinds of edits are expected>
 
 ## Forbidden Changes
-- <paths or behaviors that must not change>
+- <paths or globs that must not change>
 - <defaults: public API, schema, data formats, unrelated files, tests deletion>
 
 ## Acceptance Criteria
@@ -42,8 +51,9 @@ implement | investigate | fix | verify
 - <defaults: needs public API change, needs schema change, 2 attempts failed>
 
 <!--
-Rules for whoever writes this Task (Supervisor):
-- One Task = one coherent change. Never a whole Phase.
-- Keep it small enough for one cheap-worker run.
-- Never write "and then decide what to do next" - decisions belong to the Supervisor.
+Rules for whoever writes this Task (Codex, in the queue):
+- One Task = one coherent change with one verification story. Never a whole Phase.
+- The Required Verification commands are machine-read by run-phase.sh: they must
+  be exact, non-interactive, and fast enough to re-run.
+- Never write "and then decide what to do next" - decisions belong to Codex.
 -->

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# collect-result.sh - print the worker report (RESULT.md or ESCALATION.md) for review.
+# collect-result.sh - print the worker report + evidence for review.
 #
 # Usage:
 #   collect-result.sh [--root DIR] [--diff]
 #
+# Prints the report (RESULT.md or ESCALATION.md, including the ESCALATION Class)
+# and, when present, the evidence gate result (.agent/current/VERIFY.md).
 # --diff also prints `git diff --stat` and `git status --porcelain` relative to
 # the recorded baseline commit (best effort).
 #
@@ -12,7 +14,7 @@
 
 set -euo pipefail
 
-usage() { sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
 
 resolve_root() {
     local given="${1:-}"
@@ -79,6 +81,11 @@ main() {
 
     printf '===== %s (%s) =====\n\n' "$kind" "$report"
     cat "$report"
+
+    if [[ -s "$current/VERIFY.md" ]]; then
+        printf '\n===== VERIFY - evidence gate (%s) =====\n\n' "$current/VERIFY.md"
+        cat "$current/VERIFY.md"
+    fi
 
     if [[ "$want_diff" -eq 1 ]]; then
         print_diff "$root"

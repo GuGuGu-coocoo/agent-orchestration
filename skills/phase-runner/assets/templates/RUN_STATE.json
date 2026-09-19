@@ -3,7 +3,10 @@
   "current_phase": "",
   "current_task": "",
   "status": "idle",
+  "stop_reason": "",
   "human_checkpoint": "",
+  "phase_review": "",
+  "human_qa": "",
   "updated_at": "",
   "notes": ""
 }

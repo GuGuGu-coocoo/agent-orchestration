@@ -1,4 +1,4 @@
 interface:
   display_name: "Phase Runner"
-  short_description: "Run a roadmap Phase with the cheap worker"
-  default_prompt: "Use $phase-runner to execute the next roadmap Phase: decompose it into Tasks, hand exactly one Task at a time to the cheap worker, review each result, and stop at the human checkpoint."
+  short_description: "Plan a Phase, run its Tasks, review it at Phase level"
+  default_prompt: "Use $phase-runner to run the next roadmap Phase: plan it into bounded Tasks with machine-checkable verification, hand the whole Phase to run-phase.sh (one Task = one OpenCode session, no per-Task review), resolve any checkpoint or escalation, do the Phase-level integration review, then stop at awaiting_human_qa for the human."

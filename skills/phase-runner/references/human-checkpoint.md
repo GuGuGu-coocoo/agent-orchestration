@@ -2,7 +2,7 @@
 
 ## What it is
 
-The point where the Supervisor stops even though it *could* continue. Typical
+The point where autonomous work stops even though it *could* continue. Typical
 user instruction:
 
 > "用 $phase-runner 按现有 roadmap 完成 Phase C。普通技术问题自行处理。
@@ -11,13 +11,20 @@ user instruction:
 Meaning: run the whole Phase autonomously, handle ordinary problems without
 asking, stop exactly at the end of Phase C, and wait for manual QA.
 
+The end of every Phase is a checkpoint by construction:
+
+```
+Tasks done -> awaiting_phase_review -> (Codex review) -> awaiting_human_qa -> (human)
+```
+
 ## At the checkpoint
 
-The Supervisor must:
+The loop stops by itself at `awaiting_phase_review`; Codex then:
 
-1. Have all Tasks `done` and the phase verification green.
-2. Write `PHASE.md` `## Result` and update `TASK_QUEUE.json` to `status: done`.
-3. Write `.agent/RUN_STATE.json`:
+1. Runs the Phase-level integration review (`references/phase-review.md`).
+2. Accepts it with `phase-gate.sh review-pass --summary "..."`, which re-runs the
+   Phase verification for real, writes `PHASE.md` `## Result` and sets
+   `RUN_STATE.json`:
 
 ```json
 {
@@ -25,18 +32,21 @@ The Supervisor must:
   "current_phase": "C",
   "current_task": "",
   "status": "awaiting_human_qa",
+  "stop_reason": "",
+  "phase_review": "passed",
   "human_checkpoint": "after_phase_C"
 }
 ```
 
-4. Report to the human:
+3. Reports to the human:
    - what the Phase delivered (bullets, from the diff and criteria),
    - what was verified automatically and how,
    - what the human should test manually (`Human QA Required`),
-   - anything the human should know before deciding (risks, deviations,
-     deferred ideas),
+   - anything the human should know before deciding (risks, deviations, deferred
+     ideas),
    - what the next Phase would be - clearly marked as *not started*.
-5. **Stop.** No next Phase, no opportunistic fixes, no extra Tasks.
+4. **Stops.** `run-phase.sh` refuses to run while the state is
+   `awaiting_human_qa`, so "momentum" cannot start anything.
 
 ## While `awaiting_human_qa`
 
@@ -45,35 +55,38 @@ Allowed:
 - Answer questions about the work.
 - Run read-only inspection commands for the human.
 - Fix defects the human reports - but only as **new Tasks** appended to the phase
-  queue (or a follow-up phase), with the same one-Task-at-a-time worker loop.
-- Record the human's verdict in `RUN_STATE.json` (`status: qa_passed` or back to
-  `running` with a note).
+  queue: `phase-gate.sh qa-fail --note "..."` reopens the queue, the Tasks are
+  added, `run-phase.sh` runs them, the Phase verification runs again, and the
+  Phase returns to `awaiting_phase_review` -> `awaiting_human_qa`.
 
 Not allowed:
 
 - Start the next Phase or any roadmap work outside this Phase.
 - "Polish" code the human did not report.
-- Re-plan the completed phase to look better.
+- Re-plan the completed Phase to look better.
 - Resume autonomous work because "momentum".
 
-## Resuming after QA
+## After the human confirms
 
-If the human says "continue", resume like this:
+```sh
+phase-gate.sh qa-pass --note "how the human confirmed it"
+```
 
-1. Read `RUN_STATE.json` and the roadmap.
-2. Confirm which Phase is now in scope (usually the next one).
-3. Run the normal phase workflow from intake.
+That records the verdict and clears the state to `idle`. Planning the next Phase
+is then a deliberate, separate step: read the roadmap, do the intake again, write
+the new `PHASE.md` + `TASK_QUEUE.json`, and start the loop. Nothing starts by
+itself.
 
-If the human reports defects, do not reopen the phase broadly: convert each defect
-into a concrete Task, run the worker loop on them, re-run phase verification, then
-return to `awaiting_human_qa`.
+If the human reports defects, use `qa-fail` (see above) - never reopen the Phase
+broadly.
 
 ## Checkpoints the human did not ask for
 
 When there is no explicit checkpoint instruction:
 
-- Still stop after the phase and report; do not drift into the next Phase.
-- Interrupt early only for: genuine product decisions, unsafe/irreversible actions,
-  contradictory roadmap, or repeated escalation with no convergent plan.
-
-Everything else is the Supervisor's job to resolve.
+- Still stop after the Phase and report; do not drift into the next Phase.
+- The loop interrupts earlier on its own rules (checkpoint / escalation / guarded
+  Task), and Codex resolves those before continuing.
+- Interrupt the human early only for: genuine product decisions, unsafe or
+  irreversible actions, a contradictory roadmap, or repeated escalation with no
+  convergent plan.

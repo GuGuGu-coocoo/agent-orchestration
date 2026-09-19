@@ -3,6 +3,16 @@
 ## Task ID
 <TASK_ID>
 
+## Class
+CHECKPOINT | ESCALATE
+
+<!-- CHECKPOINT: progress is possible, but the Task needs a Codex decision
+     (architecture, public API, schema, security, deployment, scope growth,
+     unclear acceptance, or the worker is materially unsure).
+     ESCALATE: blocked - two genuinely different attempts failed, the Task is
+     contradictory or impossible, or the only way forward is forbidden.
+     The loop stops on both; a missing Class is treated as ESCALATE. -->
+
 ## Goal
 <what the Task asked for>
 
@@ -24,7 +34,7 @@
 ## Current Hypotheses
 <what you believe is true and what you could not verify>
 
-## Supervisor Decision Needed
+## Codex Decision Needed
 <the exact decision or permission required>
 
 ## Recommended Next Action

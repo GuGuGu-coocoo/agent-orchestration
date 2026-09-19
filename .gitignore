@@ -5,6 +5,9 @@
 *.log
 *.jsonl
 
+# Smoke-test output
+tests/smoke/.out/
+
 # Editor / OS noise
 .DS_Store
 .idea/

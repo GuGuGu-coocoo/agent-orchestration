@@ -7,8 +7,8 @@ project-specific facts; the contract wins for worker discipline.
 ## Input
 
 - `.agent/current/TASK.md` - the single Task to execute. Required.
-- `.agent/current/REVIEW.md` - optional corrections from a Supervisor REWORK
-  decision. If present, its `Required Corrections` are mandatory.
+- `.agent/current/REVIEW.md` - optional corrections from a Codex decision. If
+  present, its `Required Corrections` are mandatory.
 - `AGENTS.md` at the project root - optional project rules. Must be read if present.
 - `references/safety-policy.md` - default safety boundaries. Always binding.
 
@@ -16,11 +16,17 @@ project-specific facts; the contract wins for worker discipline.
 
 Exactly one of:
 
-- `.agent/current/RESULT.md` - task finished and verified. Status must be `DONE`.
-- `.agent/current/ESCALATION.md` - stopped after at most 2 failed distinct
-  attempts, or the Task requires a decision the worker is not allowed to make.
+- `.agent/current/RESULT.md` - Task finished and **verified**. Status must be `DONE`.
+- `.agent/current/ESCALATION.md` - stopped: it needs a decision (`Class
+  CHECKPOINT`) or it is blocked (`Class ESCALATE`).
 
 Never write both. Never write neither. Never keep editing after writing either.
+
+What happens next is **not** yours to decide: `run-phase.sh` re-runs the Task's
+Required Verification as a deterministic evidence gate, and only then archives
+the Task and continues with the next one. The same gate rejects the Task if the
+diff leaves `Allowed Changes`, if a criterion is unticked, or if verification
+does not pass - so a claim without evidence cannot pass.
 
 ## Execution protocol
 
@@ -31,7 +37,7 @@ Never write both. Never write neither. Never keep editing after writing either.
 5. Confirm the current behavior.
 6. Post a short plan (3-6 lines).
 7. Make the minimal change inside `Allowed Changes`.
-8. Run `Required Verification`.
+8. Run `Required Verification` exactly as written. Keep the real output.
 9. Ordinary failure: debug yourself. Maximum **two distinct approaches**.
 10. Re-run verification after every change.
 11. `git diff` and `git status` - confirm only intended files changed.
@@ -44,7 +50,7 @@ Never write both. Never write neither. Never keep editing after writing either.
 | --- | --- |
 | Attempt 1 | first reasonable approach |
 | Attempt 2 | one genuinely different approach / hypothesis |
-| - | Attempt 2 fails, or evidence contradicts all hypotheses -> ESCALATE |
+| - | Attempt 2 fails, or evidence contradicts all hypotheses -> ESCALATION.md |
 
 A "third attempt" is forbidden. Retrying the same approach with cosmetic tweaks is
 not a new attempt and is forbidden too.
@@ -71,23 +77,32 @@ DONE
 
 ## Acceptance Criteria
 - [x] <criterion> - <how it was checked>
-- [ ] ...
+- [x] ...
 
 ## Verification Performed
-- <command> -> <result>
+- `<command>` -> <exit code and the result you actually observed>
+- `<command>` -> ...
 
 ## Test Results
 <pass/fail counts, failing names, or "no test suite present">
+
+## Git Diff Summary
+<output of git diff --stat>
 
 ## Known Risks
 <none | list>
 
 ## Remaining Questions
 <none | list>
-
-## Git Diff Summary
-<output of git diff --stat>
 ```
+
+Rules the evidence gate enforces:
+
+- `## Status` is `DONE`.
+- Every `Acceptance Criteria` item is ticked (`- [x]`). An unticked item means
+  the Task is not done - use ESCALATION.md instead of a half-ticked RESULT.
+- `## Verification Performed` exists and names the commands you ran.
+- The diff stays inside `Allowed Changes`.
 
 ## ESCALATION.md format
 
@@ -96,6 +111,9 @@ DONE
 
 ## Task ID
 <id>
+
+## Class
+CHECKPOINT | ESCALATE
 
 ## Goal
 <what the Task asked for>
@@ -118,12 +136,14 @@ DONE
 ## Current Hypotheses
 <what you believe is true and what you cannot verify>
 
-## Supervisor Decision Needed
+## Codex Decision Needed
 <the exact decision or permission required>
 
 ## Recommended Next Action
 <your best proposal, clearly marked as a proposal>
 ```
+
+A missing `## Class` is treated as `ESCALATE` (fail closed).
 
 ## What must never appear in reports
 
@@ -132,5 +152,6 @@ DONE
 - thousands of lines of terminal logs
 - restatements of the whole project
 - plans for future Tasks or Phases
+- claimed verification that was not actually run
 
-Only keep facts a Supervisor needs to review the Task.
+Only keep facts a Codex reviewer or the evidence gate needs.

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # run-worker.sh - run exactly one cheap-worker Task via `opencode run`.
 #
+# This is the Task handoff used by the Phase loop (phase-runner/scripts/run-phase.sh)
+# and by Codex directly for a single Task. One run = one OpenCode session.
+#
 # V1 design:
 #   - One Task = one OpenCode session, created on the shared background service,
 #     so the session is observable in OpenCode Desktop.
@@ -14,8 +17,8 @@
 #   - a single project-level lock refuses a second concurrent worker; the lock
 #     records both the wrapper pid and the worker pid, and a stale lock is never
 #     taken over automatically (use --break-lock after verifying nothing runs)
-#   - previous RESULT/ESCALATION/BASELINE* are quarantined before the run, so a
-#     stale report can never be mistaken for this run's output
+#   - previous RESULT/ESCALATION/VERIFY/BASELINE* are quarantined before the run,
+#     so a stale report can never be mistaken for this run's output
 #   - the report must be fresh, carry this Task ID, and be well formed
 #   - `--allow-dirty` records the pre-run dirty evidence in BASELINE.md +
 #     BASELINE.patch (full `git diff HEAD --binary`)
@@ -40,7 +43,7 @@
 #   6  a report exists but is stale, malformed, or for another Task
 #   7  another worker is already running for this project
 #   8  stale lock could not be proven dead; re-run with --break-lock after checking
-#   10 fresh, valid ESCALATION.md (Supervisor decision required)
+#   10 fresh, valid ESCALATION.md (a decision is required; Class says CHECKPOINT or ESCALATE)
 #
 # This script never commits, pushes, merges or deletes anything.
 
@@ -162,7 +165,10 @@ valid_result() {
     return 0
 }
 
-# valid_escalation <file> -> fresh + Task ID matches + a blocker section
+# valid_escalation <file> -> fresh + Task ID matches + a blocker section.
+# The `## Class` line is read by the caller (run-phase.sh): CHECKPOINT keeps the
+# decision soft, anything else - including a missing class - is treated as
+# ESCALATE (fail closed).
 valid_escalation() {
     local f="$1"
     [[ -s "$f" ]] || return 1
@@ -217,7 +223,7 @@ main() {
     project_root="$(resolve_project_root "$root_arg")"
 
     local task_file="$project_root/.agent/current/TASK.md"
-    [[ -f "$task_file" ]] || die "no Task found at $task_file (Supervisor must write it first)"
+    [[ -f "$task_file" ]] || die "no Task found at $task_file (the Phase loop or Codex writes it first)"
     validate_task_file "$task_file"
 
     local file_task_id file_mode
@@ -380,7 +386,7 @@ main() {
     if [[ -f "$agent_dir/STATE.json" ]]; then
         prev_run="$(jq -r '.run_id // empty' "$agent_dir/STATE.json" 2>/dev/null || true)"
     fi
-    for f in RESULT.md ESCALATION.md BASELINE.md BASELINE.patch; do
+    for f in RESULT.md ESCALATION.md VERIFY.md BASELINE.md BASELINE.patch; do
         if [[ -s "$agent_dir/$f" ]]; then
             local dest="$project_root/.agent/history/attempts/${task_id}/${prev_run:-prev-$(date -u '+%Y%m%dT%H%M%SZ')}"
             mkdir -p "$dest" && mv "$agent_dir/$f" "$dest/$f"

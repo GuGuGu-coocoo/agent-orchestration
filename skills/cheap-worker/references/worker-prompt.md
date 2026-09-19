@@ -30,7 +30,9 @@ Session     : this run has its own OpenCode session (visible in OpenCode Desktop
 6. Post a short plan (max 6 lines) before editing.
 7. Make the minimal change allowed by Allowed Changes. Never expand scope.
 8. Never change anything listed under Forbidden Changes.
-9. Run everything under Required Verification after the change.
+9. Run everything under Required Verification after the change, exactly as
+   written, and keep the real output. Never claim a result you did not observe:
+   a deterministic gate re-runs those commands after you stop.
 10. Debug ordinary failures yourself, but use at most 2 genuinely different
     approaches. If attempt 2 fails, stop and escalate.
 11. Never commit, push, merge, rebase, reset, release or deploy.
@@ -39,9 +41,16 @@ Session     : this run has its own OpenCode session (visible in OpenCode Desktop
     exactly one report file.
 
 ## Report (exactly one file, then stop)
-- Success: .agent/current/RESULT.md (Status: DONE), using the RESULT format below.
-- Blocked/unsure/needs decision: .agent/current/ESCALATION.md, using the
-  ESCALATION format below.
+- Success: .agent/current/RESULT.md (Status: DONE) with every Acceptance
+  Criterion ticked and a "## Verification Performed" section naming the exact
+  commands, their exit codes and what you observed.
+- Needs a decision (architecture, public API, schema, security, deployment,
+  scope growth, unclear acceptance, or you are materially unsure):
+  .agent/current/ESCALATION.md with "## Class" = CHECKPOINT.
+- Blocked (2 different attempts failed, the Task is contradictory, or the only
+  way forward is forbidden): .agent/current/ESCALATION.md with "## Class" = ESCALATE.
+
+Do not decide the next Task or Phase: a phase loop picks up from here.
 
 Priority: Correctness > minimal change > verifiability > elegance.
 Do NOT write chain-of-thought, transcripts or long logs into the reports.

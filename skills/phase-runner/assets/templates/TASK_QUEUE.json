@@ -1,16 +1,47 @@
 {
   "phase": "X",
-  "status": "planning",
+  "status": "ready",
   "human_checkpoint_after": true,
   "created_at": "",
   "updated_at": "",
+  "phase_verification": [
+    {
+      "cmd": "<exact command that proves the whole Phase works, e.g. python3 -m pytest -q>",
+      "expect": "exit 0"
+    }
+  ],
   "tasks": [
     {
       "id": "X01",
       "title": "<short imperative title>",
       "mode": "implement",
+      "risk": "low",
       "status": "pending",
-      "acceptance_summary": "<one line the final review can check>",
+      "objective": "<one or two sentences: what must be true when this Task is done>",
+      "context": "<why this Task exists now; 2-5 lines max. No roadmap dump.>",
+      "existing_behavior": "<what the system does today, observed - not assumed>",
+      "desired_behavior": "<what it must do after this Task>",
+      "relevant_files": [
+        "<path> - <why it matters>"
+      ],
+      "allowed_changes": [
+        "<path or glob the worker may modify, e.g. app.py or src/**>"
+      ],
+      "forbidden_changes": [
+        "<path or glob that must not change, e.g. test_app.py>"
+      ],
+      "acceptance_criteria": [
+        "<observable, checkable criterion - one per line>"
+      ],
+      "verification": [
+        {
+          "cmd": "<exact command the evidence gate re-runs, e.g. python3 -m pytest -q test_app.py>",
+          "expect": "exit 0"
+        }
+      ],
+      "escalation_conditions": [
+        "<condition that must stop the worker: architecture, public API, schema, security, deployment, scope growth, 2 failed attempts, uncertainty>"
+      ],
       "depends_on": [],
       "history": []
     },
@@ -18,8 +49,23 @@
       "id": "X02",
       "title": "<short imperative title>",
       "mode": "implement",
+      "risk": "low",
       "status": "pending",
-      "acceptance_summary": "<one line the final review can check>",
+      "objective": "",
+      "context": "",
+      "existing_behavior": "",
+      "desired_behavior": "",
+      "relevant_files": [],
+      "allowed_changes": [],
+      "forbidden_changes": [],
+      "acceptance_criteria": [],
+      "verification": [
+        {
+          "cmd": "",
+          "expect": "exit 0"
+        }
+      ],
+      "escalation_conditions": [],
       "depends_on": ["X01"],
       "history": []
     }

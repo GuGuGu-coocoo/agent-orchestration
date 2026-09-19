@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# worker-notify.sh - run one cheap-worker Task in the background, hold a no-sleep
-# assertion while it runs, and wake the Codex Supervisor session when it finishes.
+# worker-notify.sh - run the worker (or a whole Phase loop) in the background,
+# hold a no-sleep assertion while it runs, and wake the Codex Supervisor session
+# when it stops.
 #
-# Why: the Supervisor can hand off a Task and end its turn instead of blocking on
-# a shell call. When the worker is done, a short message is delivered to the same
-# Codex session with `codex queue`, which starts a new turn there so Codex can
-# review (ACCEPT / REWORK) and hand off the next Task.
+# Why: Codex can hand off work and end its turn instead of blocking on a shell
+# call. When the run stops, a short message is delivered to the same Codex session
+# with `codex queue`, which starts a new turn there.
+#
+# Two handoff shapes:
+#   (default) one Task   -> cheap-worker/run-worker.sh; wake on RESULT/ESCALATION
+#   --phase              -> phase-runner/run-phase.sh; wake only when the whole
+#                           Phase loop stops (phase review, checkpoint, escalation)
 #
 # Usage:
 #   worker-notify.sh --codex-thread <id-or-name> [run-worker options...]
+#   worker-notify.sh --phase --codex-thread <id-or-name> [run-phase options...]
 #   worker-notify.sh [run-worker options...]   # uses CODEX_THREAD_ID if the runtime set it
 #   worker-notify.sh --foreground [...]        # stay attached (debug)
 #   worker-notify.sh --print-message --simulate-exit 5
@@ -17,36 +23,41 @@
 # The wake-up target must be identified exactly: pass --codex-thread, or have the
 # runtime provide CODEX_THREAD_ID. There is NO guessing from local history - a
 # wrong guess would wake another conversation. Without a target the helper fails
-# closed (exit 14) and the Supervisor uses run-worker.sh (blocking) instead.
+# closed (exit 14) and the Supervisor uses the blocking script instead.
 #
-# Options (all other options are forwarded to run-worker.sh):
+# Options (all other options are forwarded to the runner script):
+#   --phase                run the Phase loop (run-phase.sh) instead of one Task
 #   --codex-thread NAME    Codex session id or exact name (required unless
 #                          CODEX_THREAD_ID is set by the calling runtime) or --no-notify
 #   --no-notify            run the worker but do not wake Codex
 #   --foreground           do not detach (default: detached; use for tests/debug)
 #   --print-message        dry-run: print the wake-up message and exit
 #   --print-target         print the resolved target session and exit
-#   --simulate-exit N      exit code to use with --print-message (0|5|10|other)
+#   --simulate-exit N      exit code to use with --print-message (0|2|3|4|5|10|other)
 #   --message-prefix STR   optional prefix for the wake-up message
 #   --codex-bin PATH       codex CLI path (default: auto-detect)
 #   -h|--help
 #
 # Environment: CODEX_THREAD_ID (exact calling session, when provided),
 #              WORKER_NOTIFY_CODEX_HOME (default ~/.codex), CODEX_BIN,
-#              WORKER_NOTIFY_RUN_WORKER (default: sibling run-worker.sh)
+#              WORKER_NOTIFY_RUN_WORKER (default: sibling run-worker.sh),
+#              WORKER_NOTIFY_RUN_PHASE (default: sibling phase-runner/run-phase.sh)
 #
-# Exit codes: the worker's exit code (foreground mode);
+# Exit codes: the runner's exit code (foreground mode);
 #             0 when the background launch succeeded;
 #             14 no exact target (refusing to guess);
-#             15 the worker finished but the wake-up could not be delivered.
+#             15 the run finished but the wake-up could not be delivered.
 #
 # This script never commits, pushes, merges or deletes anything.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_WORKER="${WORKER_NOTIFY_RUN_WORKER:-$SCRIPT_DIR/run-worker.sh}"
 DETACHED="${WORKER_NOTIFY_DETACHED:-0}"
+PHASE_MODE=0
+
+# The runner is chosen after argument parsing (--phase switches to run-phase.sh).
+RUN_WORKER="${WORKER_NOTIFY_RUN_WORKER:-$SCRIPT_DIR/run-worker.sh}"
 
 CODEX_THREAD_ARG=""
 CODEX_THREAD=""
@@ -64,12 +75,13 @@ CODEX_HOME_DIR="${WORKER_NOTIFY_CODEX_HOME:-$HOME/.codex}"
 
 die() { printf 'worker-notify: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
 
 # --- argument parsing ---------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --codex-thread)   CODEX_THREAD_ARG="${2:-}"; shift 2 ;;
+        --phase)          PHASE_MODE=1; shift ;;
         --no-notify)      NO_NOTIFY=1; shift ;;
         --foreground)     FOREGROUND=1; shift ;;
         --print-message)  PRINT_MESSAGE=1; shift ;;
@@ -85,7 +97,17 @@ done
 if [[ "$PRINT_MESSAGE" -eq 0 && "$PRINT_SESSION" -eq 0 && "$NO_NOTIFY" -eq 0 && "$CODEX_THREAD_ARG" == "auto" ]]; then
     CODEX_THREAD_ARG=""
 fi
-[[ -x "$RUN_WORKER" ]] || die "run-worker.sh not found or not executable: $RUN_WORKER"
+
+if [[ "$PHASE_MODE" -eq 1 ]]; then
+    if [[ -n "${WORKER_NOTIFY_RUN_PHASE:-}" ]]; then
+        RUN_WORKER="$WORKER_NOTIFY_RUN_PHASE"
+    elif [[ -x "$SCRIPT_DIR/../../phase-runner/scripts/run-phase.sh" ]]; then
+        RUN_WORKER="$(cd "$SCRIPT_DIR/../../phase-runner/scripts" && pwd)/run-phase.sh"
+    else
+        RUN_WORKER="$HOME/.agents/skills/phase-runner/scripts/run-phase.sh"
+    fi
+fi
+[[ -x "$RUN_WORKER" ]] || die "runner not found or not executable: $RUN_WORKER"
 
 # --- project root / task id (for logs and message paths) ----------------------
 forward_value() {
@@ -116,6 +138,13 @@ resolve_root() {
 
 read_task_id() {
     local id
+    if [[ "$PHASE_MODE" -eq 1 ]]; then
+        if [[ -f "$1/.agent/RUN_STATE.json" ]] && command -v jq >/dev/null 2>&1; then
+            id="$(jq -r '.current_phase // empty' "$1/.agent/RUN_STATE.json" 2>/dev/null || true)"
+        fi
+        printf '%s' "phase-${id:--}"
+        return 0
+    fi
     id="$(forward_value --task-id)"
     if [[ -z "$id" && -f "$1/.agent/current/TASK.md" ]]; then
         id="$(awk '/^## Task ID[[:space:]]*$/{getline; gsub(/[[:space:]]/,""); print; exit}' "$1/.agent/current/TASK.md")"
@@ -186,14 +215,47 @@ if [[ "$PRINT_SESSION" -eq 1 ]]; then
 fi
 
 # --- wake-up message ----------------------------------------------------------
-compose_message() {
-    local rc="$1" id="$2" root="$3" msg
+# Phase mode: the loop only wakes Codex when it stops at a gate, never per Task.
+compose_phase_message() {
+    local rc="$1" label="$2" root="$3" msg
     case "$rc" in
         0)
-            msg="[worker-notify] $id 完成。请验收：读 $root/.agent/current/RESULT.md + git diff + 必要测试 → ACCEPT（归档并发下一个 Task）或 REWORK（写 REVIEW.md 后重新投递）。"
+            msg="[phase-notify] $label 全部 Task 完成，状态 awaiting_phase_review。请做 Phase 级 integration review：读 $root/.agent/phases/ 下的 PHASE_REVIEW.md、各 Task 的 RESULT.md/VERIFY.md 与 git diff → phase-gate.sh review-pass 或 review-fail。不要开始下一个 Phase。"
+            ;;
+        2)
+            msg="[phase-notify] $label 停在 checkpoint，等你决策。读 $root/.agent/RUN_STATE.json（stop_reason）、$root/.agent/current/（ESCALATION.md/VERIFY.md）后处理，再重跑 run-phase.sh。"
+            ;;
+        3)
+            msg="[phase-notify] $label 有 Task 进入 escalation。读 $root/.agent/current/ESCALATION.md 与 TASK_QUEUE.json history，处理后重跑 run-phase.sh。"
+            ;;
+        4)
+            msg="[phase-notify] $label 未启动：处于 awaiting_phase_review 或 awaiting_human_qa。先 phase-gate.sh review-pass/review-fail，或等待人工 QA 结论。"
             ;;
         5)
-            msg="[worker-notify] $id 有 RESULT.md 但 opencode 非零退出（exit=5）。先检查 $root/.agent/current/RESULT.md、BASELINE.md 与 logs/，再决定接受、返工或重跑。"
+            msg="[phase-notify] $label 因状态不一致或管道问题停下。检查 $root/.agent/current/ 与 check-state.sh，修好后重跑 run-phase.sh。"
+            ;;
+        *)
+            msg="[phase-notify] $label 结束（exit=$rc，未预期状态）。检查 $root/.agent/RUN_STATE.json 与 .agent/current/logs/。"
+            ;;
+    esac
+    if [[ -n "$MESSAGE_PREFIX" ]]; then
+        msg="$MESSAGE_PREFIX $msg"
+    fi
+    printf '%s' "$msg"
+}
+
+compose_message() {
+    local rc="$1" id="$2" root="$3" msg
+    if [[ "$PHASE_MODE" -eq 1 ]]; then
+        compose_phase_message "$rc" "$id" "$root"
+        return 0
+    fi
+    case "$rc" in
+        0)
+            msg="[worker-notify] $id 完成。读 $root/.agent/current/RESULT.md + VERIFY.md + git diff → 证据达标即继续（由 run-phase.sh 自动判定），否则处理。"
+            ;;
+        5)
+            msg="[worker-notify] $id 有 RESULT.md 但 opencode 非零退出（exit=5）。先检查 $root/.agent/current/RESULT.md、VERIFY.md 与 BASELINE.md，再决定重跑或人工处理。"
             ;;
         4)
             msg="[worker-notify] $id 同时存在 RESULT.md 与 ESCALATION.md（exit=4）。需要你裁决：读两份报告后决定以哪一份为准。"
@@ -205,7 +267,7 @@ compose_message() {
             msg="[worker-notify] $id 未启动：已有 worker 在运行（exit=7）。不要重复投递；先运行 check-state.sh 查看状态。"
             ;;
         10)
-            msg="[worker-notify] $id 需要你决策（ESCALATION.md）。请读 $root/.agent/current/ESCALATION.md，处理后决定下一步。"
+            msg="[worker-notify] $id 需要你决策（ESCALATION.md，Class=CHECKPOINT 或 ESCALATE）。先读 $root/.agent/current/ESCALATION.md，再决定下一步。"
             ;;
         2|3)
             msg="[worker-notify] $id 失败（exit=${rc}，无报告）。请检查 $root/.agent/current/STATE.json 与 logs/，决定重试或升级。"

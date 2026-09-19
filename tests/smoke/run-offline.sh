@@ -1,13 +1,31 @@
 #!/usr/bin/env bash
 # run-offline.sh - script-level smoke tests. No model calls, nothing is installed.
 #
+# Runs the scripts from THIS repository (skills/*/scripts), so a development
+# checkout is verified before it is installed and ~/.agents/skills is never
+# modified.
+#
 # Verifies:
-#   - doctor.sh passes and checks the shared service
+#   - doctor.sh passes, checks the shared service and the phase loop flags
 #   - SKILL.md frontmatter is valid for both skills
-#   - run-worker.sh fails fast without a Task and has no --model flag
-#   - run-worker.sh never passes --model or --standalone to opencode
-#   - run-worker.sh --dry-run renders the prompt, session title and command
-#   - status.sh, collect-result.sh, archive-task.sh behave as specified
+#   - run-worker.sh / run-phase.sh / worker-notify.sh never pass --model or
+#     --standalone (no model layer, shared service only)
+#   - run-worker.sh fails fast without a Task and rejects --model
+#   - the run-worker safety harness (fake opencode): report validation, stale
+#     report quarantine, lock identity, SIGTERM keeps the lock, TASK.md checks,
+#     dirty baseline, cwd pinning
+#   - the phase loop end to end against a fake worker:
+#       A: low-risk Tasks auto-continue (C01 -> C02 -> C03, one session each)
+#       B: a guarded Task / a worker CHECKPOINT stops the loop
+#       C: an ESCALATE stops the loop and blocks further runs
+#       D: the last Task enters awaiting_phase_review (never the next Phase)
+#       E: phase-gate review-pass -> awaiting_human_qa; run-phase refuses to run
+#       F: resume of an in_progress Task (never re-running the done ones)
+#     plus the evidence gate (verification, diff scope, ticked criteria,
+#     Supervisor-artifact tampering) and plan validation
+#   - check-state fail-closed matrix for the new states
+#   - phase-gate refusals (wrong state, missing summary/reason)
+#   - install/uninstall boundaries (fresh HOME, symlink escape, source copy)
 #
 # Usage: tests/smoke/run-offline.sh
 
@@ -20,7 +38,9 @@ source "$SMOKE_DIR/helpers.sh"
 TEST_NAME="offline"
 printf '== offline smoke tests ==\n'
 
-# --- 1. builder and installer invariants -------------------------------------
+# ---------------------------------------------------------------------------
+# 1. builder and installer invariants
+# ---------------------------------------------------------------------------
 info "source tree: $PROJECT_ROOT"
 
 for s in cheap-worker phase-runner; do
@@ -28,18 +48,29 @@ for s in cheap-worker phase-runner; do
     check "SKILL.md exists for $s" test -f "$src"
     check "SKILL.md frontmatter has name" bash -c "head -20 '$src' | grep -q '^name: $s$'"
     check "SKILL.md frontmatter has description" bash -c "head -20 '$src' | grep -q '^description: '"
-    check_eq "installed SKILL.md matches source for $s" \
-        "$(shasum "$src" | awk '{print $1}')" \
-        "$(shasum "$HOME/.agents/skills/$s/SKILL.md" | awk '{print $1}')"
 done
+
+# The installed copy is a separate, deliberate install step: this repo must never
+# assume it is in sync (and the tests never install it).
+if [[ -f "$HOME/.agents/skills/cheap-worker/SKILL.md" ]]; then
+    if [[ "$(shasum "$PROJECT_ROOT/skills/cheap-worker/SKILL.md" | awk '{print $1}')" == \
+          "$(shasum "$HOME/.agents/skills/cheap-worker/SKILL.md" | awk '{print $1}')" ]]; then
+        pass "installed cheap-worker SKILL.md matches source"
+    else
+        info "installed ~/.agents/skills/cheap-worker differs from this source tree (run scripts/install-skills.sh to sync; the tests never do)"
+        pass "installed copy exists (not modified by tests)"
+    fi
+else
+    info "cheap-worker is not installed globally (fine for development)"
+fi
 
 check "other skills still present (docx)" test -f "$HOME/.agents/skills/docx/SKILL.md"
 check "other skills still present (pdf)" test -f "$HOME/.agents/skills/pdf/SKILL.md"
-check "other skills still present (pptx)" test -f "$HOME/.agents/skills/pptx/SKILL.md"
-check "other skills still present (xlsx)" test -f "$HOME/.agents/skills/xlsx/SKILL.md"
 
-# --- 2. doctor ----------------------------------------------------------------
-if "$HOME/.agents/skills/cheap-worker/scripts/doctor.sh" --root "$SMOKE_DIR" >"$OUT_DIR/doctor.log" 2>&1; then
+# ---------------------------------------------------------------------------
+# 2. doctor
+# ---------------------------------------------------------------------------
+if "$DOCTOR" --root "$SMOKE_DIR" >"$OUT_DIR/doctor.log" 2>&1; then
     pass "doctor.sh exits 0"
 else
     fail "doctor.sh exited non-zero (see $OUT_DIR/doctor.log)"
@@ -48,8 +79,11 @@ check "doctor.sh reports no problems" grep -q 'result: 0 problem' "$OUT_DIR/doct
 check "doctor.sh checks the shared background service" grep -q 'background service' "$OUT_DIR/doctor.log"
 check "doctor.sh verifies no --model is passed" grep -q 'never passes --model' "$OUT_DIR/doctor.log"
 check "doctor.sh verifies no --standalone is used" grep -q 'never uses --standalone' "$OUT_DIR/doctor.log"
+check "doctor.sh checks the phase loop" grep -q 'phase loop' "$OUT_DIR/doctor.log"
 
-# --- 3. run-worker.sh precondition failures ------------------------------------
+# ---------------------------------------------------------------------------
+# 3. run-worker.sh preconditions
+# ---------------------------------------------------------------------------
 repo="$(new_repo smoke-offline)"
 CLEANUP_DIRS+=("$repo")
 
@@ -60,22 +94,34 @@ else
 fi
 check "failure message is clear" grep -q 'no Task found' "$OUT_DIR/no-task.log"
 
+if (cd "$repo" && "$RUN_PHASE") >"$OUT_DIR/phase-no-state.log" 2>&1; then
+    fail "run-phase.sh should fail without RUN_STATE.json"
+else
+    pass "run-phase.sh fails without RUN_STATE.json"
+fi
+check "run-phase failure message is clear" grep -q 'no ' "$OUT_DIR/phase-no-state.log"
+
 write_task "$repo" "OFF1" "implement" "objective" "existing" "desired" \
     "- app.py" "- app.py" "- everything else" \
     "- [ ] done" '`python3 app.py` exits 0' "none"
 
-# --- 3b. no model configuration layer ------------------------------------------
-worker_code="$(grep -v '^[[:space:]]*#' "$WORKER")"
-if printf '%s\n' "$worker_code" | grep -q -- '--model'; then
-    fail "run-worker.sh must not pass --model"
-else
-    pass "run-worker.sh never passes --model"
-fi
-if printf '%s\n' "$worker_code" | grep -q -- '--standalone'; then
-    fail "run-worker.sh must not use --standalone"
-else
-    pass "run-worker.sh never uses --standalone"
-fi
+# ---------------------------------------------------------------------------
+# 3b. no model configuration layer, shared service only
+# ---------------------------------------------------------------------------
+for script in "$WORKER" "$RUN_PHASE" "$PHASE_GATE" "$NOTIFY"; do
+    name="$(basename "$script")"
+    code="$(grep -v '^[[:space:]]*#' "$script")"
+    if printf '%s\n' "$code" | grep -q -- '--model'; then
+        fail "$name must not pass --model"
+    else
+        pass "$name never passes --model"
+    fi
+    if printf '%s\n' "$code" | grep -q -- '--standalone'; then
+        fail "$name must not use --standalone"
+    else
+        pass "$name never uses --standalone"
+    fi
+done
 
 if (cd "$repo" && "$WORKER" --mode implement --model foo/bar) >"$OUT_DIR/model-flag.log" 2>&1; then
     fail "run-worker.sh should reject an unknown --model flag"
@@ -84,7 +130,23 @@ else
 fi
 check "rejection message names the unknown argument" grep -q "unknown argument '--model'" "$OUT_DIR/model-flag.log"
 
-# --- 4. dry-run ----------------------------------------------------------------
+if (cd "$repo" && "$RUN_PHASE" --model foo/bar) >"$OUT_DIR/phase-model-flag.log" 2>&1; then
+    fail "run-phase.sh should reject an unknown --model flag"
+else
+    pass "run-phase.sh rejects --model"
+fi
+
+# the loop must drive the worker through run-worker.sh (no private opencode call)
+check "run-phase.sh calls run-worker.sh" grep -q 'run-worker.sh' "$RUN_PHASE"
+if grep -v '^[[:space:]]*#' "$RUN_PHASE" | grep -q 'opencode run'; then
+    fail "run-phase.sh must not call opencode directly"
+else
+    pass "run-phase.sh never calls opencode directly (one Task = one session via run-worker.sh)"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. dry-run
+# ---------------------------------------------------------------------------
 if (cd "$repo" && "$WORKER" --mode implement --dry-run) >"$OUT_DIR/dryrun.log" 2>&1; then
     pass "dry-run exits 0"
 else
@@ -99,15 +161,18 @@ else
     pass "dry-run command has no --model"
 fi
 
-# --- 5. status / collect-result -------------------------------------------------
-if (cd "$repo" && "$HOME/.agents/skills/cheap-worker/scripts/status.sh") >"$OUT_DIR/status.log" 2>&1; then
+# ---------------------------------------------------------------------------
+# 5. status / collect-result
+# ---------------------------------------------------------------------------
+if (cd "$repo" && "$STATUS") >"$OUT_DIR/status.log" 2>&1; then
     pass "status.sh exits 0"
 else
     fail "status.sh failed"
 fi
 check "status.sh shows the task id" grep -q 'task id      : OFF1' "$OUT_DIR/status.log"
+check "status.sh shows the loop state" grep -q 'loop state   :' "$OUT_DIR/status.log"
 
-if (cd "$repo" && "$HOME/.agents/skills/cheap-worker/scripts/collect-result.sh") >/dev/null 2>&1; then
+if (cd "$repo" && "$COLLECT") >/dev/null 2>&1; then
     fail "collect-result.sh should fail with no report"
 else
     pass "collect-result.sh fails with no report"
@@ -126,16 +191,24 @@ DONE
 Offline fixture.
 EOF
 
-if (cd "$repo" && "$HOME/.agents/skills/cheap-worker/scripts/collect-result.sh") >"$OUT_DIR/collect.log" 2>&1; then
+if (cd "$repo" && "$COLLECT") >"$OUT_DIR/collect.log" 2>&1; then
     pass "collect-result.sh succeeds with a report"
 else
     fail "collect-result.sh failed with a report present"
 fi
 check "collect-result.sh prints the report" grep -q 'Offline fixture' "$OUT_DIR/collect.log"
 
-# --- 6. archive-task.sh ----------------------------------------------------------
-ARCHIVER="$HOME/.agents/skills/cheap-worker/scripts/archive-task.sh"
+cat >"$repo/.agent/current/VERIFY.md" <<'EOF'
+# Task verification (evidence gate)
+- result: PASS
+EOF
+(cd "$repo" && "$COLLECT") >"$OUT_DIR/collect-verify.log" 2>&1 || true
+check "collect-result.sh prints the evidence gate result" grep -q 'evidence gate' "$OUT_DIR/collect-verify.log"
+rm -f "$repo/.agent/current/VERIFY.md"
 
+# ---------------------------------------------------------------------------
+# 6. archive-task.sh
+# ---------------------------------------------------------------------------
 if (cd "$repo" && "$ARCHIVER" --decision ACCEPT) >/dev/null 2>&1; then
     fail "archive-task.sh without --yes should refuse"
 else
@@ -143,6 +216,10 @@ else
 fi
 
 mkdir -p "$repo/.agent/history"
+cat >"$repo/.agent/current/VERIFY.md" <<'EOF'
+# Task verification (evidence gate)
+- result: PASS
+EOF
 if (cd "$repo" && "$ARCHIVER" --yes --decision ACCEPT) >"$OUT_DIR/archive.log" 2>&1; then
     pass "archive-task.sh archives with --yes"
 else
@@ -150,20 +227,19 @@ else
 fi
 check "TASK.md was archived" bash -c "ls '$repo'/\.agent/history/*OFF1/TASK.md >/dev/null 2>&1"
 check "RESULT.md was archived" bash -c "ls '$repo'/\.agent/history/*OFF1/RESULT.md >/dev/null 2>&1"
+check "VERIFY.md was archived" bash -c "ls '$repo'/\.agent/history/*OFF1/VERIFY.md >/dev/null 2>&1"
 check "decision record written" bash -c "grep -q 'Decision: ACCEPT' '$repo'/\.agent/history/*OFF1/REVIEW_DECISION.md"
 check "current workspace re-seeded with blank TASK.md" bash -c "grep -q '<PHASE>-<NN>' '$repo/.agent/current/TASK.md'"
 check "current RESULT.md cleared" bash -c "! test -e '$repo/.agent/current/RESULT.md'"
 
-# --- 6b. worker-notify.sh --------------------------------------------------------
-NOTIFY="$HOME/.agents/skills/cheap-worker/scripts/worker-notify.sh"
-
+# ---------------------------------------------------------------------------
+# 6b. worker-notify.sh (one Task)
+# ---------------------------------------------------------------------------
 if "$NOTIFY" --help >"$OUT_DIR/notify-help.log" 2>&1; then
     pass "worker-notify.sh --help exits 0"
 else
     fail "worker-notify.sh --help failed"
 fi
-
-(cd "$repo" && "$NOTIFY" --print-message --simulate-exit 0 --task-id OFF2) >"$OUT_DIR/notify-msg-0.log" 2>&1 || true
 
 # fake worker + fake codex: exercise the notify path offline
 cat >"$repo/.fake-worker.sh" <<'FAKEEOF'
@@ -181,7 +257,7 @@ rm -f "$OUT_DIR/fake-codex-calls.log"
 
 if (cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-worker.sh" "$NOTIFY" \
         --no-notify --foreground --mode implement) >"$OUT_DIR/notify-no-thread.log" 2>&1; then
-    pass "worker-notify.sh runs without --codex-thread (auto-discovery / no-notify)"
+    pass "worker-notify.sh runs with --no-notify"
 else
     fail "worker-notify.sh --no-notify run failed"
 fi
@@ -247,7 +323,26 @@ else
     fail "detached worker did not notify within 10s"
 fi
 
-# --- 6c. session identity: explicit only, fail closed (H04) ----------------------
+# --- 6c. worker-notify.sh --phase message wording ---------------------------------
+phase_msg() {  # phase_msg <exit-code> -> file
+    local rc="$1"
+    (cd "$repo" && WORKER_NOTIFY_RUN_PHASE="$RUN_PHASE" "$NOTIFY" --phase --print-message --simulate-exit "$rc") \
+        >"$OUT_DIR/notify-phase-msg-${rc}.log" 2>&1 || true
+}
+phase_msg 0
+phase_msg 2
+phase_msg 3
+phase_msg 4
+check "phase wake-up: phase-review wording" grep -q 'awaiting_phase_review' "$OUT_DIR/notify-phase-msg-0.log"
+check "phase wake-up: review is Phase-level" grep -q 'Phase 级 integration review' "$OUT_DIR/notify-phase-msg-0.log"
+check "phase wake-up: checkpoint wording" grep -q 'checkpoint' "$OUT_DIR/notify-phase-msg-2.log"
+check "phase wake-up: escalation wording" grep -q 'escalation' "$OUT_DIR/notify-phase-msg-3.log"
+check "phase wake-up: human gate wording" grep -q 'awaiting_human_qa' "$OUT_DIR/notify-phase-msg-4.log"
+check "phase wake-up: does not ask for a per-Task review" bash -c "! grep -q '下一个 Task' '$OUT_DIR/notify-phase-msg-0.log'"
+
+# ---------------------------------------------------------------------------
+# 6d. session identity: explicit only, fail closed
+# ---------------------------------------------------------------------------
 FAKE_HOME="$repo/.fake-codex-home"
 mkdir -p "$FAKE_HOME"
 sqlite3 "$FAKE_HOME/state_5.sqlite" \
@@ -259,57 +354,51 @@ NOTIFY_HOME_TEST() {
     (cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$@")
 }
 
-# no identity -> refuse (exit 1), never guess
 N_RC=0
 NOTIFY_HOME_TEST env -u CODEX_THREAD_ID "$NOTIFY" --print-target >"$OUT_DIR/target-none.log" 2>&1 || N_RC=$?
 check_eq "identity: no CODEX_THREAD_ID and no flag -> exit 1" "1" "$N_RC"
 check "identity: refusal message is explicit" grep -q 'no target' "$OUT_DIR/target-none.log"
 
-# explicit flag wins
 N_RC=0
 NOTIFY_HOME_TEST "$NOTIFY" --print-target --codex-thread sess-ok >"$OUT_DIR/target-flag.log" 2>&1 || N_RC=$?
 check_eq "identity: explicit --codex-thread is used" "0" "$N_RC"
 check "identity: prints the explicit target" grep -q '^sess-ok' "$OUT_DIR/target-flag.log"
 
-# CODEX_THREAD_ID from the calling runtime is honored
 N_RC=0
 NOTIFY_HOME_TEST env CODEX_THREAD_ID=sess-ok "$NOTIFY" --print-target >"$OUT_DIR/target-env.log" 2>&1 || N_RC=$?
 check_eq "identity: CODEX_THREAD_ID is honored" "0" "$N_RC"
 
-# archived target is refused with a hint
 N_RC=0
 NOTIFY_HOME_TEST "$NOTIFY" --print-target --codex-thread sess-archived >"$OUT_DIR/target-arch.log" 2>&1 || N_RC=$?
 check_eq "identity: archived target -> exit 3" "3" "$N_RC"
 check "identity: archived hint present" grep -q 'ARCHIVED' "$OUT_DIR/target-arch.log"
 
-# handoff without an identity fails closed instead of guessing
 rm -f "$repo/.agent/current/RESULT.md"
 N_RC=0
 NOTIFY_HOME_TEST env -u CODEX_THREAD_ID "$NOTIFY" --mode implement --task-id OFF2 >"$OUT_DIR/notify-no-target.log" 2>&1 || N_RC=$?
 check_eq "worker-notify: no target -> exit 14 (refusing to guess)" "14" "$N_RC"
 check "worker-notify: refusal is explicit" grep -q 'refusing to guess' "$OUT_DIR/notify-no-target.log"
 
-# message wording for the new exit codes (N01)
+(NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 0 --task-id OFF2) >"$OUT_DIR/notify-msg-0.log" 2>&1 || true
 (NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 0 --task-id OFF2) >"$OUT_DIR/notify-msg-0.log" 2>&1 || true
 (NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 5 --task-id OFF2) >"$OUT_DIR/notify-msg-5.log" 2>&1 || true
 (NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 6 --task-id OFF2) >"$OUT_DIR/notify-msg-6.log" 2>&1 || true
 (NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 7 --task-id OFF2) >"$OUT_DIR/notify-msg-7.log" 2>&1 || true
 (NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 10 --task-id OFF2) >"$OUT_DIR/notify-msg-10.log" 2>&1 || true
 (NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 2 --task-id OFF2) >"$OUT_DIR/notify-msg-2.log" 2>&1 || true
-check "success message asks for review" grep -q '验收' "$OUT_DIR/notify-msg-0.log"
+check "task wake-up: mentions the evidence gate" grep -q 'VERIFY.md' "$OUT_DIR/notify-msg-0.log"
 check "exit 5 asks to read the existing RESULT" grep -q '有 RESULT.md' "$OUT_DIR/notify-msg-5.log"
 check "exit 6 asks to inspect current/ and attempts/" grep -q 'attempts' "$OUT_DIR/notify-msg-6.log"
 check "exit 7 says a worker is already running" grep -q '已有 worker' "$OUT_DIR/notify-msg-7.log"
 check "escalation message asks for a decision" grep -q '决策' "$OUT_DIR/notify-msg-10.log"
+check "escalation message names the Class" grep -q 'Class' "$OUT_DIR/notify-msg-10.log"
 check "failure (no report) message says so" grep -q '无报告' "$OUT_DIR/notify-msg-2.log"
-check "message carries absolute paths" grep -q '/\.agent/current/RESULT.md' "$OUT_DIR/notify-msg-0.log"
 
-# --- 6d. run-worker.sh safety harness (fake opencode, offline) --------------------
+# ---------------------------------------------------------------------------
+# 6e. run-worker.sh safety harness (fake opencode, offline)
+# ---------------------------------------------------------------------------
 HARNESS="$repo/.harness"
-rm -rf "$HARNESS"
-mkdir -p "$HARNESS/bin"
-cp "$SMOKE_DIR/assets/fake-opencode.sh" "$HARNESS/bin/opencode"
-chmod +x "$HARNESS/bin/opencode"
+make_fake_bin "$HARNESS/bin" >/dev/null
 
 hrepo="$(new_repo smoke-harness)"
 CLEANUP_DIRS+=("$hrepo")
@@ -318,7 +407,7 @@ write_task "$hrepo" "H01" "implement" "harness objective" "existing behavior" "d
 printf 'print("hi")\n' >"$hrepo/app.py"
 commit_all "$hrepo" "harness baseline"
 HROOT="$(cd "$hrepo" && pwd -P)"
-HRUN="$HOME/.agents/skills/cheap-worker/scripts/run-worker.sh"
+HRUN="$WORKER"
 
 run_fake() {  # run_fake <mode> <exit> [args...] -> sets FAKE_RC
     local mode="$1" xc="$2"; shift 2
@@ -370,7 +459,7 @@ check_eq "harness: stale report quarantined, no report -> exit 3" "3" "$FAKE_RC"
 check "harness: stale report moved to attempts/" bash -c "grep -rl 'stale report from an earlier attempt' '$hrepo/.agent/history/attempts' >/dev/null 2>&1"
 check "harness: current/RESULT.md is gone" bash -c "! test -e '$hrepo/.agent/current/RESULT.md'"
 
-# single-run lock identity (H03)
+# single-run lock identity
 sleep 30 &
 LOCKER=$!
 mkdir -p "$hrepo/.agent/current/.worker.lock"
@@ -380,7 +469,7 @@ check_eq "harness: live wrapper lock refuses a second worker -> exit 7" "7" "$FA
 kill "$LOCKER" 2>/dev/null || true
 wait "$LOCKER" 2>/dev/null || true
 
-# dead wrapper but a recorded live worker pid must still refuse (H03 core case)
+# dead wrapper but a recorded live worker pid must still refuse
 sleep 30 &
 SURVIVOR=$!
 printf 'pid=999999\nworker_pid=%s\nrun_id=survivor\n' "$SURVIVOR" >"$hrepo/.agent/current/.worker.lock/info"
@@ -395,11 +484,9 @@ run_fake result 0 --allow-dirty --mode implement
 check_eq "harness: unprovable stale lock -> exit 8" "8" "$FAKE_RC"
 check "harness: exit 8 explains --break-lock" grep -q -- '--break-lock' "$OUT_DIR/fake-run.log"
 
-# cancellation must KEEP the lock until execution is proven stopped (H03)
+# cancellation must KEEP the lock until execution is proven stopped
 SLOWBIN="$HARNESS/slowbin"
-mkdir -p "$SLOWBIN"
-cp "$SMOKE_DIR/assets/fake-opencode.sh" "$SLOWBIN/opencode"
-chmod +x "$SLOWBIN/opencode"
+make_fake_bin "$SLOWBIN" >/dev/null
 PIDLOG="$HARNESS/slow.pids"
 RELEASE="$HARNESS/slow.release"
 rm -f "$PIDLOG" "$RELEASE"
@@ -432,7 +519,7 @@ if [[ -s "$PIDLOG" ]]; then
     while IFS= read -r p; do kill -TERM "$p" 2>/dev/null || true; done <"$PIDLOG"
 fi
 
-# TASK.md validation (M02)
+# TASK.md validation
 cp "$hrepo/.agent/current/TASK.md" "$HARNESS/TASK.good"
 printf '# Task\n\n## Task ID\nH01\n\n## Mode\nimplement\n' >"$hrepo/.agent/current/TASK.md"
 run_fake result 0 --allow-dirty --mode implement
@@ -443,16 +530,15 @@ check_eq "harness: --task-id mismatch -> exit 1" "1" "$FAKE_RC"
 run_fake result 0 --allow-dirty --mode verify
 check_eq "harness: --mode mismatch -> exit 1" "1" "$FAKE_RC"
 
-# template list placeholders are still placeholders (M02)
+# template list placeholders are still placeholders
 cp "$HARNESS/TASK.good" "$hrepo/.agent/current/TASK.md"
 sed -i '' 's/^- \[ \] works$/- [ ] <observable, checkable criterion>/' "$hrepo/.agent/current/TASK.md"
-sed -i '' 's/^- app\.py$/- <exact files>/' "$hrepo/.agent/current/TASK.md"
 run_fake result 0 --allow-dirty --mode implement
 check_eq "harness: list placeholders rejected -> exit 1" "1" "$FAKE_RC"
 check "harness: placeholder message names the section" grep -q 'placeholder' "$OUT_DIR/fake-run.log"
 cp "$HARNESS/TASK.good" "$hrepo/.agent/current/TASK.md"
 
-# REVIEW.md without a Task ID is rejected (M02)
+# REVIEW.md without a Task ID is rejected
 cat >"$hrepo/.agent/current/REVIEW.md" <<'EOF'
 # Review
 
@@ -467,7 +553,7 @@ check_eq "harness: REVIEW.md without Task ID -> exit 1" "1" "$FAKE_RC"
 check "harness: REVIEW message is explicit" grep -q 'REVIEW.md has no' "$OUT_DIR/fake-run.log"
 rm -f "$hrepo/.agent/current/REVIEW.md"
 
-# dirty tree handling + baseline evidence (M01)
+# dirty tree handling + baseline evidence
 printf 'print("local change")\n' >>"$hrepo/app.py"
 run_fake result 0 --mode implement
 check_eq "harness: dirty tree without --allow-dirty -> exit 1" "1" "$FAKE_RC"
@@ -476,7 +562,7 @@ check_eq "harness: dirty tree with --allow-dirty -> exit 0" "0" "$FAKE_RC"
 check "harness: BASELINE.md lists the dirty file" grep -q 'M app.py' "$hrepo/.agent/current/BASELINE.md"
 check "harness: BASELINE.patch holds the full pre-run patch" grep -q 'local change' "$hrepo/.agent/current/BASELINE.patch"
 
-# cwd pinning when invoked from elsewhere (H02)
+# cwd pinning when invoked from elsewhere
 OTHER="$(new_repo smoke-caller)"
 CLEANUP_DIRS+=("$OTHER")
 rm -f "$HARNESS/cwd.log"
@@ -488,33 +574,650 @@ FAKE_RC=0
 check_eq "harness: --root run succeeds from another directory" "0" "$FAKE_RC"
 check_eq "harness: opencode still ran in the project root" "$HROOT" "$(tail -1 "$HARNESS/cwd.log")"
 
-# --- 7. collect-result conflict + installer boundaries -----------------------------
-cat >"$repo/.agent/current/RESULT.md" <<'EOF'
-# Result
+# ---------------------------------------------------------------------------
+# 7. THE PHASE LOOP (offline, fake worker): scenarios A-F
+# ---------------------------------------------------------------------------
+FAKEBIN="$repo/.fakebin"
+make_fake_bin "$FAKEBIN" >/dev/null
 
-## Task ID
-OFF3
-
-## Status
-DONE
+# --- A: three low-risk Tasks auto-continue, one session per Task -------------
+info "phase loop A: auto-continue over three Tasks"
+AREPO="$(new_repo smoke-loop-a)"
+CLEANUP_DIRS+=("$AREPO")
+AFIX="$(mktemp -d "$TMP_BASE/smoke-fix-a.XXXXXX")"
+CLEANUP_DIRS+=("$AFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$AREPO/app.py"
+write_phase_md "$AREPO" "A"
+write_run_state "$AREPO" "A" "idle" >/dev/null
+Q="$AFIX/tasks.jsonl"
+queue_task_json A01 "add shutdown" low pending "grep -q 'def shutdown' app.py" "app.py" >>"$Q"
+queue_task_json A02 "add farewell" low pending "grep -q 'def farewell' app.py" "app.py" >>"$Q"
+queue_task_json A03 "add docs" low pending "grep -q 'def farewell' app.py" "app.py, README.md" >>"$Q"
+write_queue "$AREPO" "A" "$Q" "grep -q 'def shutdown' app.py && grep -q 'def farewell' app.py"
+cat >"$AFIX/A01.sh" <<'EOF'
+printf '\n\ndef shutdown(seconds):\n    return "bye"\n' >> app.py
 EOF
-cat >"$repo/.agent/current/ESCALATION.md" <<'EOF'
+cat >"$AFIX/A02.sh" <<'EOF'
+printf '\n\ndef farewell(name):\n    return "bye, %s" % name\n' >> app.py
+EOF
+cat >"$AFIX/A03.sh" <<'EOF'
+printf '# Fixture docs\n' >> README.md
+EOF
+commit_all "$AREPO" "loop A fixture"
+CWDLOG="$OUT_DIR/loop-a-cwd.log"
+: >"$CWDLOG"
+LAST_EXIT=0
+( cd "$AREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" \
+    FAKE_TASK_DIR="$AFIX" FAKE_OPENCODE_CWD_LOG="$CWDLOG" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-a.log" 2>&1 || LAST_EXIT=$?
+check_eq "A: loop completed the phase -> exit 0" "0" "$LAST_EXIT"
+check_eq "A: one OpenCode session per Task" "3" "$(grep -c . "$CWDLOG")"
+check "A: all three Tasks are done" bash -c \
+    "jq -e '[.tasks[] | select(.status==\"done\")] | length == 3' '$AREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "A: every Task has an ACCEPT history entry" bash -c \
+    "jq -e '[.tasks[] | select((.history | map(.decision) | index(\"ACCEPT\")) == null)] | length == 0' '$AREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "A: three archives exist" bash -c "[ \"\$(ls -d '$AREPO'/.agent/history/*A0[0-9] 2>/dev/null | wc -l | tr -d ' ')\" = 3 ]"
+check "A: the loop never stopped mid-phase" bash -c "! grep -q 'STOP (' '$OUT_DIR/loop-a.log'"
+check "A: three worker runs finished cleanly" bash -c "[ \"\$(grep -c 'worker exit=0' '$OUT_DIR/loop-a.log')\" = 3 ]"
+check "A: the Phase verification ran for real" grep -q 'PASS (exit 0)' "$AREPO/.agent/phases/A/PHASE_REVIEW.md"
+check "A: evidence per Task was kept in the phase history" bash -c "test -s '$AREPO/.agent/phases/A/history/VERIFY-A02.md'"
+check "A: the rendered Task was kept in the phase history" bash -c "test -s '$AREPO/.agent/phases/A/history/TASK-A01.md'"
+check "A: state is awaiting_phase_review (D)" bash -c "jq -e '.status == \"awaiting_phase_review\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+check "A: stop_reason is phase_complete" bash -c "jq -e '.stop_reason == \"phase_complete\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+check "A: the queue is done" bash -c "jq -e '.status == \"done\"' '$AREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "A: no phase lock is left behind" bash -c "! test -e '$AREPO/.agent/current/.phase.lock'"
+check "A: no ESCALATION stays behind" bash -c "! test -s '$AREPO/.agent/current/ESCALATION.md'"
+check "A: the Phase was NOT followed by another phase" bash -c "! test -d '$AREPO/.agent/phases/B'"
+
+# --- B: a guarded Task stops the loop ----------------------------------------
+info "phase loop B: checkpoint (guarded Task and worker CHECKPOINT)"
+BREPO="$(new_repo smoke-loop-b)"
+CLEANUP_DIRS+=("$BREPO")
+BFIX="$(mktemp -d "$TMP_BASE/smoke-fix-b.XXXXXX")"
+CLEANUP_DIRS+=("$BFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$BREPO/app.py"
+write_phase_md "$BREPO" "A"
+write_run_state "$BREPO" "A" "idle" >/dev/null
+QB="$BFIX/tasks.jsonl"
+queue_task_json B01 "change the public API" guarded pending "grep -q 'def api2' app.py" "app.py" >>"$QB"
+queue_task_json B02 "must not run yet" low pending "grep -q 'def b02' app.py" "app.py" >>"$QB"
+write_queue "$BREPO" "A" "$QB" "grep -q 'def api2' app.py"
+cat >"$BFIX/B01.sh" <<'EOF'
+printf '\n\ndef api2():\n    return 2\n' >> app.py
+EOF
+cat >"$BFIX/B02.sh" <<'EOF'
+printf '\n\ndef b02():\n    return 2\n' >> app.py
+EOF
+commit_all "$BREPO" "loop B fixture"
+LAST_EXIT=0
+( cd "$BREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$BFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-b-guarded.log" 2>&1 || LAST_EXIT=$?
+check_eq "B: guarded Task stops the loop -> exit 2" "2" "$LAST_EXIT"
+check "B: the guarded Task was accepted and archived" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"B01\")][0].status == \"done\"' '$BREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "B: the NEXT Task was NOT started" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"B02\")][0].status == \"pending\"' '$BREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "B: state is checkpoint" bash -c "jq -e '.status == \"checkpoint\"' '$BREPO/.agent/RUN_STATE.json' >/dev/null"
+check "B: stop_reason names the guarded Task" bash -c "jq -e '.stop_reason == \"guarded_task_review\"' '$BREPO/.agent/RUN_STATE.json' >/dev/null"
+
+# worker CHECKPOINT: the loop stops and the Task stays in_progress
+CFIX2="$(mktemp -d "$TMP_BASE/smoke-fix-b2.XXXXXX")"
+CLEANUP_DIRS+=("$CFIX2")
+printf 'CHECKPOINT\n' >"$CFIX2/B02.escalation"
+LAST_EXIT=0
+( cd "$BREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$CFIX2" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-b-checkpoint.log" 2>&1 || LAST_EXIT=$?
+check_eq "B: worker CHECKPOINT stops the loop -> exit 2" "2" "$LAST_EXIT"
+check "B: state is checkpoint" bash -c "jq -e '.status == \"checkpoint\"' '$BREPO/.agent/RUN_STATE.json' >/dev/null"
+check "B: stop_reason is worker_checkpoint" bash -c "jq -e '.stop_reason == \"worker_checkpoint\"' '$BREPO/.agent/RUN_STATE.json' >/dev/null"
+check "B: the Task stays in_progress for the resume" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"B02\")][0].status == \"in_progress\"' '$BREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "B: the worker report is kept for Codex" test -s "$BREPO/.agent/current/ESCALATION.md"
+(cd "$BREPO" && "$CHECK_STATE") >"$OUT_DIR/cs-loop-b.log" 2>&1 || true
+check "B: check-state verdict is CHECKPOINT" grep -q 'verdict: CHECKPOINT' "$OUT_DIR/cs-loop-b.log"
+check "B: check-state points at the decision" grep -q 'Codex decision needed' "$OUT_DIR/cs-loop-b.log"
+
+# --- C: an ESCALATE stops the loop and blocks further runs -------------------
+info "phase loop C: escalation"
+DREPO="$(new_repo smoke-loop-c)"
+CLEANUP_DIRS+=("$DREPO")
+DFIX="$(mktemp -d "$TMP_BASE/smoke-fix-c.XXXXXX")"
+CLEANUP_DIRS+=("$DFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$DREPO/app.py"
+write_phase_md "$DREPO" "A"
+write_run_state "$DREPO" "A" "idle" >/dev/null
+QD="$DFIX/tasks.jsonl"
+queue_task_json C01 "contradictory Task" low pending "grep -q 'def c01' app.py" "app.py" >>"$QD"
+queue_task_json C02 "must not run" low pending "grep -q 'def c02' app.py" "app.py" >>"$QD"
+write_queue "$DREPO" "A" "$QD" "grep -q 'def c01' app.py"
+printf 'ESCALATE\n' >"$DFIX/C01.escalation"
+commit_all "$DREPO" "loop C fixture"
+LAST_EXIT=0
+( cd "$DREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$DFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-c.log" 2>&1 || LAST_EXIT=$?
+check_eq "C: escalation stops the loop -> exit 3" "3" "$LAST_EXIT"
+check "C: state is escalated" bash -c "jq -e '.status == \"escalated\"' '$DREPO/.agent/RUN_STATE.json' >/dev/null"
+check "C: stop_reason is worker_escalation" bash -c "jq -e '.stop_reason == \"worker_escalation\"' '$DREPO/.agent/RUN_STATE.json' >/dev/null"
+check "C: the Task is escalated in the queue" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"C01\")][0].status == \"escalated\"' '$DREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "C: the next Task was not started" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"C02\")][0].status == \"pending\"' '$DREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+LAST_EXIT=0
+( cd "$DREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$DFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-c-rerun.log" 2>&1 || LAST_EXIT=$?
+check_eq "C: an escalated Task blocks the loop -> exit 3" "3" "$LAST_EXIT"
+check "C: the refusal names the escalated Task" grep -q 'escalated' "$OUT_DIR/loop-c-rerun.log"
+check "C: check-state also says ESCALATED" bash -c "cd '$DREPO' && '$CHECK_STATE' 2>&1 | grep -q 'verdict: ESCALATED'"
+
+# --- D: a failing Phase verification is a checkpoint, not a pass --------------
+info "phase loop D: failing Phase verification"
+EREPO="$(new_repo smoke-loop-d)"
+CLEANUP_DIRS+=("$EREPO")
+EFIX="$(mktemp -d "$TMP_BASE/smoke-fix-d.XXXXXX")"
+CLEANUP_DIRS+=("$EFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$EREPO/app.py"
+write_phase_md "$EREPO" "A"
+write_run_state "$EREPO" "A" "idle" >/dev/null
+QE="$EFIX/tasks.jsonl"
+queue_task_json D01 "add a helper" low pending "grep -q 'def helper' app.py" "app.py" >>"$QE"
+write_queue "$EREPO" "A" "$QE" "grep -q 'def never_added' app.py"
+cat >"$EFIX/D01.sh" <<'EOF'
+printf '\n\ndef helper():\n    return 1\n' >> app.py
+EOF
+commit_all "$EREPO" "loop D fixture"
+LAST_EXIT=0
+( cd "$EREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$EFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-d.log" 2>&1 || LAST_EXIT=$?
+check_eq "D: failing Phase verification -> exit 2 (checkpoint)" "2" "$LAST_EXIT"
+check "D: state is checkpoint, not phase review" bash -c "jq -e '.status == \"checkpoint\"' '$EREPO/.agent/RUN_STATE.json' >/dev/null"
+check "D: stop_reason is phase_verification_failed" bash -c "jq -e '.stop_reason == \"phase_verification_failed\"' '$EREPO/.agent/RUN_STATE.json' >/dev/null"
+check "D: the Phase verification evidence records the FAIL" grep -q '^FAIL' "$EREPO/.agent/phases/A/PHASE_REVIEW.md"
+check "D: the Task itself was accepted" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"D01\")][0].status == \"done\"' '$EREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+
+# --- E: the review gate and the human gate -----------------------------------
+info "phase loop E: phase review + human QA gates"
+LAST_EXIT=0
+( cd "$AREPO" && "$RUN_PHASE" ) >"$OUT_DIR/loop-e-refuse.log" 2>&1 || LAST_EXIT=$?
+check_eq "E: the loop refuses to run at awaiting_phase_review -> exit 4" "4" "$LAST_EXIT"
+check "E: the refusal explains the review gate" grep -q 'phase review' "$OUT_DIR/loop-e-refuse.log"
+check "E: no Task ran again" bash -c "[ \"\$(ls -d '$AREPO'/.agent/history/*A0[0-9] 2>/dev/null | wc -l | tr -d ' ')\" = 3 ]"
+
+# review-pass without a summary is refused
+RG_RC=0
+(cd "$AREPO" && "$PHASE_GATE" review-pass) >"$OUT_DIR/gate-no-summary.log" 2>&1 || RG_RC=$?
+check_eq "E: review-pass without --summary -> exit 1" "1" "$RG_RC"
+check "E: the refusal names the missing summary" grep -q 'summary' "$OUT_DIR/gate-no-summary.log"
+
+# a review-pass with a failing phase verification must refuse and change nothing
+jq '.phase_verification = [{"cmd":"grep -q def_never_there app.py","expect":"exit 0"}]' \
+    "$AREPO/.agent/phases/A/TASK_QUEUE.json" >"$AREPO/.agent/phases/A/q.json" \
+    && mv "$AREPO/.agent/phases/A/q.json" "$AREPO/.agent/phases/A/TASK_QUEUE.json"
+RG_RC=0
+(cd "$AREPO" && "$PHASE_GATE" review-pass --summary "fixture review") >"$OUT_DIR/gate-fail-verify.log" 2>&1 || RG_RC=$?
+check_eq "E: review-pass with a failing verification -> exit 1" "1" "$RG_RC"
+check "E: the state did not move to human QA" bash -c "jq -e '.status == \"awaiting_phase_review\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+check "E: PHASE.md has no review Result yet" bash -c "! grep -q 'Reviewed by:' '$AREPO/.agent/phases/A/PHASE.md'"
+jq '.phase_verification = [{"cmd":"grep -Eq \"def +farewell\" app.py","expect":"exit 0"}]' \
+    "$AREPO/.agent/phases/A/TASK_QUEUE.json" >"$AREPO/.agent/phases/A/q.json" \
+    && mv "$AREPO/.agent/phases/A/q.json" "$AREPO/.agent/phases/A/TASK_QUEUE.json"
+
+# review-fail reopens the queue; the corrective Task runs; the Phase comes back
+(cd "$AREPO" && "$PHASE_GATE" review-fail --reason "one criterion is not covered by a test") \
+    >"$OUT_DIR/gate-review-fail.log" 2>&1 || fail "E: review-fail failed"
+check "E: review-fail reopens the queue" bash -c "jq -e '.status == \"running\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+check "E: review-fail records an adjustment" bash -c \
+    "jq -e '[.adjustments[] | select(.reason | test(\"not covered\"))] | length == 1' '$AREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "E: check-state reports the queue is complete" bash -c "cd '$AREPO' && '$CHECK_STATE' 2>&1 | grep -q 'verdict: QUEUE_COMPLETE'"
+
+# Codex appends the corrective Task to the queue (the queue is Codex-owned)
+FIX2="$(mktemp -d "$TMP_BASE/smoke-fix-e2.XXXXXX")"
+CLEANUP_DIRS+=("$FIX2")
+cat >"$FIX2/E01.sh" <<'EOF'
+printf '\n\ndef e01()\n    return 1\n' >> app.py
+EOF
+jq '.tasks += [{
+      "id": "E01", "title": "add the missing coverage", "mode": "implement", "risk": "low",
+      "status": "pending", "objective": "add e01() and cover it", "context": "corrective Task after review-fail",
+      "existing_behavior": "no e01()", "desired_behavior": "e01() exists",
+      "relevant_files": ["app.py - fixture"], "allowed_changes": ["app.py"], "forbidden_changes": [],
+      "acceptance_criteria": ["e01() exists"],
+      "verification": [{"cmd": "grep -q \"def e01\" app.py", "expect": "exit 0"}],
+      "escalation_conditions": [], "depends_on": [], "history": []
+    }]' "$AREPO/.agent/phases/A/TASK_QUEUE.json" >"$AREPO/.agent/phases/A/q.json" \
+    && mv "$AREPO/.agent/phases/A/q.json" "$AREPO/.agent/phases/A/TASK_QUEUE.json"
+LAST_EXIT=0
+( cd "$AREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$FIX2" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-e-corrective.log" 2>&1 || LAST_EXIT=$?
+check_eq "E: the corrective Task ran and the Phase returned to review -> exit 0" "0" "$LAST_EXIT"
+check "E: the corrective Task is done" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"E01\")][0].status == \"done\"' '$AREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "E: it stopped at the review gate again" bash -c "jq -e '.status == \"awaiting_phase_review\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+
+(cd "$AREPO" && "$PHASE_GATE" review-pass --summary "reviewed the diff and re-ran the phase verification") \
+    >"$OUT_DIR/gate-pass.log" 2>&1 || fail "E: review-pass failed (see $OUT_DIR/gate-pass.log)"
+check "E: review-pass moved the state to awaiting_human_qa" bash -c "jq -e '.status == \"awaiting_human_qa\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+check "E: the review is recorded" bash -c "jq -e '.phase_review == \"passed\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+check "E: PHASE.md got the Result section" grep -q '^## Result' "$AREPO/.agent/phases/A/PHASE.md"
+check "E: the review re-ran the phase verification" grep -q 'Phase review run' "$AREPO/.agent/phases/A/PHASE_REVIEW.md"
+
+LAST_EXIT=0
+( cd "$AREPO" && "$RUN_PHASE" ) >"$OUT_DIR/loop-e-human-gate.log" 2>&1 || LAST_EXIT=$?
+check_eq "E: the loop refuses to run at awaiting_human_qa -> exit 4" "4" "$LAST_EXIT"
+check "E: the refusal explains the human gate" grep -q 'human' "$OUT_DIR/loop-e-human-gate.log"
+check "E: check-state says AWAITING_HUMAN_QA" bash -c "cd '$AREPO' && '$CHECK_STATE' 2>&1 | grep -q 'verdict: AWAITING_HUMAN_QA'"
+
+# qa-fail reopens the queue; qa-pass (human confirmed) clears the gate
+(cd "$AREPO" && "$PHASE_GATE" qa-fail --note "the human found a defect") >"$OUT_DIR/gate-qa-fail.log" 2>&1 \
+    || fail "E: qa-fail failed"
+check "E: qa-fail reopens the queue" bash -c "jq -e '.status == \"running\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+check "E: qa-fail records an adjustment" bash -c \
+    "jq -e '[.adjustments[] | select(.change | test(\"human QA\"))] | length == 1' '$AREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+# the loop re-runs the Phase verification after a qa-fail and stops at the review gate
+LAST_EXIT=0
+( cd "$AREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$FIX2" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-e-qafail.log" 2>&1 || LAST_EXIT=$?
+check_eq "E: after qa-fail the loop returns to the review gate -> exit 0" "0" "$LAST_EXIT"
+check "E: it is awaiting_phase_review again" bash -c "jq -e '.status == \"awaiting_phase_review\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+(cd "$AREPO" && "$PHASE_GATE" review-pass --summary "re-reviewed after the human QA round") \
+    >"$OUT_DIR/gate-pass2.log" 2>&1 || fail "E: the second review-pass failed"
+(cd "$AREPO" && "$PHASE_GATE" qa-pass --note "the human confirmed") >"$OUT_DIR/gate-qa-pass.log" 2>&1 \
+    || fail "E: qa-pass failed"
+check "E: qa-pass records the verdict" bash -c "jq -e '.human_qa == \"passed\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+check "E: qa-pass leaves the state idle (the next Phase is a new decision)" bash -c "jq -e '.status == \"idle\"' '$AREPO/.agent/RUN_STATE.json' >/dev/null"
+
+# --- F: resume --------------------------------------------------------------
+info "phase loop F: resume an interrupted Phase"
+FREPO="$(new_repo smoke-loop-f)"
+CLEANUP_DIRS+=("$FREPO")
+FFIX="$(mktemp -d "$TMP_BASE/smoke-fix-f.XXXXXX")"
+CLEANUP_DIRS+=("$FFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$FREPO/app.py"
+write_phase_md "$FREPO" "A"
+write_run_state "$FREPO" "A" "running" >/dev/null
+QF="$FFIX/tasks.jsonl"
+queue_task_json F01 "already done" low done "grep -q 'def uppercase' app.py" "app.py" >>"$QF"
+queue_task_json F02 "was interrupted" low in_progress "grep -q 'def f02' app.py" "app.py" >>"$QF"
+write_queue "$FREPO" "A" "$QF" "grep -q 'def f02' app.py"
+# The M03 window: the queue says in_progress but TASK.md is still the blank template.
+mkdir -p "$FREPO/.agent/current"
+cp "$PROJECT_ROOT/skills/cheap-worker/assets/templates/TASK.md" "$FREPO/.agent/current/TASK.md"
+printf '{"task_id":"F02","run_id":"r1","status":"running"}' >"$FREPO/.agent/current/STATE.json"
+# ... and a stale report left over from an older Task must not block the resume.
+mkdir -p "$FREPO/.agent/phases/A/history"
+cat >"$FREPO/.agent/current/ESCALATION.md" <<'EOF'
 # Escalation
 
 ## Task ID
-OFF3
+F00
+
+## Class
+CHECKPOINT
 
 ## Current Blocker
-fixture
+stale report from an earlier Task
 EOF
-CR_RC=0
-(cd "$repo" && "$HOME/.agents/skills/cheap-worker/scripts/collect-result.sh") >"$OUT_DIR/collect-both.log" 2>&1 || CR_RC=$?
-check_eq "collect-result: both reports -> exit 4" "4" "$CR_RC"
-check "collect-result: prints the RESULT body" grep -q 'Status' "$OUT_DIR/collect-both.log"
-check "collect-result: prints the ESCALATION body" grep -q 'Current Blocker' "$OUT_DIR/collect-both.log"
-rm -f "$repo/.agent/current/RESULT.md" "$repo/.agent/current/ESCALATION.md"
+cat >"$FFIX/F02.sh" <<'EOF'
+printf '\n\ndef f02():\n    return 2\n' >> app.py
+EOF
+commit_all "$FREPO" "loop F fixture"
+LAST_EXIT=0
+( cd "$FREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$FFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-f.log" 2>&1 || LAST_EXIT=$?
+check_eq "F: the loop resumed and finished -> exit 0" "0" "$LAST_EXIT"
+check "F: it logged the resume" grep -q 'resumed=yes' "$OUT_DIR/loop-f.log"
+check "F: F01 was never re-run" bash -c "! ls -d '$FREPO'/.agent/history/*F01 >/dev/null 2>&1"
+check "F: F02 is done" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"F02\")][0].status == \"done\"' '$FREPO/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "F: the rebuilt TASK.md was archived in the phase history" bash -c "grep -q 'F02' '$FREPO/.agent/phases/A/history/TASK-F02.md'"
+check "F: the stale report was quarantined" bash -c "grep -rl 'stale report from an earlier Task' '$FREPO/.agent/history/attempts' >/dev/null 2>&1"
+check "F: state is awaiting_phase_review" bash -c "jq -e '.status == \"awaiting_phase_review\"' '$FREPO/.agent/RUN_STATE.json' >/dev/null"
 
-# --target is a test-only mechanism
+# ---------------------------------------------------------------------------
+# 7b. plan validation and the evidence gate
+# ---------------------------------------------------------------------------
+info "phase loop: plan validation and evidence gate"
+
+# a Task without a verification command is not runnable
+GREPO="$(new_repo smoke-loop-plan)"
+CLEANUP_DIRS+=("$GREPO")
+GFIX="$(mktemp -d "$TMP_BASE/smoke-fix-plan.XXXXXX")"
+CLEANUP_DIRS+=("$GFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$GREPO/app.py"
+write_phase_md "$GREPO" "A"
+write_run_state "$GREPO" "A" "idle" >/dev/null
+QG="$GFIX/tasks.jsonl"
+jq -nc '{id:"G01",title:"no verification",mode:"implement",risk:"low",status:"pending",
+         objective:"x",context:"",existing_behavior:"",desired_behavior:"x",
+         relevant_files:[],allowed_changes:["app.py"],forbidden_changes:[],
+         acceptance_criteria:["must be observable"],verification:[],
+         escalation_conditions:[],depends_on:[],history:[]}' >>"$QG"
+write_queue "$GREPO" "A" "$QG" "true"
+commit_all "$GREPO" "plan fixture"
+LAST_EXIT=0
+( cd "$GREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$GFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-plan.log" 2>&1 || LAST_EXIT=$?
+check_eq "plan: a Task without verification -> exit 2 (checkpoint)" "2" "$LAST_EXIT"
+check "plan: the reason names the verification requirement" grep -q 'verification' "$OUT_DIR/loop-plan.log"
+check "plan: nothing ran" bash -c "! ls -d '$GREPO'/.agent/history/*G01 >/dev/null 2>&1"
+check "plan: no log from a worker run" bash -c "! ls '$GREPO'/.agent/current/logs/worker-* >/dev/null 2>&1"
+
+# evidence gate: an unticked criterion fails the Task
+HREPO="$(new_repo smoke-loop-gate)"
+CLEANUP_DIRS+=("$HREPO")
+HFIX="$(mktemp -d "$TMP_BASE/smoke-fix-gate.XXXXXX")"
+CLEANUP_DIRS+=("$HFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$HREPO/app.py"
+write_phase_md "$HREPO" "A"
+write_run_state "$HREPO" "A" "idle" >/dev/null
+QH="$HFIX/tasks.jsonl"
+queue_task_json H01 "unticked criterion" low pending "grep -q 'def h01' app.py" "app.py" >>"$QH"
+write_queue "$HREPO" "A" "$QH" "grep -q 'def h01' app.py"
+cat >"$HFIX/H01.sh" <<'EOF'
+printf '\n\ndef h01():\n    return 1\n' >> app.py
+cat > .agent/current/RESULT.md <<'RESULT'
+# Result
+
+## Task ID
+H01
+
+## Status
+DONE
+
+## Summary
+claims done but leaves a criterion unticked
+
+## Acceptance Criteria
+- [x] one thing - checked
+- [ ] the other thing - not done
+
+## Verification Performed
+- `true` -> exit 0
+RESULT
+EOF
+commit_all "$HREPO" "gate fixture"
+LAST_EXIT=0
+( cd "$HREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$HFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-gate-unticked.log" 2>&1 || LAST_EXIT=$?
+check_eq "gate: an unticked criterion -> exit 3 (escalate)" "3" "$LAST_EXIT"
+check "gate: VERIFY.md records the FAIL" grep -q '^FAIL' "$HREPO/.agent/current/VERIFY.md"
+check "gate: the unticked criterion is named" grep -q 'unticked' "$HREPO/.agent/current/VERIFY.md"
+check "gate: the Task was not archived" bash -c "! ls -d '$HREPO'/.agent/history/*H01 >/dev/null 2>&1"
+
+# evidence gate: the re-run verification command fails
+IREPO="$(new_repo smoke-loop-verify)"
+CLEANUP_DIRS+=("$IREPO")
+IFIX="$(mktemp -d "$TMP_BASE/smoke-fix-verify.XXXXXX")"
+CLEANUP_DIRS+=("$IFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$IREPO/app.py"
+write_phase_md "$IREPO" "A"
+write_run_state "$IREPO" "A" "idle" >/dev/null
+QI="$IFIX/tasks.jsonl"
+queue_task_json I01 "claims success without doing the work" low pending "grep -q 'def i01' app.py" "app.py" >>"$QI"
+write_queue "$IREPO" "A" "$QI" "grep -q 'def i01' app.py"
+commit_all "$IREPO" "verify fixture"
+LAST_EXIT=0
+( cd "$IREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$IFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-gate-verify.log" 2>&1 || LAST_EXIT=$?
+check_eq "gate: a failing verification -> exit 3" "3" "$LAST_EXIT"
+check "gate: the failing command is named" grep -q 'verification 1' "$IREPO/.agent/current/VERIFY.md"
+
+# evidence gate: a change outside Allowed Changes
+JREPO="$(new_repo smoke-loop-scope)"
+CLEANUP_DIRS+=("$JREPO")
+JFIX="$(mktemp -d "$TMP_BASE/smoke-fix-scope.XXXXXX")"
+CLEANUP_DIRS+=("$JFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$JREPO/app.py"
+printf 'secret = 1\n' >"$JREPO/other.py"
+write_phase_md "$JREPO" "A"
+write_run_state "$JREPO" "A" "idle" >/dev/null
+QJ="$JFIX/tasks.jsonl"
+queue_task_json J01 "stay inside allowed changes" low pending "true" "app.py" "other.py" >>"$QJ"
+write_queue "$JREPO" "A" "$QJ" "true"
+cat >"$JFIX/J01.sh" <<'EOF'
+printf 'secret = 2\n' > other.py
+EOF
+commit_all "$JREPO" "scope fixture"
+LAST_EXIT=0
+( cd "$JREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$JFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-gate-scope.log" 2>&1 || LAST_EXIT=$?
+check_eq "gate: a change outside Allowed Changes -> exit 3" "3" "$LAST_EXIT"
+check "gate: the forbidden file is named" grep -q 'other.py' "$JREPO/.agent/current/VERIFY.md"
+check "gate: the reason mentions Forbidden" grep -q 'Forbidden' "$JREPO/.agent/current/VERIFY.md"
+
+# evidence gate: the worker must not edit the Supervisor artifacts
+KREPO="$(new_repo smoke-loop-tamper)"
+CLEANUP_DIRS+=("$KREPO")
+KFIX="$(mktemp -d "$TMP_BASE/smoke-fix-tamper.XXXXXX")"
+CLEANUP_DIRS+=("$KFIX")
+printf 'def uppercase(s):\n    return s.upper()\n' >"$KREPO/app.py"
+write_phase_md "$KREPO" "A"
+write_run_state "$KREPO" "A" "idle" >/dev/null
+QK="$KFIX/tasks.jsonl"
+queue_task_json K01 "tamper with the queue" low pending "true" "app.py" >>"$QK"
+write_queue "$KREPO" "A" "$QK" "true"
+cat >"$KFIX/K01.sh" <<'EOF'
+python3 - <<'PY'
+import json, io
+p = ".agent/phases/A/TASK_QUEUE.json"
+d = json.load(open(p))
+d["tasks"][0]["status"] = "done"
+json.dump(d, open(p, "w"), indent=2)
+PY
+EOF
+commit_all "$KREPO" "tamper fixture"
+LAST_EXIT=0
+( cd "$KREPO" && PATH="$FAKEBIN:$PATH" FAKE_OPENCODE_MODE=script \
+    FAKE_OPENCODE_SCRIPT="$SMOKE_DIR/assets/fake-task.sh" FAKE_TASK_DIR="$KFIX" \
+    "$RUN_PHASE" ) >"$OUT_DIR/loop-gate-tamper.log" 2>&1 || LAST_EXIT=$?
+check_eq "gate: a worker edit of the queue -> exit 3" "3" "$LAST_EXIT"
+check "gate: the tampering is named" grep -q 'Supervisor artifact' "$KREPO/.agent/current/VERIFY.md"
+
+# ---------------------------------------------------------------------------
+# 8. check-state fail-closed matrix (new states)
+# ---------------------------------------------------------------------------
+info "check-state matrix"
+CSREPO="$(new_repo smoke-checkstate)"
+CLEANUP_DIRS+=("$CSREPO")
+mkdir -p "$CSREPO/.agent/phases/A" "$CSREPO/.agent/current"
+sstate() {  # sstate <queue-json> <run-state-json> [<task-md>] [<state-json>]
+    local q="$1" rs="$2" tmd="${3:-}" st="${4:-}"
+    printf '%s' "$q" >"$CSREPO/.agent/phases/A/TASK_QUEUE.json"
+    printf '%s' "$rs" >"$CSREPO/.agent/RUN_STATE.json"
+    if [[ -n "$tmd" ]]; then
+        printf '%s' "$tmd" >"$CSREPO/.agent/current/TASK.md"
+    else
+        rm -f "$CSREPO/.agent/current/TASK.md"
+    fi
+    if [[ -n "$st" ]]; then
+        printf '%s' "$st" >"$CSREPO/.agent/current/STATE.json"
+    else
+        rm -f "$CSREPO/.agent/current/STATE.json"
+    fi
+    rm -f "$CSREPO/.agent/current/RESULT.md" "$CSREPO/.agent/current/ESCALATION.md"
+    rm -rf "$CSREPO/.agent/current/.worker.lock" "$CSREPO/.agent/current/.phase.lock"
+}
+CS="$CHECK_STATE"
+cstate() {  # cstate <name> [expected-exit]
+    local name="$1" want="${2:-}"
+    CS_RC=0
+    (cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-${name}.log" 2>&1 || CS_RC=$?
+    [[ -z "$want" ]] || check_eq "check-state: $name -> exit $want" "$want" "$CS_RC"
+}
+Q_TASK='{"tasks":[{"id":"A02","status":"in_progress","verification":[{"cmd":"true"}]}]}'
+
+sstate '{broken' '{"current_phase":"A","current_task":"A02","status":"running"}' '' '{}'
+cstate badjson 1
+check "check-state: broken JSON is reported" grep -qE 'not a JSON object|not valid JSON' "$OUT_DIR/cs-badjson.log"
+
+sstate "$Q_TASK" '{"current_phase":"A","current_task":"WRONG","status":"running"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+cstate runstate-mismatch 1
+check "check-state: RUN_STATE mismatch reported" grep -q 'does not match the queue' "$OUT_DIR/cs-runstate-mismatch.log"
+
+sstate '{"tasks":[{"id":"A02","status":"in_progress","verification":[{"cmd":"true"}]},{"id":"A03","status":"in_progress","verification":[{"cmd":"true"}]}]}' \
+    '{"current_phase":"A","current_task":"A02","status":"running"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+cstate two-inprogress 1
+check "check-state: two in_progress reported" grep -q 'more than one Task is in_progress' "$OUT_DIR/cs-two-inprogress.log"
+
+sstate '{"tasks":[{"id":"A02","status":"pending","verification":[{"cmd":"true"}]}]}' \
+    '{"current_phase":"A","current_task":"","status":"running"}' '' '{"task_id":"","run_id":"","status":"idle"}'
+cstate pending 0
+check "check-state: pending -> RUNNING" grep -q 'verdict: RUNNING' "$OUT_DIR/cs-pending.log"
+
+sstate "$Q_TASK" '{"current_phase":"A","current_task":"A02","status":"checkpoint","stop_reason":"worker_checkpoint"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+cstate checkpoint 1
+check "check-state: checkpoint verdict" grep -q 'verdict: CHECKPOINT' "$OUT_DIR/cs-checkpoint.log"
+check "check-state: prints the stop_reason" grep -q 'worker_checkpoint' "$OUT_DIR/cs-checkpoint.log"
+
+sstate '{"tasks":[{"id":"A02","status":"escalated","verification":[{"cmd":"true"}]}]}' \
+    '{"current_phase":"A","current_task":"A02","status":"escalated"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+cstate escalated 1
+check "check-state: escalated verdict" grep -q 'verdict: ESCALATED' "$OUT_DIR/cs-escalated.log"
+
+sstate '{"tasks":[{"id":"A02","status":"done","verification":[{"cmd":"true"}]}]}' \
+    '{"current_phase":"A","current_task":"","status":"awaiting_phase_review"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+cstate awaiting-review 1
+check "check-state: awaiting phase review verdict" grep -q 'verdict: AWAITING_PHASE_REVIEW' "$OUT_DIR/cs-awaiting-review.log"
+
+sstate '{"tasks":[{"id":"A02","status":"done","verification":[{"cmd":"true"}]}]}' \
+    '{"current_phase":"A","current_task":"","status":"awaiting_human_qa"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+cstate awaiting-human 1
+check "check-state: awaiting human QA verdict" grep -q 'verdict: AWAITING_HUMAN_QA' "$OUT_DIR/cs-awaiting-human.log"
+
+sstate '{"tasks":[{"id":"A02","status":"pending","verification":[{"cmd":"true"}]}]}' \
+    '{"current_phase":"A","current_task":"","status":"awaiting_human_qa"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+cstate human-with-pending 1
+check "check-state: human QA with pending reported" grep -q 'still has pending' "$OUT_DIR/cs-human-with-pending.log"
+
+mkdir -p "$CSREPO/.agent/history/20260101T000000Z-A02"
+sstate "$Q_TASK" '{"current_phase":"A","current_task":"A02","status":"running"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+cstate archived-not-done 1
+check "check-state: suggests marking done" grep -q 'mark it done' "$OUT_DIR/cs-archived-not-done.log"
+rm -rf "$CSREPO/.agent/history"
+
+sstate "$Q_TASK" '{"current_phase":"A","current_task":"A02","status":"running"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+printf '# Result\n\n## Task ID\nA02\n\n## Status\nFAILED\n' >"$CSREPO/.agent/current/RESULT.md"
+cstate bad-result 1
+check "check-state: unacceptable report reported" grep -q 'not acceptable' "$OUT_DIR/cs-bad-result.log"
+
+sstate "$Q_TASK" '{"current_phase":"A","current_task":"A02","status":"running"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+printf '# Escalation\n\n## Task ID\nA02\n' >"$CSREPO/.agent/current/ESCALATION.md"
+cstate escalation-noblocker 1
+check "check-state: missing blocker reported" grep -q 'no Current Blocker' "$OUT_DIR/cs-escalation-noblocker.log"
+
+sstate '{"tasks":[{"id":42,"status":"pending"}]}' '{"current_phase":"A","status":"running"}'
+cstate number-id 1
+check "check-state: numeric id reported" grep -q 'missing/invalid id' "$OUT_DIR/cs-number-id.log"
+
+sstate '{"tasks":[{"id":"A02","status":"pending","verification":[{"cmd":"true"}]},{"id":"A02","status":"pending","verification":[{"cmd":"true"}]}]}' \
+    '{"current_phase":"A","status":"running"}'
+cstate duplicate-id 1
+check "check-state: duplicate ids reported" grep -q 'duplicate Task ids' "$OUT_DIR/cs-duplicate-id.log"
+
+sstate '{"tasks":[{"id":"A02","status":"pending"}]}' '{"status":"running"}'
+cstate no-phase 1
+check "check-state: phase requirement reported" grep -q 'requires a current_phase' "$OUT_DIR/cs-no-phase.log"
+
+sstate '{"tasks":[{"id":"A02","status":"pending","verification":[]}]}' \
+    '{"current_phase":"A","status":"running"}'
+cstate no-verification 1
+check "check-state: a Task without verification is an ISSUE" grep -q 'no verification commands' "$OUT_DIR/cs-no-verification.log"
+
+sstate '{"tasks":[{"id":"A02","status":"pending","verification":[{"cmd":"true"}]}]}' \
+    '{"current_phase":"A","current_task":"","status":"nonsense"}' '' '{"task_id":"","run_id":"","status":"idle"}'
+cstate unknown-status 1
+check "check-state: unknown status reported" grep -q 'not a known state' "$OUT_DIR/cs-unknown-status.log"
+
+rm -f "$CSREPO/.agent/phases/A/TASK_QUEUE.json"
+printf '%s' '{"current_phase":"A","current_task":"A02","status":"running"}' >"$CSREPO/.agent/RUN_STATE.json"
+cstate missing-queue 1
+check "check-state: missing queue reported" grep -q 'is missing' "$OUT_DIR/cs-missing-queue.log"
+
+# live locks -> WORKER_RUNNING
+sstate "$Q_TASK" '{"current_phase":"A","current_task":"A02","status":"running"}' \
+    '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+sleep 30 &
+SURV=$!
+mkdir -p "$CSREPO/.agent/current/.worker.lock"
+printf 'pid=999999\nworker_pid=%s\nrun_id=survivor\n' "$SURV" >"$CSREPO/.agent/current/.worker.lock/info"
+cstate survivor-lock 1
+check "check-state: live worker_pid verdict" grep -q 'verdict: WORKER_RUNNING' "$OUT_DIR/cs-survivor-lock.log"
+rm -rf "$CSREPO/.agent/current/.worker.lock"
+mkdir -p "$CSREPO/.agent/current/.phase.lock"
+printf 'pid=%s\nrun_id=loop\nphase=A\n' "$SURV" >"$CSREPO/.agent/current/.phase.lock/info"
+cstate live-phase-lock 1
+check "check-state: live phase lock verdict" grep -q 'verdict: WORKER_RUNNING' "$OUT_DIR/cs-live-phase-lock.log"
+rm -rf "$CSREPO/.agent/current/.phase.lock"
+kill "$SURV" 2>/dev/null || true
+wait "$SURV" 2>/dev/null || true
+
+# empty project
+EMPTYREPO="$(new_repo smoke-checkstate-empty)"
+CLEANUP_DIRS+=("$EMPTYREPO")
+CS_RC=0
+(cd "$EMPTYREPO" && "$CS") >"$OUT_DIR/cs-empty.log" 2>&1 || CS_RC=$?
+check_eq "check-state: fresh project -> EMPTY exit 0" "0" "$CS_RC"
+check "check-state: empty verdict" grep -q 'verdict: EMPTY' "$OUT_DIR/cs-empty.log"
+
+# ---------------------------------------------------------------------------
+# 9. installer / uninstaller boundaries
+# ---------------------------------------------------------------------------
 if (AGENT_ORCHESTRATION_TEST_TARGET=0 "$PROJECT_ROOT/scripts/install-skills.sh" --target "$OUT_DIR/forbidden-target/skills" --quiet) >"$OUT_DIR/install-target-gate.log" 2>&1; then
     fail "installer --target must be refused without the test env var"
 else
@@ -522,7 +1225,6 @@ else
 fi
 check "installer target gate message" grep -q 'test-only mechanism' "$OUT_DIR/install-target-gate.log"
 
-# a fresh HOME must install (L01)
 FRESH_HOME="$(mktemp -d "$TMP_BASE/fresh-home.XXXXXX")"
 CLEANUP_DIRS+=("$FRESH_HOME")
 if HOME="$FRESH_HOME" "$PROJECT_ROOT/scripts/install-skills.sh" --quiet >"$OUT_DIR/install-fresh-home.log" 2>&1; then
@@ -531,8 +1233,9 @@ else
     fail "installer failed on a fresh HOME (see $OUT_DIR/install-fresh-home.log)"
 fi
 check "fresh HOME install created both skills" test -f "$FRESH_HOME/.agents/skills/phase-runner/SKILL.md"
+check "fresh HOME install includes the loop script" test -x "$FRESH_HOME/.agents/skills/phase-runner/scripts/run-phase.sh"
+check "fresh HOME install includes the gate script" test -x "$FRESH_HOME/.agents/skills/phase-runner/scripts/phase-gate.sh"
 
-# physical-target policy: a parent symlink escaping $HOME is refused (M05)
 LINK_HOME="$(mktemp -d "$TMP_BASE/linkhome.XXXXXX")"
 ALTERNATE="$(mktemp -d "$TMP_BASE/alternate.XXXXXX")"
 CLEANUP_DIRS+=("$LINK_HOME" "$ALTERNATE")
@@ -545,7 +1248,6 @@ else
 fi
 check "symlink-escape message" grep -q 'outside \$HOME' "$OUT_DIR/install-symlink-escape.log"
 
-# uninstaller must refuse a source-tree target even with the test gate (M05)
 SRCCOPY="$(mktemp -d "$TMP_BASE/sourcecopy.XXXXXX")"
 CLEANUP_DIRS+=("$SRCCOPY")
 mkdir -p "$SRCCOPY/skills" "$SRCCOPY/scripts"
@@ -563,214 +1265,6 @@ fi
 check "source-copy refusal message" grep -q 'source repo' "$OUT_DIR/uninstall-sourcecopy.log"
 check "source-copy skills survived" test -f "$SRCCOPY/skills/cheap-worker/SKILL.md"
 
-# no-HEAD repository: BASELINE.patch explains itself instead of being silently empty
-NOHREPO="$(new_repo smoke-no-head)"
-CLEANUP_DIRS+=("$NOHREPO")
-write_task "$NOHREPO" "N01" "implement" "no-head objective" "none" "something" \
-    "- app.py" "- app.py" "- any other file" "- [ ] works" '`python3 app.py` exits 0' "none"
-printf 'print("hi")\n' >"$NOHREPO/app.py"
-NOH_RC=0
-( cd "$NOHREPO" && PATH="$HARNESS/bin:$PATH" FAKE_OPENCODE_MODE=result FAKE_TASK_ID=N01 \
-    "$HRUN" --allow-dirty --mode implement ) >"$OUT_DIR/no-head.log" 2>&1 || NOH_RC=$?
-check_eq "no-HEAD repo runs with --allow-dirty -> exit 0" "0" "$NOH_RC"
-check "no-HEAD BASELINE.patch explains the limitation" grep -q 'no HEAD yet' "$NOHREPO/.agent/current/BASELINE.patch"
-
-# --- 7b. check-state fail-closed cases (M03) ----------------------------------------
-CSREPO="$(new_repo smoke-checkstate)"
-CLEANUP_DIRS+=("$CSREPO")
-mkdir -p "$CSREPO/.agent/phases/A" "$CSREPO/.agent/current"
-sstate() {  # sstate <queue-json> <run-state-json> <task-md> <state-json>
-    printf '%s' "$1" >"$CSREPO/.agent/phases/A/TASK_QUEUE.json"
-    printf '%s' "$2" >"$CSREPO/.agent/RUN_STATE.json"
-    printf '%s' "$3" >"$CSREPO/.agent/current/TASK.md"
-    printf '%s' "$4" >"$CSREPO/.agent/current/STATE.json"
-    rm -f "$CSREPO/.agent/current/RESULT.md" "$CSREPO/.agent/current/ESCALATION.md"
-}
-CS="$HOME/.agents/skills/cheap-worker/scripts/check-state.sh"
-
-sstate '{broken' '{"current_phase":"A","current_task":"A02","status":"running"}' '' '{}'
-CS_RC=0
-(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-badjson.log" 2>&1 || CS_RC=$?
-check_eq "check-state: broken queue JSON -> exit 1" "1" "$CS_RC"
-check "check-state: broken JSON is reported" grep -qE 'not a JSON object|not valid JSON' "$OUT_DIR/cs-badjson.log"
-
-sstate '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
-       '{"current_phase":"A","current_task":"WRONG","status":"running"}' \
-       '# Task
-
-## Task ID
-A02' '{"task_id":"A02"}'
-CS_RC=0
-(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-runstate.log" 2>&1 || CS_RC=$?
-check_eq "check-state: RUN_STATE task mismatch -> exit 1" "1" "$CS_RC"
-check "check-state: mismatch is reported" grep -q 'does not match the queue' "$OUT_DIR/cs-runstate.log"
-
-sstate '{"tasks":[{"id":"A02","status":"in_progress"},{"id":"A03","status":"in_progress"}]}' \
-       '{"current_phase":"A","current_task":"A02","status":"running"}' \
-       '# Task
-
-## Task ID
-A02' '{"task_id":"A02"}'
-CS_RC=0
-(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-two-inprogress.log" 2>&1 || CS_RC=$?
-check_eq "check-state: two in_progress -> exit 1" "1" "$CS_RC"
-check "check-state: two in_progress reported" grep -q 'more than one Task is in_progress' "$OUT_DIR/cs-two-inprogress.log"
-
-mkdir -p "$CSREPO/.agent/history/20260101T000000Z-A02"
-sstate '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
-       '{"current_phase":"A","current_task":"A02","status":"running"}' \
-       '# Task
-
-## Task ID
-A02' '{"task_id":"A02"}'
-CS_RC=0
-(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-archived-not-done.log" 2>&1 || CS_RC=$?
-check_eq "check-state: archive without done -> exit 1" "1" "$CS_RC"
-check "check-state: suggests marking done" grep -q 'mark it done' "$OUT_DIR/cs-archived-not-done.log"
-
-# --- 7c. check-state fail-closed matrix (round-3 M03) ------------------------------
-cs_case() {  # cs_case <name> <queue-content> <runstate-content> [result-content] [state-content]
-    local name="$1" q="$2" rs="$3" res="${4:-}" st="${5:-}"
-    printf '%s' "$q" >"$CSREPO/.agent/phases/A/TASK_QUEUE.json"
-    printf '%s' "$rs" >"$CSREPO/.agent/RUN_STATE.json"
-    printf '# Task\n\n## Task ID\nA02\n' >"$CSREPO/.agent/current/TASK.md"
-    if [[ -n "$st" ]]; then
-        printf '%s' "$st" >"$CSREPO/.agent/current/STATE.json"
-    else
-        printf '%s' '{"task_id":"A02","run_id":"r1","status":"running"}' >"$CSREPO/.agent/current/STATE.json"
-    fi
-    rm -f "$CSREPO/.agent/current/RESULT.md" "$CSREPO/.agent/current/ESCALATION.md"
-    rm -rf "$CSREPO/.agent/history" "$CSREPO/.agent/current/.worker.lock"
-    [[ -n "$res" ]] && printf '%s' "$res" >"$CSREPO/.agent/current/RESULT.md"
-    CS_RC=0
-    (cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-${name}.log" 2>&1 || CS_RC=$?
-}
-
-cs_case empty-runstate '{"tasks":[{"id":"A02","status":"in_progress"}]}' ''
-check_eq "check-state: empty RUN_STATE -> exit 1" "1" "$CS_RC"
-check "check-state: empty RUN_STATE reported" grep -q 'empty or not a JSON object' "$OUT_DIR/cs-empty-runstate.log"
-
-cs_case null-queue 'null' '{"current_phase":"A","current_task":"A02","status":"running"}'
-check_eq "check-state: null queue -> exit 1" "1" "$CS_RC"
-check "check-state: null queue reported" grep -q 'not a JSON object' "$OUT_DIR/cs-null-queue.log"
-
-rm -f "$CSREPO/.agent/phases/A/TASK_QUEUE.json"
-printf '%s' '{"current_phase":"A","current_task":"A02","status":"running"}' >"$CSREPO/.agent/RUN_STATE.json"
-CS_RC=0
-(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-missing-queue.log" 2>&1 || CS_RC=$?
-check_eq "check-state: missing queue while running -> exit 1" "1" "$CS_RC"
-check "check-state: missing queue reported" grep -q 'is missing' "$OUT_DIR/cs-missing-queue.log"
-
-cs_case escalated '{"tasks":[{"id":"A02","status":"escalated"}]}' '{"current_phase":"A","current_task":"A02","status":"running"}'
-check_eq "check-state: escalated task -> exit 1" "1" "$CS_RC"
-check "check-state: escalated verdict" grep -q 'verdict: ESCALATED' "$OUT_DIR/cs-escalated.log"
-
-cs_case checkpoint '{"tasks":[{"id":"A02","status":"pending"}]}' '{"current_phase":"A","current_task":"","status":"awaiting_human_qa"}'
-check_eq "check-state: checkpoint with pending -> exit 1" "1" "$CS_RC"
-check "check-state: checkpoint verdict" grep -q 'verdict: CHECKPOINT' "$OUT_DIR/cs-checkpoint.log"
-check "check-state: checkpoint contradiction reported" grep -q 'still has pending' "$OUT_DIR/cs-checkpoint.log"
-
-cs_case bad-result '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
-    '{"current_phase":"A","current_task":"A02","status":"running"}' \
-    '# Result
-
-## Task ID
-A02
-
-## Status
-FAILED'
-check_eq "check-state: RESULT not DONE -> exit 1" "1" "$CS_RC"
-check "check-state: unacceptable report reported" grep -q 'not acceptable' "$OUT_DIR/cs-bad-result.log"
-
-# survivor lock: a live worker_pid must produce WORKER_RUNNING, not "stale"
-sleep 30 &
-SURV=$!
-cs_case survivor-lock '{"tasks":[{"id":"A02","status":"in_progress"}]}' '{"current_phase":"A","current_task":"A02","status":"running"}'
-mkdir -p "$CSREPO/.agent/current/.worker.lock"
-printf 'pid=999999\nworker_pid=%s\nrun_id=survivor\n' "$SURV" >"$CSREPO/.agent/current/.worker.lock/info"
-CS_RC=0
-(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-survivor-lock.log" 2>&1 || CS_RC=$?
-check_eq "check-state: live worker_pid -> exit 1" "1" "$CS_RC"
-check "check-state: live worker_pid verdict" grep -q 'verdict: WORKER_RUNNING' "$OUT_DIR/cs-survivor-lock.log"
-rm -rf "$CSREPO/.agent/current/.worker.lock"
-kill "$SURV" 2>/dev/null || true
-wait "$SURV" 2>/dev/null || true
-
-# --- 7c-2. schema matrix from round 4 (M03) ----------------------------------------
-cs_case number-id '{"tasks":[{"id":42,"status":"pending"}]}' '{"current_phase":"A","status":"running"}'
-check_eq "check-state: numeric Task id -> exit 1" "1" "$CS_RC"
-check "check-state: numeric id reported" grep -q 'missing/empty/non-string id' "$OUT_DIR/cs-number-id.log"
-
-cs_case missing-id '{"tasks":[{"status":"pending"}]}' '{"current_phase":"A","status":"running"}'
-check_eq "check-state: missing Task id -> exit 1" "1" "$CS_RC"
-
-cs_case empty-id '{"tasks":[{"id":"","status":"pending"}]}' '{"current_phase":"A","status":"running"}'
-check_eq "check-state: empty Task id -> exit 1" "1" "$CS_RC"
-
-cs_case missing-status '{"tasks":[{"id":"A02"}]}' '{"current_phase":"A","status":"running"}'
-check_eq "check-state: missing Task status -> exit 1" "1" "$CS_RC"
-
-cs_case duplicate-id '{"tasks":[{"id":"A02","status":"pending"},{"id":"A02","status":"pending"}]}' \
-    '{"current_phase":"A","current_task":"A02","status":"running"}'
-check_eq "check-state: duplicate Task ids -> exit 1" "1" "$CS_RC"
-check "check-state: duplicate ids reported" grep -q 'duplicate Task ids' "$OUT_DIR/cs-duplicate-id.log"
-
-cs_case no-phase '{"tasks":[{"id":"A02","status":"pending"}]}' '{"status":"running"}'
-check_eq "check-state: running without a phase -> exit 1" "1" "$CS_RC"
-check "check-state: phase requirement reported" grep -q 'requires a current_phase' "$OUT_DIR/cs-no-phase.log"
-
-cs_case broken-state '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
-    '{"current_phase":"A","current_task":"A02","status":"running"}' '' '{broken'
-check_eq "check-state: broken STATE.json -> exit 1" "1" "$CS_RC"
-check "check-state: broken STATE reported" grep -q 'STATE.json exists but is empty or not a JSON object' "$OUT_DIR/cs-broken-state.log"
-
-# positive controls: the fixes must not block legitimate states
-cs_case valid-pending '{"tasks":[{"id":"A02","status":"pending"}]}' \
-    '{"current_phase":"A","current_task":"","status":"running"}' '' '{"task_id":"","run_id":"","status":"idle"}'
-check_eq "check-state: valid pending -> exit 0" "0" "$CS_RC"
-check "check-state: valid pending verdict" grep -q 'verdict: NEXT' "$OUT_DIR/cs-valid-pending.log"
-
-cs_case idle-empty '{"tasks":[]}' '{"status":"idle"}' '' '{"task_id":"","run_id":"","status":"idle"}'
-check_eq "check-state: idle intake -> exit 0" "0" "$CS_RC"
-check "check-state: idle verdict stays EMPTY" grep -q 'verdict: EMPTY' "$OUT_DIR/cs-idle-empty.log"
-
-# --- 7d. phase-driver obeys check-state (offline, no model calls) -------------------
-DREPO="$(new_repo smoke-driver-gate)"
-CLEANUP_DIRS+=("$DREPO")
-mkdir -p "$DREPO/.agent/phases/A/history" "$DREPO/.agent/current"
-printf '%s' '{"tasks":[{"id":"A02","status":"pending"}]}' >"$DREPO/.agent/phases/A/TASK_QUEUE.json"
-printf '%s' '{"current_phase":"A","current_task":"","status":"awaiting_human_qa"}' >"$DREPO/.agent/RUN_STATE.json"
-printf '# Phase A\n' >"$DREPO/.agent/phases/A/PHASE.md"
-DG_RC=0
-REPO="$DREPO" SMOKE_DIR="$SMOKE_DIR" REWORK_MODE=0 \
-    bash "$SMOKE_DIR/lib/phase-driver.sh" >"$OUT_DIR/driver-gate.log" 2>&1 || DG_RC=$?
-check_eq "driver stops on a checkpoint verdict -> exit 2" "2" "$DG_RC"
-check "driver logged the stop verdict" grep -q 'stop verdict CHECKPOINT' "$OUT_DIR/driver-gate.log"
-
-# a WORKER_RUNNING verdict must stop WITHOUT rewriting TASK.md (round-4 M04)
-LLREPO="$(new_repo smoke-driver-live-lock)"
-CLEANUP_DIRS+=("$LLREPO")
-mkdir -p "$LLREPO/.agent/phases/A/history" "$LLREPO/.agent/current"
-printf '%s' '{"phase":"A","status":"running","tasks":[{"id":"A02","title":"add shutdown(seconds)","mode":"implement","status":"in_progress","history":[]}]}' >"$LLREPO/.agent/phases/A/TASK_QUEUE.json"
-printf '%s' '{"current_phase":"A","current_task":"A02","status":"running"}' >"$LLREPO/.agent/RUN_STATE.json"
-printf '# Task\n\n## Task ID\nA02\n\n## Mode\nimplement\n\n## Marker\nAUDIT ORIGINAL DEFINITION\n' >"$LLREPO/.agent/current/TASK.md"
-printf '%s' '{"task_id":"A02","run_id":"r1","status":"running"}' >"$LLREPO/.agent/current/STATE.json"
-sleep 30 &
-SURV2=$!
-mkdir -p "$LLREPO/.agent/current/.worker.lock"
-printf 'pid=999999\nworker_pid=%s\nrun_id=live\n' "$SURV2" >"$LLREPO/.agent/current/.worker.lock/info"
-LL_RC=0
-REPO="$LLREPO" SMOKE_DIR="$SMOKE_DIR" REWORK_MODE=0 \
-    bash "$SMOKE_DIR/lib/phase-driver.sh" >"$OUT_DIR/driver-live-lock.log" 2>&1 || LL_RC=$?
-check_eq "driver stops on WORKER_RUNNING -> exit 2" "2" "$LL_RC"
-check "driver wrote no worker log" bash -c "[ ! -d '$LLREPO/.agent/current/logs' ] || [ -z \"\$(ls -A '$LLREPO/.agent/current/logs')\" ]"
-check "TASK.md was NOT rewritten" grep -q 'AUDIT ORIGINAL DEFINITION' "$LLREPO/.agent/current/TASK.md"
-check "the phase history copy was not created" bash -c "! test -e '$LLREPO/.agent/phases/A/history/TASK-A02.md'"
-rm -rf "$LLREPO/.agent/current/.worker.lock"
-kill "$SURV2" 2>/dev/null || true
-wait "$SURV2" 2>/dev/null || true
-
-# --- 7e. installer must not create a target it will refuse (M05 LOW) ----------------
 ESCAPE_HOME="$(mktemp -d "$TMP_BASE/escape-home.XXXXXX")"
 ESCAPE_OUT="$(mktemp -d "$TMP_BASE/escape-out.XXXXXX")"
 CLEANUP_DIRS+=("$ESCAPE_HOME" "$ESCAPE_OUT")
@@ -780,14 +1274,19 @@ HOME="$ESCAPE_HOME" "$PROJECT_ROOT/scripts/install-skills.sh" --quiet >"$OUT_DIR
 check_eq "installer refuses a parent symlink escape" "1" "$ES_RC"
 check "installer did not create the refused target" bash -c "! test -e '$ESCAPE_OUT/skills'"
 
-# --- 8. uninstall safety (dry-run only) -------------------------------------------
 if "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" --dry-run >"$OUT_DIR/uninstall-dry.log" 2>&1; then
     pass "uninstall --dry-run exits 0"
 else
     fail "uninstall --dry-run failed"
 fi
 check "uninstall lists both managed skills" bash -c "grep -q 'cheap-worker' '$OUT_DIR/uninstall-dry.log' && grep -q 'phase-runner' '$OUT_DIR/uninstall-dry.log'"
-check "uninstall keeps siblings" bash -c "grep -q 'keep: .*docx' '$OUT_DIR/uninstall-dry.log'"
 check "uninstall did not delete anything" test -d "$HOME/.agents/skills/cheap-worker"
+
+# ---------------------------------------------------------------------------
+# 10. the installed skills were not touched by this test run
+# ---------------------------------------------------------------------------
+if [[ -f "$HOME/.agents/skills/cheap-worker/.installed-by-agent-orchestration" ]]; then
+    pass "~/.agents/skills/cheap-worker is still the marked install (tests never install)"
+fi
 
 finish

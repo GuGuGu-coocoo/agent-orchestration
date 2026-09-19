@@ -10,6 +10,8 @@
 #   invalid     writes a RESULT.md without a Status section
 #   escalation  writes a valid ESCALATION.md
 #   both        writes a valid RESULT.md and ESCALATION.md
+#   script      runs FAKE_OPENCODE_SCRIPT (a fixture that does the "work");
+#               if that writes no report, a default DONE RESULT.md is written
 #
 # FAKE_OPENCODE_EXIT sets the exit code (default 0). FAKE_OPENCODE_CWD_LOG is
 # appended with the cwd of each `run` invocation.
@@ -60,9 +62,20 @@ esac
 case "$mode" in
     escalation|both)
         {
-            printf '# Escalation\n\n## Task ID\n%s\n\n## Current Blocker\nfake blocker\n' "$task_id"
+            printf '# Escalation\n\n## Task ID\n%s\n\n## Class\nESCALATE\n\n## Current Blocker\nfake blocker\n' "$task_id"
         } >"$current/ESCALATION.md"
         ;;
 esac
+
+if [[ "$mode" == "script" ]]; then
+    if [[ -n "${FAKE_OPENCODE_SCRIPT:-}" ]]; then
+        bash "$FAKE_OPENCODE_SCRIPT"
+    fi
+    if [[ ! -s "$current/RESULT.md" && ! -s "$current/ESCALATION.md" ]]; then
+        {
+            printf '# Result\n\n## Task ID\n%s\n\n## Status\nDONE\n\n## Summary\nfake scripted result\n\n## Verification Performed\n- `true` -> exit 0\n' "$task_id"
+        } >"$current/RESULT.md"
+    fi
+fi
 
 exit "${FAKE_OPENCODE_EXIT:-0}"

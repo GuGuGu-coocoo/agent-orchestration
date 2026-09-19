@@ -1,72 +1,56 @@
 ---
 name: phase-runner
-description: Use when the Codex/Astra Supervisor is asked to execute one Phase from an existing roadmap by decomposing it into atomic Tasks, handing exactly one Task at a time to the cheap-worker skill, reviewing each report, and stopping at the human checkpoint. Covers phase intake, upfront task queue planning, task handoff, ACCEPT/REWORK/ESCALATE review, phase-level verification, RUN_STATE bookkeeping and resume. It is neither a worker nor a second agent and never launches another Supervisor session.
+description: Use when the Codex/Astra Supervisor has to run one Phase from an existing roadmap. Covers requirement intake, roadmap reading, architecture decisions, planning the Phase into bounded Tasks with machine-checkable verification, handing the whole Phase to the OpenCode phase loop (run-phase.sh) once, resolving checkpoints/escalations, the Phase-level integration review, the human QA gate, RUN_STATE bookkeeping and resume. It never reviews every Task and never starts the next Phase by itself. It is neither a worker nor a second agent and never launches another Supervisor session.
 metadata:
-  short-description: Run a roadmap Phase with the cheap worker
+  short-description: Plan a Phase, run it, review it at Phase level
 ---
 
 # phase-runner
 
 `phase-runner` is the **current Codex/Astra Supervisor's** standard workflow for
-completing one Phase with the `cheap-worker` skill. It is a playbook, not a program:
-it never starts a second Codex CLI, never spawns recursive agents, and never lets a
-worker plan.
+one Phase of a roadmap. It is a playbook, not a program: it never starts a second
+Codex CLI, never spawns recursive agents, and never lets a worker plan.
 
 ```
 Phase C
-  -> Supervisor investigates + plans once (upfront)
-  -> TASK_QUEUE.json
-  -> C01 -> cheap-worker -> Supervisor review -> ACCEPT/REWORK/ESCALATE
-  -> C02 -> cheap-worker -> Supervisor review
-  -> ...
-  -> Phase-level verification
-  -> Human checkpoint -> STOP (awaiting_human_qa)
+  -> Codex plans once: PHASE.md + TASK_QUEUE.json (bounded Tasks, verification, risk)
+  -> OpenCode phase loop (run-phase.sh), one Task = one session:
+       Task -> implement -> self-verify -> evidence gate -> next Task ...
+       stop on checkpoint / escalation / end of Phase
+  -> awaiting_phase_review  (STOP: Codex phase-level integration review)
+  -> awaiting_human_qa      (STOP: the human decides)
+  -> next Phase only after the human confirms
 ```
 
 ## Non-negotiables
 
 1. **The worker never plans.** It receives `.agent/current/TASK.md` and nothing else.
-2. **One Task at a time.** Never hand a queue or a Phase description to the worker.
-3. **The Supervisor owns the queue.** Only the Supervisor edits `TASK_QUEUE.json`.
-4. **Never ask the human "continue?" between Tasks.** ACCEPT means move to the next
-   Task automatically. The human is only interrupted for product decisions, unsafe
-   scope, or the phase checkpoint.
-5. **Files are the source of truth.** `.agent/*.json` + `.agent/phases/**` survive
+2. **Codex plans and reviews; OpenCode executes and verifies.** There is **no
+   per-Task Codex review**. The Task-level acceptance decision is the
+   deterministic evidence gate in `run-phase.sh` (re-run verification + diff
+   scope + ticked criteria).
+3. **One Task = one OpenCode session.** Never pass `--standalone` or `--model`;
+   the model is whatever OpenCode is configured to use.
+4. **Codex owns the queue.** Only Codex edits `TASK_QUEUE.json` and `PHASE.md`;
+   only the loop writes `.agent/current/`.
+5. **A Phase always ends in a STOP.** All Tasks done is `awaiting_phase_review`,
+   never the next Phase and never human QA directly.
+6. **`awaiting_human_qa` is a hard gate.** The next Phase starts only after the
+   human confirms; `run-phase.sh` refuses to run until then.
+7. **Files are the source of truth.** `.agent/*.json` + `.agent/phases/**` survive
    session loss, terminal close and reboot. Chat history is not state.
-6. **V1 has no automation glue:** the Supervisor performs each loop step explicitly
-   with its own tools. Do not build daemons, schedulers, watchers or swarms.
-7. **One Task = one OpenCode session.** The worker runs on the shared background
-   service so the human can watch it in OpenCode Desktop; never pass `--standalone`
-   or `--model`, and give each session a clear title.
-8. **Wake-up handoff needs an exact target.** `worker-notify.sh` runs the worker in
-   the background and wakes a session with `codex queue`. The target must be named
-   by the human (`--codex-thread`) or provided as `CODEX_THREAD_ID`; the helper
-   never guesses, and falls back to blocking mode when no target exists.
+8. **No automation glue.** No daemons, schedulers, watchers, DAGs, parallel
+   workers or custom UIs. The loop is one bash script; Codex is the Supervisor.
 
-## Background handoff (wake-up mode)
+## What Codex owns
 
-Wake-up needs an exact target: the human names this session (e.g. `编排`) or the
-runtime provides `CODEX_THREAD_ID`. There is no auto-detection - the helper refuses
-to guess (exit 14) and you use blocking mode instead.
-
-Handoff: run `worker-notify.sh --codex-thread "<id-or-name>" ...`, report the plan in
-one line and end your turn. You will receive a short `[worker-notify]` message when
-the Task ends:
-
-- `完成` -> do the normal review (step 13-14) and hand off the next Task.
-- `需要你决策` -> read `ESCALATION.md`, resolve or ask the human, then continue.
-- anything else (exit 5/6/7/2/3) -> inspect the named report/state first; do not
-  retry blindly. Exit 15 means the wake-up itself failed: the message is in
-  `.agent/current/NOTIFY_FAILED.md`.
-
-Prerequisites: the ChatGPT/Codex desktop app stays running **with the target session
-open** (an open session can be woken by `codex queue`; a closed or archived one
-cannot).
-
-If the app was closed or the target could not be reached, the helper writes
-`.agent/current/NOTIFY_FAILED.md` with the message and a hint; read it on your next
-turn to see what ended. Keep wake-up messages short - they enter this conversation
-as a user message and cost tokens on every wake-up.
+| Owns | Does not own |
+| --- | --- |
+| requirement discussion, roadmap, architecture decisions | Task-level implementation |
+| Phase planning and Task decomposition | Task-level verification (the gate does it) |
+| resolving checkpoints and escalations | deciding "is this Task done?" per Task |
+| the Phase-level integration review | running the Task loop |
+| deciding to enter human QA | starting the next Phase without the human |
 
 ## Workflow
 
@@ -77,139 +61,144 @@ as a user message and cost tokens on every wake-up.
    `.agent/ROADMAP.md`, or a pointer inside `AGENTS.md`. If several exist, pick the
    current one by content/recency; ask the human only if genuinely ambiguous.
 3. Inspect the repo: `git status`, `git rev-parse HEAD`, `git log --oneline -10`,
-   `.agent/` contents, existing phase dirs. On resume, read
-   `.agent/RUN_STATE.json` first - it may say the phase is already running.
+   `.agent/` contents, existing phase dirs. On resume, read `.agent/RUN_STATE.json`
+   first (and run `check-state.sh`, see Resume).
 4. Restate the target Phase and the human checkpoint out loud (2-5 lines).
 
-### 1. Plan upfront
+### 1. Plan the Phase once, into a machine-runnable queue
 
-5. Investigate the code needed to understand the Phase (read-only).
-6. Decompose the Phase into atomic Tasks now: each Task = one coherent, verifiable
-   change a cheap worker can finish in one run. Write them down with acceptance
-   criteria and required verification.
-7. Create:
-   - `.agent/phases/<PHASE>/PHASE.md` (from the template)
-   - `.agent/phases/<PHASE>/TASK_QUEUE.json` (from the template)
-   - `.agent/phases/<PHASE>/history/`
-8. Update `.agent/RUN_STATE.json` (`current_phase`, `current_task`, `status`).
-9. Tell the human the plan in one short block, then start Task 1 without waiting for
-   a "continue".
+5. Investigate the code the Phase touches (read-only).
+6. Decompose the Phase into bounded Tasks. For **every** Task write:
+   - `allowed_changes` / `forbidden_changes` (paths or globs - the gate checks the diff),
+   - `acceptance_criteria` (observable, one per line),
+   - `verification`: at least one exact, non-interactive command **the gate will
+     re-run** (`{"cmd": "...", "expect": "exit 0"}`); a Task without that cannot
+     run,
+   - `risk`: `low` for ordinary work, `guarded` for architecture / public API /
+     schema / data migration / security / permissions / credentials / deployment
+     (the loop stops for a Codex review right after a guarded Task is accepted).
+7. Create/update:
+   - `.agent/phases/<PHASE>/PHASE.md` (from the template; `## Required Phase
+     Verification` must match the queue's `phase_verification`),
+   - `.agent/phases/<PHASE>/TASK_QUEUE.json` (from the template),
+   - `.agent/RUN_STATE.json` (`current_phase`, `current_task: ""`, `status: idle`).
+8. Tell the human the plan in one short block, then start the loop. Details and
+   sizing rules: `references/phase-planning.md`.
 
-Details and sizing rules: `references/phase-planning.md`.
+### 2. Hand the whole Phase to the OpenCode loop - once
 
-### 2. Task loop (repeat until the queue is done)
+9. Run the loop. It executes one OpenCode worker session per Task, verifies each
+   Task with the evidence gate, auto-accepts and continues; it stops only at a
+   checkpoint, an escalation, or the end of the Phase.
 
-10. Render the next `pending` Task into `.agent/current/TASK.md` using the TASK
-    contract (keep a copy in `.agent/phases/<PHASE>/history/`), then mark it
-    `in_progress` in `TASK_QUEUE.json` and `RUN_STATE.json`. Render first, mark
-    second: an interruption then leaves a Task that is still `pending`, not a
-    queue entry pointing at a template. Write both JSON files via temp file +
-    rename.
-11. Record the git baseline: `git status`, `git rev-parse HEAD`. If the previous
-    accepted Task was not committed (the normal case: the worker never commits),
-    pass `--allow-dirty`; `run-worker.sh` records the pre-run dirty evidence in
-    `.agent/current/BASELINE.md`, and the review must compare against it so that
-    old changes are not mistaken for this Task's diff.
-12. Hand off the Task to the worker - exactly one Task at a time - in one of two modes:
-    - **Blocking (default, always safe)**:
-      `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode> --task-id <id> --title "<queue title>" [--allow-dirty]`
-      This blocks until the worker finishes, then continue in the same turn.
-    - **Background + wake-up (only with an exact target)**:
-      `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --codex-thread "<id-or-name>" --mode <mode> --task-id <id> --title "<queue title>" [--allow-dirty]`
-      Use it when the human named this session (or the runtime sets
-      `CODEX_THREAD_ID`). It returns immediately, you end your turn, and `codex
-      queue` wakes that session when the worker is done. The helper never guesses a
-      session: without an exact target it exits `14` - fall back to blocking.
-    Model choice belongs to OpenCode's own configuration; neither script passes
-    `--model` and neither starts a private server. One Task = one OpenCode session,
-    visible in OpenCode Desktop.
-    Worker exit codes: `0` fresh valid RESULT, `5` RESULT but opencode failed
-    (review carefully), `10` ESCALATION, `6` stale/mismatched report, `7` another
-    worker is running, `8` stale lock needs `--break-lock`, `2/3/4` plumbing
-    failures. The script validates TASK.md (required sections, real Task ID,
-    matching `--mode`/`--task-id`, REVIEW.md identity) and quarantines previous
-    reports to `.agent/history/attempts/<task>/` before each run.
-13. Review the result per `references/task-review.md`: read `TASK.md`, `RESULT.md`,
-    `git diff --stat`/`git diff`, `BASELINE.md`, test output, plus only the files
-    that changed. `check-state.sh` prints the cross-file consistency verdict when
-    something looks off.
-14. Decide exactly one of:
-    - **ACCEPT** -> `archive-task.sh --yes --decision ACCEPT` first, then mark the
-      Task `done` in the queue (never `done` without an archive); select the next
-      pending Task; continue without asking the human.
-    - **REWORK** -> write `.agent/current/REVIEW.md` with concrete required
-      corrections (same Task ID), keep the Task `in_progress`, re-run steps 12-13.
-    - **ESCALATE** -> the Supervisor resolves technical/architectural blockers
-      itself (adjust plan, split Task, add context, change approach). Ask the human
-      only for genuine product decisions. Record the decision in the queue history.
-15. If new evidence invalidates a future Task, revise the queue now and append the
-    reason to `TASK_QUEUE.json` -> `adjustments`. Never silently drop a Task.
-16. If `run-worker.sh` returns `7`, another worker is running: do not start a
-    second one. If it returns `8`, the previous run could not be proven dead (for
-    example after a cancellation): verify with `check-state.sh`/`ps`, then rerun
-    with `--break-lock`. A cancelled run (Ctrl-C/SIGTERM) intentionally keeps the
-    lock.
+   ```sh
+   # blocking (Codex waits; always available)
+   ~/.agents/skills/phase-runner/scripts/run-phase.sh --root "$PWD"
 
-### 3. Phase completion
+   # background + wake-up: Codex ends its turn and is woken when the loop STOPS
+   ~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
+     --phase --codex-thread "<id-or-name>"
+   ```
 
-17. All Tasks `done`? Run the Phase Acceptance Criteria from `PHASE.md` and the
-    Required Phase Verification (full test suite, build, lint, smoke, manual checks
-    that don't need the human). This is a real run, not a status flip.
-18. Fix only via new Tasks - never by skipping verification.
-19. Write a short Phase summary into `PHASE.md` (`## Result`) and archive the phase
-    in `TASK_QUEUE.json` (`status: done`).
-20. Update `.agent/RUN_STATE.json`: `status: awaiting_human_qa`,
-    `human_checkpoint: after_phase_<X>`, `current_phase`, `current_task` frozen.
-21. **STOP.** Report to the human what changed, what was verified, what to test
-    manually, and what the next Phase would be. Do not start the next Phase.
+   Useful flags: `--max-tasks N` (safety cap), `--dry-run` (print the queue
+   without running), `--break-lock` (after a crash, once nothing is running),
+   `--no-check-state` (skip the resume diagnostic).
 
-## Human checkpoint
+   Wake-up prerequisites: the human named this session (`--codex-thread`) or the
+   runtime provides `CODEX_THREAD_ID`; the ChatGPT/Codex app must stay open with
+   the target session open. Without an exact target the helper exits `14` - use
+   blocking mode. An undelivered message is kept in
+   `.agent/current/NOTIFY_FAILED.md`.
+
+10. The loop's exit codes tell you what happened (it also writes
+    `.agent/RUN_STATE.json`):
+
+    | exit | RUN_STATE.status | meaning |
+    | --- | --- | --- |
+    | 0 | `awaiting_phase_review` | all Tasks done + Phase verification passed: do the phase review |
+    | 2 | `checkpoint` | Codex decision needed (`stop_reason` says what) |
+    | 3 | `escalated` | a Task is blocked; Codex must resolve it |
+    | 4 | `awaiting_phase_review` / `awaiting_human_qa` | nothing to run: the Phase is at a gate |
+    | 5 | `checkpoint` | inconsistent/plumbing state (report, lock, state) |
+    | 1 | - | invalid invocation, plan or state |
+
+### 3. React to the stop (the only places Codex spends tokens)
+
+- **`awaiting_phase_review`** -> the Phase-level integration review:
+  read `PHASE_REVIEW.md`, every archived `RESULT.md`/`VERIFY.md`, the full
+  `git diff`, re-run the Phase verification, then:
+  ```sh
+  ~/.agents/skills/phase-runner/scripts/phase-gate.sh review-pass --summary "..."
+  ~/.agents/skills/phase-runner/scripts/phase-gate.sh review-fail --reason "..."
+  ```
+  `review-fail` reopens the queue so you can append corrective Tasks and run the
+  loop again. `review-pass` re-runs the Phase verification for real and moves to
+  `awaiting_human_qa`. Procedure: `references/phase-review.md`.
+
+- **`checkpoint`** -> read `stop_reason` + `.agent/current/` (and
+  `ESCALATION.md` when the worker asked a question), then decide: revise the Task
+  in the queue, split it, write `.agent/current/REVIEW.md` corrections (same Task
+  ID) for the same Task, or ask the human for a genuine product decision. Then
+  run the loop again. Procedure: `references/checkpoint-handling.md`.
+
+- **`escalated`** -> the Task is `escalated` in the queue and blocks the loop.
+  Resolve it in the queue (revise / split / drop with an `adjustments` entry),
+  then run the loop again.
+
+- **`awaiting_human_qa`** -> stop and report. Nothing runs until the human
+  answers. Record the verdict:
+  ```sh
+  ~/.agents/skills/phase-runner/scripts/phase-gate.sh qa-pass --note "..."
+  ~/.agents/skills/phase-runner/scripts/phase-gate.sh qa-fail --note "..."   # defects -> new Tasks
+  ```
+
+### 4. Human QA gate
 
 `references/human-checkpoint.md` defines what may and may not be done between
 `awaiting_human_qa` and the human's verdict. In short: no product work, no next
-Phase, no "helpful" extra Tasks. Answer questions, fix defects the human reports
-(through new Tasks), and wait.
+Phase, no "helpful" extra Tasks. Answer questions, turn reported defects into
+Tasks, and wait. **The next Phase starts only after the human confirms.**
 
 ## Resume
 
 Any time a session starts, before anything else:
 
 1. Run `~/.agents/skills/cheap-worker/scripts/check-state.sh` in the project. It
-   cross-checks the lock, queue, `RUN_STATE.json`, the current TASK/STATE and the
+   cross-checks the locks, queue, `RUN_STATE.json`, the current TASK/STATE and the
    reports, and prints a single verdict. An `INCONSISTENT` verdict is blocking:
-   fix the listed items (or run the reconciliation named in the message) before
-   acting. `check-state.sh` is fail-closed on unreadable JSON; it is a diagnostic,
-   not a substitute for reading the files it points at.
-2. Read `.agent/RUN_STATE.json` and `.agent/phases/<phase>/TASK_QUEUE.json`.
+   fix the listed items before acting.
+2. Read `.agent/RUN_STATE.json` (`status`, `current_task`, `stop_reason`) and
+   `.agent/phases/<phase>/TASK_QUEUE.json`.
 
 | check-state verdict | action |
 | --- | --- |
-| `WORKER_RUNNING` | a wrapper or worker process is alive: do not start another; wait for the report or the `[worker-notify]` message |
-| `ESCALATED` | a Task is escalated: read the report/queue history and decide (product decisions go to the human) |
-| `BLOCKED` | resolve the recorded blocker before resuming |
-| `CHECKPOINT` | `awaiting_human_qa`: stop; the human decides the next Phase |
-| `INCONSISTENT` | fix the listed issues first (rewrite TASK.md from the saved definition, archive missing done Tasks, resolve double reports) |
-| `REVIEW_OR_RESUME` | report acceptable -> review; otherwise re-run the same Task (`run-worker.sh --allow-dirty`) |
-| `NEXT` | hand off the pending Task (step 10) |
-| `PHASE_COMPLETE` | run the phase final review (step 17), then stop at the checkpoint |
-| `EMPTY` | no queue state (fresh project): start from phase intake |
+| `WORKER_RUNNING` | a worker or the loop is alive: do not start another; wait for the report or the `[phase-notify]` message |
+| `INCONSISTENT` | fix the listed issues first (rewrite TASK.md from the queue, resolve double reports, archive missing done Tasks) |
+| `ESCALATED` | resolve the escalated Task in the queue, then run the loop |
+| `CHECKPOINT` | a Codex decision is pending: read `.agent/current/` and `stop_reason` |
+| `AWAITING_PHASE_REVIEW` | do the Phase-level integration review (`phase-gate.sh`) |
+| `AWAITING_HUMAN_QA` | stop; the human decides; nothing runs before that |
+| `RUNNING` | continue hand-offs with `run-phase.sh` (it resumes the `in_progress` Task) |
+| `QUEUE_COMPLETE` | no runnable Task left: run `run-phase.sh` for the Phase verification, or append a corrective Task |
+| `EMPTY` | no queue state: plan the Phase (or the next Phase after human QA) |
 
-Exit codes: `0` = actionable verdict, `1` = stop. A missing archive for a `done`
-Task is only a warning (the Task is skipped anyway); an archive for an
-`in_progress` Task is blocking.
+Exit codes: `0` = actionable, `1` = stop.
 
 Never restart a completed Task. Never re-plan from scratch if the queue is valid;
-only revise pending Tasks with recorded reasons.
+only revise pending Tasks with recorded reasons. `run-phase.sh` re-renders
+`.agent/current/TASK.md` from the queue definition, so a blank or stale TASK.md is
+repaired automatically on resume.
 
 ## Reference index
 
 | File | Purpose |
 | --- | --- |
-| `references/phase-planning.md` | how to decompose a Phase into atomic Tasks |
-| `references/task-review.md` | ACCEPT / REWORK / ESCALATE decision procedure |
+| `references/phase-planning.md` | how to decompose a Phase into runnable Tasks (queue schema, risk classes, verification) |
+| `references/phase-review.md` | the Phase-level integration review and the `phase-gate.sh` decision |
+| `references/checkpoint-handling.md` | resolving checkpoint / escalation stops |
 | `references/roadmap-policy.md` | finding and respecting the roadmap, scope rules |
-| `references/human-checkpoint.md` | what "stop and wait" means in practice |
+| `references/human-checkpoint.md` | what "stop and wait for the human" means in practice |
 | `assets/templates/PHASE.md` | phase document template |
-| `assets/templates/TASK_QUEUE.json` | task queue template |
+| `assets/templates/TASK_QUEUE.json` | task queue template (machine-readable Task definitions) |
 | `assets/templates/RUN_STATE.json` | run state / resume template |
 | `../cheap-worker/SKILL.md` | the worker side of the contract |

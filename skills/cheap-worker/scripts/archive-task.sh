@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # archive-task.sh - archive the current Task's artifacts into .agent/history/.
 #
-# Called by the Supervisor AFTER a review decision (normally ACCEPT), never by the
-# worker itself. Non-destructive up to .agent/history: it moves files, it never
-# deletes project code.
+# Called by the Phase loop (run-phase.sh) after the evidence gate passes, or by
+# Codex for a manual decision - never by the worker itself. Non-destructive up to
+# .agent/history: it moves files, it never deletes project code.
 #
 # Usage:
 #   archive-task.sh [--root DIR] [--task-id ID] --yes [--decision ACCEPT|REWORK|ESCALATE]
 #
 # Effects:
-#   .agent/current/{TASK.md,RESULT.md,REVIEW.md,ESCALATION.md,STATE.json,BASELINE.md,BASELINE.patch,logs/}
+#   .agent/current/{TASK.md,RESULT.md,REVIEW.md,ESCALATION.md,VERIFY.md,STATE.json,BASELINE.md,BASELINE.patch,logs/}
 #     -> .agent/history/<UTC timestamp>-<task-id>/
 #   .agent/current/{TASK.md,STATE.json} are re-seeded from the skill templates.
 #
@@ -94,7 +94,7 @@ main() {
     fi
 
     mkdir -p "$archive"
-    for f in TASK.md RESULT.md REVIEW.md ESCALATION.md STATE.json BASELINE.md BASELINE.patch; do
+    for f in TASK.md RESULT.md REVIEW.md ESCALATION.md VERIFY.md STATE.json BASELINE.md BASELINE.patch; do
         [[ -e "$current/$f" ]] && mv "$current/$f" "$archive/$f"
     done
     if [[ -d "$current/logs" ]]; then

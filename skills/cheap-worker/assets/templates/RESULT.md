@@ -17,21 +17,24 @@ DONE
 
 ## Acceptance Criteria
 - [x] <criterion> - <how it was checked>
-- [ ] <criterion not satisfied> - <why>
+- [x] <criterion> - <how it was checked>
+
+<!-- Every criterion must be ticked; an unticked item means this Task is not done. -->
 
 ## Verification Performed
-- `<command>` -> <result>
+- `<exact command>` -> <exit code / observed result>
+- `<exact command>` -> <exit code / observed result>
 
 ## Test Results
 <pass/fail counts, failing test names, or "no test suite present">
+
+## Git Diff Summary
+```
+<paste output of `git diff --stat`>
+```
 
 ## Known Risks
 <none | list>
 
 ## Remaining Questions
 <none | list>
-
-## Git Diff Summary
-```
-<paste output of `git diff --stat`>
-```

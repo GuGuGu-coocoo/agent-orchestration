@@ -110,6 +110,35 @@ main() {
     fi
     command -v caffeinate >/dev/null 2>&1 && ok "caffeinate available (no-sleep assertion while a worker runs)" || warn "caffeinate not found (macOS sleep may pause unattended runs)"
 
+    printf 'phase loop (phase-runner skill)\n'
+    local pr_root=""
+    if [[ -f "$SCRIPT_DIR/../../phase-runner/SKILL.md" ]]; then
+        pr_root="$(cd "$SCRIPT_DIR/../../phase-runner" && pwd)"
+    elif [[ -f "$HOME/.agents/skills/phase-runner/SKILL.md" ]]; then
+        pr_root="$HOME/.agents/skills/phase-runner"
+    fi
+    if [[ -n "$pr_root" ]]; then
+        ok "phase-runner root: $pr_root"
+        local s
+        for s in run-phase.sh phase-gate.sh; do
+            [[ -f "$pr_root/scripts/$s" ]] && ok "scripts/$s" || bad "scripts/$s missing"
+        done
+        local rp_code=""
+        [[ -f "$pr_root/scripts/run-phase.sh" ]] && rp_code="$(grep -v '^[[:space:]]*#' "$pr_root/scripts/run-phase.sh" || true)"
+        if printf '%s\n' "$rp_code" | grep -q -- '--standalone'; then
+            bad "run-phase.sh passes --standalone; the loop must use the shared service"
+        else
+            ok "run-phase.sh never uses --standalone"
+        fi
+        if printf '%s\n' "$rp_code" | grep -q -- '--model'; then
+            bad "run-phase.sh passes --model; the model comes from OpenCode config"
+        else
+            ok "run-phase.sh never passes --model (one Task = one OpenCode session)"
+        fi
+    else
+        warn "phase-runner skill not found (source tree or ~/.agents/skills/phase-runner)"
+    fi
+
     printf 'skill files\n'
     local sk
     if sk="$(skill_root)"; then
@@ -147,9 +176,10 @@ main() {
         [[ -f "$agent_dir/current/TASK.md" ]]       && ok "TASK.md present"       || warn "no .agent/current/TASK.md"
         [[ -f "$agent_dir/current/RESULT.md" ]]     && ok "RESULT.md present"     || true
         [[ -f "$agent_dir/current/ESCALATION.md" ]] && ok "ESCALATION.md present" || true
+        [[ -f "$agent_dir/current/VERIFY.md" ]]     && ok "VERIFY.md present (evidence gate)" || true
         if [[ -f "$agent_dir/RUN_STATE.json" ]]; then
             if command -v jq >/dev/null 2>&1 && jq empty "$agent_dir/RUN_STATE.json" >/dev/null 2>&1; then
-                ok "RUN_STATE.json valid JSON"
+                ok "RUN_STATE.json valid JSON ($(jq -r '.current_phase // "?"' "$agent_dir/RUN_STATE.json") / $(jq -r '.status // "?"' "$agent_dir/RUN_STATE.json"))"
             else
                 bad "RUN_STATE.json is not valid JSON"
             fi

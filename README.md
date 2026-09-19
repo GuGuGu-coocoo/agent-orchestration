@@ -1,11 +1,15 @@
 # agent-orchestration
 
-Global, cross-project Agent Orchestration Skills for a three-layer workflow:
+Global, cross-project Agent Orchestration Skills for a three-layer workflow where
+**OpenCode does the Task-level work and verification, and Codex supervises at
+Phase level**:
 
 ```
-Human        -> product intent, roadmap confirmation, manual QA
-Codex/Astra  -> phase planning, task decomposition, architecture, review, next-task decisions
-cheap worker -> exactly ONE implementation task at a time
+Human          -> product intent, roadmap confirmation, manual QA
+Codex/Astra    -> requirements, architecture, roadmap, Phase planning,
+                  Phase-level review, escalation handling, human-QA decision
+OpenCode loop  -> executes the Phase's bounded Tasks, one session per Task,
+                  verifies each Task itself, auto-continues, stops on risk
 ```
 
 Two OpenCode skills are managed here and installed to `~/.agents/skills/`:
@@ -13,30 +17,35 @@ Two OpenCode skills are managed here and installed to `~/.agents/skills/`:
 | Skill | Role | Location after install |
 | --- | --- | --- |
 | `cheap-worker` | executes one Task, writes RESULT/ESCALATION | `~/.agents/skills/cheap-worker` |
-| `phase-runner` | Supervisor playbook for running a Phase | `~/.agents/skills/phase-runner` |
+| `phase-runner` | the Phase loop + the Codex playbook for one Phase | `~/.agents/skills/phase-runner` |
 
-The most important rule: **the cheap worker never plans a Phase.** A Phase is
-investigated and decomposed by Codex/Astra; the worker only ever sees
-`.agent/current/TASK.md`.
+The most important rule: **the worker never plans a Phase, and Codex never
+reviews a Task.** Codex plans the Phase once into `TASK_QUEUE.json`; the loop
+(`run-phase.sh`) executes it and accepts each Task with a deterministic evidence
+gate.
 
 ## Architecture
 
 ```
 roadmap
-  -> Codex/Astra (phase-runner):  plan Phase into TASK_QUEUE.json  (once, upfront)
-      -> TASK C01 -> cheap-worker session in OpenCode Desktop -> RESULT/ESCALATION -> Codex review
-          -> ACCEPT  -> archive, next Task automatically
-          -> REWORK  -> REVIEW.md corrections, same Task again
-          -> ESCALATE-> Codex resolves; human only for product decisions
-      -> TASK C02 -> ...
-  -> phase-level verification
-  -> RUN_STATE.json: awaiting_human_qa
-  -> STOP (human tests manually)
+  -> Codex (phase-runner): plan the Phase ONCE
+       PHASE.md + TASK_QUEUE.json   (bounded Tasks, risk class, verification)
+  -> OpenCode phase loop (run-phase.sh), one Task = one OpenCode session:
+       render TASK.md -> worker implements + self-verifies -> evidence gate
+         gate = RESULT.md DONE + criteria ticked
+                + required verification commands re-run green
+                + diff inside Allowed Changes
+                + Supervisor artifacts untouched
+       PASS  -> archive, mark done, next Task automatically
+       STOP  -> checkpoint | escalate | guarded Task review
+  -> awaiting_phase_review   (STOP: Codex Phase-level integration review)
+  -> awaiting_human_qa       (STOP: the human decides)
+  -> the next Phase is a deliberate new decision
 ```
 
 Files, not chat history, are the source of truth for resume. Each Task is one
 OpenCode session on the shared background service, so the human can watch it in
-OpenCode Desktop while Codex supervises.
+OpenCode Desktop while the loop runs.
 
 ## Repository layout
 
@@ -53,31 +62,31 @@ agent-orchestration/
 │   │   ├── scripts/
 │   │   │   ├── doctor.sh              # environment health check
 │   │   │   ├── run-worker.sh          # run exactly one Task (blocking)
-│   │   │   ├── worker-notify.sh       # run one Task in background + wake Codex
-│   │   │   ├── status.sh              # read-only status of the current Task
-│   │   │   ├── collect-result.sh      # print RESULT/ESCALATION (+ git diff)
+│   │   │   ├── worker-notify.sh       # run one Task OR a whole Phase in background + wake Codex
+│   │   │   ├── status.sh              # read-only status (Phase + Task)
+│   │   │   ├── check-state.sh         # resume verdict / consistency check
+│   │   │   ├── collect-result.sh      # print RESULT/ESCALATION + VERIFY evidence
 │   │   │   └── archive-task.sh        # move finished Task artifacts to history
 │   │   ├── references/
 │   │   │   ├── worker-contract.md     # normative worker contract + report formats
 │   │   │   ├── worker-prompt.md       # prompt template used by run-worker.sh
-│   │   │   ├── escalation-policy.md   # when and how to stop
+│   │   │   ├── escalation-policy.md   # CHECKPOINT vs ESCALATE, when to stop
 │   │   │   └── safety-policy.md       # default safety boundaries
 │   │   └── assets/templates/
-│   │       ├── TASK.md
-│   │       ├── RESULT.md
-│   │       ├── ESCALATION.md
-│   │       └── STATE.json
+│   │       ├── TASK.md  RESULT.md  ESCALATION.md  STATE.json
 │   └── phase-runner/
-│       ├── SKILL.md
+│       ├── SKILL.md                   # the Codex playbook for one Phase
+│       ├── scripts/
+│       │   ├── run-phase.sh           # THE LOOP: Task after Task, evidence gate
+│       │   └── phase-gate.sh          # Phase review / human QA gate recorder
 │       ├── references/
-│       │   ├── phase-planning.md      # how to decompose a Phase
-│       │   ├── task-review.md         # ACCEPT / REWORK / ESCALATE
+│       │   ├── phase-planning.md      # decompose a Phase into runnable Tasks
+│       │   ├── phase-review.md        # the Phase-level integration review
+│       │   ├── checkpoint-handling.md # resolving checkpoint / escalation stops
 │       │   ├── roadmap-policy.md      # finding and respecting the roadmap
-│       │   └── human-checkpoint.md    # stopping and waiting for QA
+│       │   └── human-checkpoint.md    # stop and wait for the human
 │       └── assets/templates/
-│           ├── PHASE.md
-│           ├── TASK_QUEUE.json
-│           └── RUN_STATE.json
+│           ├── PHASE.md  TASK_QUEUE.json  RUN_STATE.json
 └── tests/smoke/                       # throwaway-repo tests, never the user's projects
 ```
 
@@ -109,22 +118,74 @@ If you linked the skill into Codex, remove that link too:
 rm ~/.codex/skills/phase-runner
 ```
 
-## cheap-worker usage
+## Running a Phase
 
-The Supervisor (Codex) writes `.agent/current/TASK.md`, then:
+Codex plans the Phase (see `skills/phase-runner/SKILL.md`), then hands the whole
+Phase to the loop **once**:
 
 ```sh
 cd /path/to/target-project
 
-~/.agents/skills/cheap-worker/scripts/doctor.sh
-~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode implement \
-  --title "Add retry queue"
+~/.agents/skills/phase-runner/scripts/run-phase.sh          # blocking
+~/.agents/skills/phase-runner/scripts/run-phase.sh --dry-run  # print the plan only
+
+# background + wake Codex only when the loop STOPS (phase review / checkpoint / escalation)
+~/.agents/skills/cheap-worker/scripts/worker-notify.sh --phase --codex-thread "编排"
 ```
 
-`--title` is optional and is the short Task title; the session title becomes
-`cheap-worker · <task-id> · <title>` (or `cheap-worker · <task-id>` when omitted,
-derived from the Objective). The model is whatever OpenCode itself is configured
-to use - the script never passes `--model` and never uses `--standalone`.
+`run-phase.sh` exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | the Phase reached `awaiting_phase_review` (STOP: Codex review) |
+| 1 | invalid invocation, invalid plan, or a state gate refused |
+| 2 | stopped at a checkpoint (Codex decision needed) |
+| 3 | stopped at an escalation (blocked) |
+| 4 | refused: the Phase is at a gate (`awaiting_phase_review` / `awaiting_human_qa`) |
+| 5 | stopped at an inconsistent/plumbing state (report, lock, state) |
+
+Flags: `--root DIR`, `--max-tasks N` (safety cap), `--dry-run`, `--break-lock`
+(clear a provably dead loop lock), `--no-check-state`.
+
+The Phase review is recorded with:
+
+```sh
+~/.agents/skills/phase-runner/scripts/phase-gate.sh review-pass --summary "..."
+~/.agents/skills/phase-runner/scripts/phase-gate.sh review-fail --reason "..."   # add corrective Tasks, continue
+~/.agents/skills/phase-runner/scripts/phase-gate.sh qa-pass --note "..."         # after the human confirmed
+~/.agents/skills/phase-runner/scripts/phase-gate.sh qa-fail --note "..."         # convert defects into Tasks
+```
+
+## The evidence gate (why Codex does not review each Task)
+
+For every Task the loop re-runs, itself, deterministically:
+
+- `RESULT.md` is fresh, belongs to this Task, `Status: DONE`, no unticked criteria;
+- every `verification` command from the queue re-runs and meets its expectation
+  (`exit 0`, `exit N`, or `contains:<text>`);
+- the changed files are inside `allowed_changes` and outside `forbidden_changes`
+  (tool artifacts such as `__pycache__`/`.pytest_cache` are ignored);
+- `TASK_QUEUE.json`, `RUN_STATE.json`, `PHASE.md` and `TASK.md` were not touched by
+  the worker.
+
+The outcome is written to `.agent/current/VERIFY.md` and copied to
+`.agent/phases/<P>/history/VERIFY-<task>.md`; PASS archives the Task and continues,
+FAIL/any stop hands over to Codex. A worker's own "DONE" is never enough.
+
+## cheap-worker usage (single Task)
+
+The loop drives this automatically; you can also run one Task by hand:
+
+```sh
+cd /path/to/target-project
+~/.agents/skills/cheap-worker/scripts/doctor.sh
+~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode implement --title "Add retry queue"
+```
+
+`--title` is optional; the session title becomes
+`cheap-worker · <task-id> · <title>`. The model is whatever OpenCode itself is
+configured to use - the script never passes `--model` and never uses
+`--standalone`.
 
 `run-worker.sh` exit codes:
 
@@ -132,7 +193,7 @@ to use - the script never passes `--model` and never uses `--standalone`.
 | --- | --- |
 | 0 | fresh, valid `RESULT.md` from this run |
 | 5 | valid `RESULT.md` but opencode exited non-zero (review before accepting) |
-| 10 | valid `ESCALATION.md`, Supervisor decision required |
+| 10 | valid `ESCALATION.md` (`## Class`: CHECKPOINT or ESCALATE) |
 | 1 | precondition failure (missing/invalid/inconsistent TASK.md, dirty tree without `--allow-dirty`) |
 | 2 | opencode failed and wrote no report |
 | 3 | opencode finished but wrote no report |
@@ -147,38 +208,24 @@ Safety behaviours on every run:
   pid and the worker pid**, refuses a second worker (`7`), and **never takes over a
   stale lock automatically**: use `--break-lock` after verifying nothing runs (`8`).
   A cancelled run (Ctrl-C / SIGTERM) attempts to stop its worker (TERM plus up to
-  ~10s of waiting) and **always keeps the lock**; killing the CLI is not proof that
-  a shared-service execution stopped, so the next run must verify and pass
-  `--break-lock`.
-- previous `RESULT.md`/`ESCALATION.md`/`BASELINE.*` are quarantined to
+  ~10s of waiting) and **always keeps the lock**.
+- previous `RESULT.md`/`ESCALATION.md`/`VERIFY.md`/`BASELINE.*` are quarantined to
   `.agent/history/attempts/<task>/` so a stale report can never be mistaken for
   this run's output
-- `TASK.md` must contain the required sections (Task ID, Mode, Objective,
-  Acceptance Criteria, Required Verification, Allowed Changes, Forbidden Changes)
-  with real content - list placeholders such as `- <...>` / `- [ ] <...>` count as
-  missing; `--task-id`/`--mode` must match the file; a `REVIEW.md` must carry the
-  same Task ID
+- `TASK.md` must contain the required sections with real content (list placeholders
+  such as `- <...>` count as missing); `--task-id`/`--mode` must match the file; a
+  `REVIEW.md` must carry the same Task ID
 - `--allow-dirty` records the pre-run tracked/staged/untracked status in
   `.agent/current/BASELINE.md` plus `git diff HEAD --binary` in `BASELINE.patch`
-  (tracked content only; untracked file **contents** and repositories without a
-  commit are outside this guarantee)
-- `check-state.sh` is fail-closed: empty/unreadable/misspelled state is an issue,
-  not a default; it distinguishes actionable verdicts (`NEXT`, `REVIEW_OR_RESUME`,
-  `PHASE_COMPLETE`) from stop verdicts (`WORKER_RUNNING`, `ESCALATED`, `BLOCKED`,
-  `CHECKPOINT`, `INCONSISTENT`)
 - opencode always runs with `cwd` = project root, even when invoked elsewhere
 
 Other helper scripts:
 
 ```sh
 ~/.agents/skills/cheap-worker/scripts/status.sh
-~/.agents/skills/cheap-worker/scripts/check-state.sh    # resume consistency verdict
+~/.agents/skills/cheap-worker/scripts/check-state.sh    # resume verdict
 ~/.agents/skills/cheap-worker/scripts/collect-result.sh --diff
 ~/.agents/skills/cheap-worker/scripts/archive-task.sh --yes --decision ACCEPT
-
-# non-blocking variant: run in background and wake a Codex session when done
-~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
-  --mode implement --task-id C01 --title "Add retry queue"
 ```
 
 ## phase-runner usage
@@ -186,36 +233,35 @@ Other helper scripts:
 After install, in an OpenCode/Codex session, say something like:
 
 > 用 $phase-runner 按现有 roadmap 开发到 Phase C。
-> 你负责拆 Task、逐个调用 $cheap-worker 并验收。
-> 普通技术问题不要问我。
-> Phase C 自动验收通过后停止，我来人工测试。
+> 你负责需求和 Phase planning，把 Phase 拆成 bounded Tasks 后交给 run-phase.sh 跑。
+> 不要逐个 Task review；Phase 完成后做 integration review，然后停下等我人工测试。
 
 The Supervisor then follows `skills/phase-runner/SKILL.md`: intake, upfront
-planning, the one-Task-at-a-time worker loop, review decisions, phase
-verification, and the human checkpoint. It never asks "continue?" between Tasks.
+planning, one hand-off of the whole Phase, resolving checkpoint/escalation stops,
+the Phase-level review, and the human checkpoint. It never asks "continue?"
+between Tasks and never reviews a Task result.
 
 ## Model selection
 
-V1 has **no model layer of its own**. `run-worker.sh` never passes `--model`; the
-worker uses whatever OpenCode's own configuration selects:
+V1 has **no model layer of its own**. Neither `run-worker.sh` nor `run-phase.sh`
+passes `--model`; the worker uses whatever OpenCode's own configuration selects:
 
 - Global config: `~/.config/opencode/opencode.json` -> `"model"`
 - Or the OpenCode Desktop / TUI model selector (sessions can differ)
 
-Check the available model IDs with `opencode models`, and change the default in
-OpenCode's own config if you want a different worker. There is no fallback, no
-router, no project-level model config and no automatic switching - by design.
+There is no fallback, no router, no project-level model config and no automatic
+switching - by design. Check the available model IDs with `opencode models`.
 
 ## OpenCode Desktop observability
 
-Every worker run is a normal OpenCode session on the **shared background service**,
-so you can watch it in OpenCode Desktop:
+Every Task is a normal OpenCode session on the **shared background service**, so
+you can watch it in OpenCode Desktop:
 
 - One Task = one session, titled `cheap-worker · C01 · Add retry queue`.
 - The session shows the model output, Read / Search / Edit / Bash / test steps and
   the final report, exactly as it happened.
-- `run-worker.sh` never starts a private server (`--standalone` is not used), so
-  the session is the same one Desktop already sees.
+- Neither script starts a private server (`--standalone` is not used), so the
+  session is the same one Desktop already sees.
 - `status.sh` prints the session id recorded in `.agent/current/STATE.json`.
 - There is no separate dashboard, log UI or monitoring component to maintain.
 
@@ -236,44 +282,24 @@ Then in a new Codex conversation:
 > 用 $phase-runner 做到 Phase C。
 > 我的会话名是 `编排`（用于后台唤醒；不写就用 blocking 模式）。
 
-The Supervisor plans the Phase and hands off each Task with `worker-notify.sh`
-(background, explicit session target) or `run-worker.sh` (blocking). Without a
-session target the blocking mode is the safe default; there is no auto-detection.
-
 ### Two handoff modes
 
 | Mode | Command | Codex behavior | Use when |
 | --- | --- | --- | --- |
-| Blocking | `run-worker.sh ...` | waits inside the turn, then continues | default; always available |
-| Background + wake-up | `worker-notify.sh --codex-thread <id-or-name> ...` | returns immediately and ends the turn; `codex queue` wakes that session when the Task ends | you want to leave the machine and a target session is known |
+| Blocking | `run-phase.sh` | waits inside the turn, then does the Phase review | default; always available |
+| Background + wake-up | `worker-notify.sh --phase --codex-thread <id-or-name>` | returns immediately and ends the turn; `codex queue` wakes that session when the loop **stops** | you want to leave the machine and a target session is known |
 
 Wake-up details:
 
 - The target must be **exact**: `--codex-thread <id-or-name>`, or `CODEX_THREAD_ID`
-  when the calling runtime provides it. There is **no guessing from local history**
-  (a wrong guess would wake another conversation); without a target the helper
-  fails closed (`exit 14`) and the Supervisor stays in blocking mode.
-- `exit 15` means the worker finished but the wake-up could not be delivered:
-  the message is preserved in `.agent/current/NOTIFY_FAILED.md`.
+  when the calling runtime provides it. There is **no guessing from local history**;
+  without a target the helper fails closed (`exit 14`) and blocking mode is used.
+- Codex is woken **once per stop**, not once per Task: phase review, checkpoint,
+  escalation or plumbing stop.
+- `exit 15` means the loop finished but the wake-up could not be delivered: the
+  message is preserved in `.agent/current/NOTIFY_FAILED.md`.
 - Requires the ChatGPT/Codex desktop app to stay open **with the target session
-  open**: an open session can be woken; a closed or archived one cannot.
-- The wake-up message is a short `[worker-notify] ...` user message in the same
-  session. It enters the context, so keep it short.
-- While the worker runs, the helper holds a `caffeinate -i` assertion so the Mac
-  does not idle-sleep. It cannot prevent lid-close sleep: for unattended runs, plug
-  in and keep the lid open.
-
-How the loop actually runs:
-
-- In blocking mode, Codex blocks on the shell call and continues in the same turn
-  when it returns - that is what makes "ACCEPT -> next Task" automatic.
-- In wake-up mode, Codex ends its turn immediately; the `codex queue` message
-  starts a new turn in the same session so Codex can review and hand off the next
-  Task. No polling, no third process.
-- Implementation tokens are paid by OpenCode's model, not by Codex; Codex only
-  spends on phase/task planning, the small handoff commands, and reviewing
-  RESULT/diff/test output. That is the intended usage saving.
-- Worker sessions are visible in OpenCode Desktop, not in Codex.
+  open**. While the loop runs, the helper holds a `caffeinate -i` assertion.
 
 ## Project runtime directory
 
@@ -281,32 +307,69 @@ First use in a target project creates:
 
 ```
 .agent/
-├── RUN_STATE.json         # target phase, current phase/task, status
+├── RUN_STATE.json         # phase, current task, status, stop_reason
 ├── current/
-│   ├── TASK.md            # the one Task being executed
-│   ├── RESULT.md          # after a successful run
-│   ├── ESCALATION.md      # after an escalation
-│   ├── REVIEW.md          # Supervisor rework notes (only when reworking)
-│   ├── STATE.json         # task id, mode, status, baseline, session id
-│   └── logs/              # raw opencode JSON event streams (debug aid)
+│   ├── TASK.md            # the one Task being executed (rendered from the queue)
+│   ├── RESULT.md          # after a successful worker run
+│   ├── ESCALATION.md      # after a CHECKPOINT / ESCALATE stop
+│   ├── VERIFY.md          # deterministic evidence-gate result (written by the loop)
+│   ├── REVIEW.md          # Codex corrections for a re-run (only when reworking)
+│   ├── STATE.json         # run id, task, status, baseline, session id
+│   ├── .worker.lock       # single-worker lock (wrapper pid + worker pid)
+│   ├── .phase.lock        # single-loop lock
+│   └── logs/              # raw opencode JSON event streams + loop logs
 ├── phases/<PHASE>/
 │   ├── PHASE.md
-│   ├── TASK_QUEUE.json
-│   └── history/           # archived Task artifacts (optional, simple)
-└── history/               # archive-task.sh output (optional, simple)
+│   ├── TASK_QUEUE.json    # the machine-readable plan (Codex owns this file)
+│   ├── PHASE_REVIEW.md    # the Phase verification run(s)
+│   └── history/           # TASK-<id>.md, VERIFY-<id>.md per Task
+└── history/               # archives: <stamp>-<task>/ with RESULT, VERIFY, diff base
 ```
 
 `.agent/` is runtime state only. Architecture, roadmap, product and design docs
 stay in their normal locations (`ROADMAP.md`, `docs/`, `AGENTS.md`). If the
 project has an `AGENTS.md`, the worker must read it.
 
+## State machine
+
+`RUN_STATE.json.status` is one of:
+
+| Status | Meaning | Who moves it on |
+| --- | --- | --- |
+| `idle` | planned but not running / human gate cleared | `run-phase.sh` starts |
+| `running` | the loop is executing Tasks | the loop |
+| `checkpoint` | the loop stopped for a Codex decision (`stop_reason`) | Codex, then `run-phase.sh` |
+| `escalated` | a Task is blocked; the loop refuses to continue | Codex (queue), then `run-phase.sh` |
+| `awaiting_phase_review` | all Tasks done, Phase verification passed | Codex: `phase-gate.sh review-pass/fail` |
+| `awaiting_human_qa` | the review passed; the human decides | the human: `phase-gate.sh qa-pass/fail` |
+
+`check-state.sh` prints one verdict for resume: `RUNNING`, `QUEUE_COMPLETE`, `EMPTY`,
+`CHECKPOINT`, `ESCALATED`, `AWAITING_PHASE_REVIEW`, `AWAITING_HUMAN_QA`,
+`WORKER_RUNNING` or `INCONSISTENT` (exit `0` = actionable, `1` = stop).
+
+## When the loop stops (checkpoint / escalation rules)
+
+Stops are not failures: they are where Codex is supposed to spend tokens.
+
+- **guarded Task** (`risk: guarded` - architecture, public API, schema/data
+  migration, security, permissions, credentials, deployment): runs, then the loop
+  stops for a Codex review before the next Task.
+- **worker `CHECKPOINT`**: the worker needs a decision (those same topics, scope
+  growth, unverifiable acceptance, product intent, material uncertainty).
+- **worker `ESCALATE` / failed evidence gate**: two attempts failed, the Task is
+  contradictory, or the verification does not pass.
+- **plumbing**: no/conflicting/stale report, worker lock, unproven stale lock,
+  `opencode` non-zero exit, inconsistent state.
+- **end of Phase** (always): `awaiting_phase_review`, never the next Phase.
+
 ## Smoke tests
 
-`tests/smoke/` creates throwaway git repos under the system temp directory. It
-never touches real projects. See `tests/smoke/README.md`.
+`tests/smoke/` creates throwaway git repos under the system temp directory and
+runs the scripts from **this source tree**. It never touches real projects and
+never installs anything. See `tests/smoke/README.md`.
 
 ```sh
-tests/smoke/run-offline.sh                  # no model calls (149 checks)
+tests/smoke/run-offline.sh                  # no model calls (266 checks)
 tests/smoke/run-live.sh                     # all live tests (OpenCode default model)
 SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh  # keep the generated repos
 ```
@@ -318,51 +381,51 @@ quota errors (HTTP 429); otherwise they fail loudly. They never silently pass.
 
 State lives in files:
 
-- `.agent/RUN_STATE.json` - phase/task/status of the whole run
-- `.agent/phases/<PHASE>/TASK_QUEUE.json` - the Task queue and its history
+- `.agent/RUN_STATE.json` - phase/task/status/stop_reason of the whole run
+- `.agent/phases/<PHASE>/TASK_QUEUE.json` - the plan and per-Task history
 - `.agent/current/STATE.json` - current Task, baseline, session id, last result
+- `.agent/current/VERIFY.md` - the evidence-gate result of the last run
 
-On resume the Supervisor reads these first and continues from the recorded
-`in_progress` Task. Completed Tasks are never re-run. See
-`skills/phase-runner/SKILL.md` section "Resume".
+On resume run `check-state.sh` first; then `run-phase.sh` continues from the
+recorded `in_progress` Task (it re-renders `TASK.md` from the queue, so a blank or
+stale TASK.md repairs itself). Completed Tasks are never re-run.
 
 ## Human checkpoint
 
-When the human asks to stop after a Phase, the Supervisor finishes the Phase,
-runs the phase verification, writes `RUN_STATE.json` with
-`status: awaiting_human_qa`, reports, and stops. It does not start the next Phase.
-Defects reported during manual QA become new Tasks with the same loop. See
-`skills/phase-runner/references/human-checkpoint.md`.
+When the last Task is done, the loop stops at `awaiting_phase_review`. Codex does
+the integration review, and only `review-pass` moves the state to
+`awaiting_human_qa`. Then Codex reports, and **stops**: no next Phase, no extra
+Tasks. After the human tests, `qa-pass` (or `qa-fail` for defects) records the
+verdict. See `skills/phase-runner/references/human-checkpoint.md`.
 
 ## Known limitations (V1)
 
 - Model choice is entirely OpenCode's: if the configured default model is slow,
-  rate-limited or unreachable, the worker fails with a plumbing error (exit 2)
-  and the Supervisor decides. There is no fallback and no router.
-- The Supervisor loop is played by the current Codex/Astra session; there is no
-  separate orchestrator daemon. Wake-up mode requires the ChatGPT/Codex desktop app
-  to stay open with the orchestration session open (its daemon owns the session and
-  the message queue; closed or archived sessions cannot be woken).
-- Session wake-up requires an **exact** target (`--codex-thread` or
-  `CODEX_THREAD_ID`); the helper refuses to guess from Codex's local history, so
-  without a target the Supervisor falls back to blocking mode.
+  rate-limited or unreachable, the worker fails with a plumbing error and the loop
+  stops at a checkpoint. There is no fallback and no router.
+- The Supervisor is the current Codex/Astra session; there is no separate
+  orchestrator daemon. Wake-up mode requires the ChatGPT/Codex desktop app to stay
+  open with the orchestration session open.
 - `run-worker.sh` has no built-in wall-clock timeout (OpenCode's own behavior and
   the caller's timeout apply). `worker-notify.sh` solves the timeout problem by
-  detaching, but it cannot prevent lid-close sleep or a manual shutdown, and
-  a worker that is still alive behind a dead wrapper blocks new runs until the
-  lock is cleared with `--break-lock`.
-- Reports are model-written Markdown; they can be wrong. The diff and command
-  output are the evidence.
+  detaching, but it cannot prevent lid-close sleep or a manual shutdown.
+- Reports are model-written Markdown; they can be wrong. The re-run verification,
+  the diff scope and the diff itself are the evidence.
 - The worker prompt embeds the contract, so the worker never needs to read the
-  skill directory. This is deliberate: OpenCode's `external_directory` permission
-  defaults to `ask`, which auto-rejects in non-interactive runs.
+  skill directory (OpenCode's `external_directory` permission defaults to `ask`).
+- Verification commands come from the queue and run via `bash -c` in the project
+  root: they must be non-interactive, deterministic and reasonably fast.
 - The installer's `rsync --delete` mirror mode assumes the target directory is
-  fully managed by this project (it is marked as such). `--target` is test-only.
+  fully managed by this project. `--target` is test-only.
 - macOS bash 3.2 compatible; not tested on Windows.
 
 ## Development rules
 
-- One Task = one coherent change.
-- The worker never edits its own TASK.md, the queue, or `RUN_STATE.json`.
-- The Supervisor never lets a worker plan.
-- Do not add databases, queues, daemons, dashboards or recursive agents to V1.
+- One Task = one coherent change with one verification story.
+- The worker never edits its own TASK.md, the queue, or `RUN_STATE.json` (the
+  evidence gate fails the Task if it does).
+- Codex never reviews a Task result and never edits code inside the loop: a fix is
+  a Task like any other.
+- A Phase always ends at `awaiting_phase_review`; the human gate is not optional.
+- Do not add databases, queues, daemons, dashboards, DAGs, parallel workers or
+  recursive agents to V1.

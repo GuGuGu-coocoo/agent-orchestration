@@ -1,38 +1,39 @@
 #!/usr/bin/env bash
-# check-state.sh - read-only consistency check before resuming a Phase.
+# check-state.sh - read-only consistency check and resume verdict for a Phase.
 #
 # Cross-checks the files that must agree after an interruption:
-#   .agent/current/.worker.lock   (a live wrapper or worker process?)
+#   .agent/current/.worker.lock   (a live worker wrapper / worker process?)
+#   .agent/current/.phase.lock    (a live phase loop?)
 #   .agent/RUN_STATE.json         (phase/task/status - required, structured)
 #   .agent/phases/<phase>/TASK_QUEUE.json
 #   .agent/current/TASK.md        (the Task in flight)
 #   .agent/current/STATE.json     (run id / task / result of the last run)
-#   .agent/current/{RESULT,ESCALATION}.md
-#   .agent/history/*              (archives for done tasks)
+#   .agent/current/{RESULT,ESCALATION,VERIFY}.md
+#   .agent/history/*              (archives for done Tasks)
 #
 # It is fail-closed: an empty, unreadable, wrongly-structured or missing required
 # file is an ISSUE, never a default value. It never changes anything.
 #
 # Verdicts (printed as "verdict: <V>"):
-#   WORKER_RUNNING    a wrapper or worker process is alive - wait, do not start
-#   ESCALATED         the queue holds an escalated Task - Supervisor decision
-#   BLOCKED           RUN_STATE says blocked - resolve before resuming
-#   CHECKPOINT        awaiting_human_qa - stop and hand over to the human
-#   INCONSISTENT      files disagree, are missing, or are unreadable - fix first
-#   REVIEW_OR_RESUME  an in_progress Task: report ready -> review, else re-run it
-#   NEXT              a pending Task is ready to hand off
-#   PHASE_COMPLETE    every Task is done - run the phase final review
-#   EMPTY             a fresh project (no .agent state at all)
+#   WORKER_RUNNING        a worker or phase loop process is alive - do not start
+#   INCONSISTENT          files disagree, are missing, or are unreadable - fix first
+#   ESCALATED             the loop stopped on a blocker (status or a Task) - Codex
+#   CHECKPOINT            the loop stopped for a Codex decision (status=checkpoint)
+#   AWAITING_PHASE_REVIEW Tasks are done, the Phase waits for the Codex review
+#   AWAITING_HUMAN_QA     the review passed, the human decides the next Phase
+#   RUNNING               the loop may continue (pending/in_progress Tasks)
+#   QUEUE_COMPLETE        a queue with no runnable Task left (Phase review, or
+#                         Codex adds a corrective Task)
+#   EMPTY                 a fresh project (no .agent state at all)
 #
-# Exit codes: 0 = actionable (REVIEW_OR_RESUME / NEXT / PHASE_COMPLETE / EMPTY),
-#             1 = stop (WORKER_RUNNING / ESCALATED / BLOCKED / CHECKPOINT / INCONSISTENT).
+# Exit codes: 0 = actionable (RUNNING / QUEUE_COMPLETE / EMPTY), 1 = stop (the rest).
 #
 # Usage:
 #   check-state.sh [--root DIR]
 
 set -euo pipefail
 
-usage() { sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
 
 ISSUES=0
 issue() { printf '  ISSUE   %s\n' "$*"; ISSUES=$((ISSUES + 1)); }
@@ -56,7 +57,6 @@ jqv() {
     printf '%s' "$fallback"
 }
 
-# valid_object <file> -> 0 when the file is a non-empty JSON object
 valid_object() {
     local file="$1"
     [[ -s "$file" ]] || return 1
@@ -74,6 +74,11 @@ report_status_of() {
     awk '/^## Status[[:space:]]*$/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' "$1"
 }
 
+report_class_of() {
+    [[ -f "$1" ]] || { printf ''; return 0; }
+    awk '/^## Class[[:space:]]*$/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' "$1"
+}
+
 section_nonempty() {
     awk -v h="$2" '
         $0 == "## " h || $0 ~ "^## " h "[[:space:]]*$" { f=1; next }
@@ -82,9 +87,22 @@ section_nonempty() {
     ' "$1" | grep -v '^[[:space:]]*<!--' | grep -v '^[[:space:]]*$' | head -1 || true
 }
 
+live_pid_in() {  # live_pid_in <lock-dir> -> prints "wrapper:<pid>|worker:<pid>" when live
+    local lock="$1" lpid="" wpid=""
+    [[ -d "$lock" ]] || return 1
+    [[ -f "$lock/info" ]] || return 1
+    lpid="$(awk -F= '/^pid=/{print $2}' "$lock/info" | head -1)"
+    wpid="$(awk -F= '/^worker_pid=/{print $2}' "$lock/info" | head -1)"
+    if [[ -n "$lpid" ]] && kill -0 "$lpid" 2>/dev/null; then printf 'wrapper:%s' "$lpid"; return 0; fi
+    if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then printf 'worker:%s' "$wpid"; return 0; fi
+    return 1
+}
+
 VERDICT=""
 STOP=1
-set_verdict() { VERDICT="$1"; case "$1" in REVIEW_OR_RESUME|NEXT|PHASE_COMPLETE|EMPTY) STOP=0 ;; esac; }
+set_verdict() { VERDICT="$1"; case "$1" in RUNNING|EMPTY|QUEUE_COMPLETE) STOP=0 ;; esac; }
+
+KNOWN_STATES="idle running checkpoint escalated awaiting_phase_review awaiting_human_qa"
 
 main() {
     local root_arg=""
@@ -100,39 +118,33 @@ main() {
     root="$(resolve_root "$root_arg")"
     agent="$root/.agent"
     current="$agent/current"
-
     printf 'check-state: %s\n\n' "$root"
 
-    # --- a fresh project has no .agent state ------------------------------------
     if [[ ! -d "$agent" ]]; then
-        printf 'verdict: EMPTY - no .agent/ state at all (fresh project; start from phase intake)\n'
+        printf 'verdict: EMPTY - no .agent/ state at all (fresh project; plan the Phase first)\n'
         exit 0
     fi
 
-    # --- lock: both the wrapper pid and the worker pid matter -------------------
-    local lock="$current/.worker.lock" lock_live=0
-    if [[ -d "$lock" ]]; then
-        local lpid="" wpid=""
-        [[ -f "$lock/info" ]] && {
-            lpid="$(awk -F= '/^pid=/{print $2}' "$lock/info" | head -1)"
-            wpid="$(awk -F= '/^worker_pid=/{print $2}' "$lock/info" | head -1)"
-        }
-        if [[ -n "$lpid" ]] && kill -0 "$lpid" 2>/dev/null; then
-            lock_live=1
-            ok "worker lock held by a LIVE wrapper (pid $lpid): $(tr '\n' ' ' <"$lock/info")"
-        elif [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
-            lock_live=1
-            ok "worker lock held by a LIVE worker process (pid $wpid): $(tr '\n' ' ' <"$lock/info")"
-        else
-            warn "stale worker lock (no live pid); run-worker will refuse until --break-lock is passed after verification"
-        fi
+    # --- live processes -----------------------------------------------------------------
+    local worker_live="" phase_live=""
+    worker_live="$(live_pid_in "$current/.worker.lock" || true)"
+    phase_live="$(live_pid_in "$current/.phase.lock" || true)"
+    if [[ -n "$worker_live" ]]; then
+        ok "worker lock held by a LIVE process ($worker_live): $(tr '\n' ' ' <"$current/.worker.lock/info")"
+    elif [[ -d "$current/.worker.lock" ]]; then
+        warn "stale worker lock (no live pid); run-worker refuses until --break-lock is passed after verification"
     else
         ok "no worker lock"
     fi
+    if [[ -n "$phase_live" ]]; then
+        ok "phase lock held by a LIVE loop ($phase_live): $(tr '\n' ' ' <"$current/.phase.lock/info")"
+    elif [[ -d "$current/.phase.lock" ]]; then
+        warn "stale phase lock (no live pid); run-phase refuses until --break-lock is passed after verification"
+    fi
 
-    # --- RUN_STATE is required and must be a structured object -------------------
+    # --- RUN_STATE ------------------------------------------------------------------------
     local run_state="$agent/RUN_STATE.json"
-    local phase="" rs_task="" rs_status="" target=""
+    local phase="" rs_task="" rs_status="" rs_reason=""
     if [[ ! -e "$run_state" ]]; then
         if [[ -d "$current" || -d "$agent/phases" ]]; then
             issue "RUN_STATE.json is missing while other .agent state exists"
@@ -146,18 +158,22 @@ main() {
         phase="$(jqv "$run_state" '.current_phase')"
         rs_task="$(jqv "$run_state" '.current_task')"
         rs_status="$(jqv "$run_state" '.status')"
-        target="$(jqv "$run_state" '.target_phase')"
-        [[ -n "$rs_status" ]] || issue "RUN_STATE.json has no status"
-        if [[ -n "$rs_status" && ! "$rs_status" =~ ^(running|blocked|awaiting_human_qa|idle)$ ]]; then
-            issue "RUN_STATE.status '$rs_status' is not a known state"
+        rs_reason="$(jqv "$run_state" '.stop_reason')"
+        if [[ -z "$rs_status" ]]; then
+            issue "RUN_STATE.json has no status"
+        elif [[ " $KNOWN_STATES " != *" $rs_status "* ]]; then
+            issue "RUN_STATE.status '$rs_status' is not a known state (idle|running|checkpoint|escalated|awaiting_phase_review|awaiting_human_qa)"
         fi
-        ok "RUN_STATE: phase=${phase:-?} task=${rs_task:-?} status=${rs_status:-?} target=${target:-?}"
+        ok "RUN_STATE: phase=${phase:-?} task=${rs_task:-?} status=${rs_status:-?} stop_reason=${rs_reason:-none}"
+        if [[ "$rs_status" == "checkpoint" && -z "$rs_reason" ]]; then
+            warn "status=checkpoint but no stop_reason is recorded"
+        fi
     fi
 
-    # --- queue must exist for the current phase and be structurally sound -------
+    # --- queue ---------------------------------------------------------------------------
     local pending="" in_progress="" done_list="" escalated="" queue=""
     local phase_required=0
-    if [[ "$rs_status" =~ ^(running|blocked|awaiting_human_qa)$ ]]; then
+    if [[ " running checkpoint escalated awaiting_phase_review awaiting_human_qa " == *" $rs_status "* ]]; then
         phase_required=1
     fi
     if [[ "$phase_required" -eq 1 && -z "$phase" ]]; then
@@ -172,21 +188,20 @@ main() {
         elif ! jq -e '(.tasks | type) == "array"' "$queue" >/dev/null 2>&1; then
             issue "$queue has no tasks array"
         else
-            # Each Task must be an object with a non-empty string id and a valid
-            # status; missing fields and type errors are ISSUES, not defaults.
-            local bad=""
+            local bad dup
             bad="$(jq -r '[
                 .tasks[] | . as $t | select(
                   ($t | type != "object")
                   or ($t.id | (type != "string") or (length == 0))
                   or ($t.status | (type != "string") or (["pending","in_progress","done","escalated","dropped"] | index($t.status) | not))
+                  or ((($t.verification // []) | length) == 0)
                 )] | length' "$queue" 2>/dev/null || printf '1')"
-            local dup="0"
+            dup="0"
             if [[ "$bad" == "0" ]]; then
                 dup="$(jq -r '[.tasks[].id] as $ids | (($ids | length) - ($ids | unique | length))' "$queue" 2>/dev/null || printf '1')"
             fi
             if [[ "$bad" != "0" ]]; then
-                issue "$queue has Tasks that are not objects, or have a missing/empty/non-string id, or an unknown status"
+                issue "$queue has Tasks that are not objects, or have a missing/invalid id or status, or no verification commands"
             elif [[ "$dup" != "0" ]]; then
                 issue "$queue has duplicate Task ids"
             else
@@ -199,12 +214,12 @@ main() {
         fi
     fi
 
-    # --- current/STATE.json must be readable when it exists ---------------------
+    # --- current/STATE.json ----------------------------------------------------------------
     if [[ -e "$current/STATE.json" ]] && ! valid_object "$current/STATE.json"; then
         issue "current/STATE.json exists but is empty or not a JSON object"
     fi
 
-    # --- current task / state / reports -----------------------------------------
+    # --- current task / state / reports -----------------------------------------------------
     local cur_task state_task result="none" escalation="none" result_ok=0 escalation_ok=0
     cur_task="$(task_id_of "$current/TASK.md")"
     [[ -n "$cur_task" && "$cur_task" == *"<"* ]] && cur_task=""
@@ -219,7 +234,7 @@ main() {
         result="$(task_id_of "$current/RESULT.md")"
         local rstatus
         rstatus="$(report_status_of "$current/RESULT.md")"
-        if [[ "$rstatus" == "DONE" ]]; then result_ok=1; else result_ok=0; fi
+        [[ "$rstatus" == "DONE" ]] && result_ok=1
         ok "RESULT.md: task='${result:-?}' status='${rstatus:-<none>}'"
         if [[ "$result_ok" -ne 1 ]]; then
             issue "RESULT.md is present but not acceptable (Status must be DONE)"
@@ -230,91 +245,100 @@ main() {
     fi
     if [[ -s "$current/ESCALATION.md" ]]; then
         escalation="$(task_id_of "$current/ESCALATION.md")"
+        local esc_class
+        esc_class="$(report_class_of "$current/ESCALATION.md")"
         [[ -n "$(section_nonempty "$current/ESCALATION.md" "Current Blocker")" ]] && escalation_ok=1 || escalation_ok=0
-        ok "ESCALATION.md: task='${escalation:-?}' blocker=$([[ "$escalation_ok" -eq 1 ]] && echo yes || echo missing)"
+        ok "ESCALATION.md: task='${escalation:-?}' class='${esc_class:-<missing>}' blocker=$([[ "$escalation_ok" -eq 1 ]] && echo yes || echo missing)"
         if [[ "$escalation_ok" -ne 1 ]]; then
             issue "ESCALATION.md is present but has no Current Blocker"
         fi
+        case "$esc_class" in
+            CHECKPOINT|ESCALATE) : ;;
+            "") warn "ESCALATION.md has no Class (CHECKPOINT|ESCALATE); a missing class is treated as ESCALATE" ;;
+            *) warn "ESCALATION.md Class '$esc_class' is not recognised; it is treated as ESCALATE" ;;
+        esac
+    fi
+    if [[ -s "$current/VERIFY.md" ]]; then
+        ok "VERIFY.md (evidence gate) present: $(grep -m1 -E '^- result: ' "$current/VERIFY.md" || printf 'result: <none>')"
     fi
 
-    # --- consistency --------------------------------------------------------------
+    # --- consistency --------------------------------------------------------------------------
     if [[ -n "$in_progress" ]]; then
         local ip_first="${in_progress%%,*}"
         [[ "$cur_task" == "$ip_first" ]] || issue "queue says in_progress=$ip_first but current/TASK.md is '${cur_task:-<none>}' (rewrite TASK.md from the saved definition before resuming)"
-        [[ -z "$state_task" || "$state_task" == "$ip_first" ]] || issue "current/STATE.json belongs to task '$state_task' but queue is on '$ip_first'"
+        [[ -z "$state_task" || "$state_task" == "$ip_first" ]] || issue "current/STATE.json belongs to task '$state_task' but the queue is on '$ip_first'"
         [[ -n "$rs_task" && "$rs_task" != "$ip_first" ]] && issue "RUN_STATE.current_task='$rs_task' does not match the queue in_progress='$ip_first'"
         [[ "$in_progress" == *","* ]] && issue "more than one Task is in_progress in the queue: $in_progress (only one may be)"
-        if [[ -z "$escalation" || "$escalation" == "none" ]]; then :; elif [[ "$escalation" != "$ip_first" ]]; then
+        if [[ "$escalation" != "none" && "$escalation" != "$ip_first" ]]; then
             issue "ESCALATION.md belongs to task '$escalation' but the queue is on '$ip_first'"
         fi
         if ls -d "$agent/history"/*"-${ip_first}" >/dev/null 2>&1; then
             issue "Task '$ip_first' already has an archive but is still in_progress (verify the archived RESULT, then mark it done instead of re-running)"
         fi
-    elif [[ -z "$pending" && -n "$done_list" ]]; then
-        if [[ "$rs_status" != "awaiting_human_qa" && "$rs_status" != "done" ]]; then
-            warn "all queue tasks are done but RUN_STATE.status=$rs_status (expected awaiting_human_qa after the phase review)"
-        fi
-    elif [[ -n "$rs_task" && -z "$pending" && -z "$done_list" && -z "$escalated" ]]; then
-        warn "RUN_STATE.current_task='$rs_task' but the queue is empty"
     fi
     if [[ "$result" != "none" && "$escalation" != "none" ]]; then
         issue "both RESULT.md and ESCALATION.md exist; resolve before resuming"
     fi
-    if [[ "$rs_status" == "awaiting_human_qa" ]]; then
+    if [[ "$rs_status" == "awaiting_phase_review" || "$rs_status" == "awaiting_human_qa" ]]; then
         if [[ -n "$pending" || -n "$in_progress" ]]; then
-            issue "RUN_STATE is awaiting_human_qa but the queue still has pending/in_progress Tasks"
+            issue "RUN_STATE is $rs_status but the queue still has pending/in_progress Tasks"
         fi
     fi
+    if [[ "$rs_status" == "escalated" && -z "$escalated" ]]; then
+        warn "status=escalated but no Task is marked escalated"
+    fi
 
-    # --- archives for done tasks ----------------------------------------------------
-    # A missing archive for a done Task is an evidence-completeness warning (the
-    # Task is skipped either way); an archive for an in_progress Task is a
-    # blocking inconsistency (handled above).
+    # --- archives for done tasks --------------------------------------------------------------
     local t
     if [[ -n "$done_list" ]]; then
         for t in ${done_list//,/ }; do
             if ! ls -d "$agent/history"/*"-${t}" >/dev/null 2>&1; then
-                warn "done Task '$t' has no archive (verify its RESULT in the queue history if the evidence matters)"
+                warn "done Task '$t' has no archive (verify its evidence in the queue history if it matters)"
             fi
         done
     fi
 
-    # --- verdict (stop states first) -------------------------------------------------
-    if [[ "$lock_live" -eq 1 ]]; then
+    # --- verdict -------------------------------------------------------------------------------
+    if [[ -n "$worker_live" || -n "$phase_live" ]]; then
         set_verdict "WORKER_RUNNING"
-    elif [[ -n "$escalated" ]]; then
-        set_verdict "ESCALATED"
-    elif [[ "$rs_status" == "blocked" ]]; then
-        set_verdict "BLOCKED"
-    elif [[ "$rs_status" == "awaiting_human_qa" ]]; then
-        set_verdict "CHECKPOINT"
     elif [[ "$ISSUES" -gt 0 ]]; then
         set_verdict "INCONSISTENT"
-    elif [[ -n "$in_progress" ]]; then
-        if [[ "$result_ok" -eq 1 || "$escalation_ok" -eq 1 ]]; then
-            set_verdict "REVIEW_OR_RESUME"
-        else
-            set_verdict "REVIEW_OR_RESUME"
-        fi
-    elif [[ -n "$pending" ]]; then
-        set_verdict "NEXT"
-    elif [[ -n "$done_list" ]]; then
-        set_verdict "PHASE_COMPLETE"
+    elif [[ -n "$escalated" || "$rs_status" == "escalated" ]]; then
+        set_verdict "ESCALATED"
+    elif [[ "$rs_status" == "checkpoint" ]]; then
+        set_verdict "CHECKPOINT"
+    elif [[ "$rs_status" == "awaiting_phase_review" ]]; then
+        set_verdict "AWAITING_PHASE_REVIEW"
+    elif [[ "$rs_status" == "awaiting_human_qa" ]]; then
+        set_verdict "AWAITING_HUMAN_QA"
+    elif [[ -n "$pending" || -n "$in_progress" ]]; then
+        set_verdict "RUNNING"
+    elif [[ -n "$queue" && -f "$queue" ]]; then
+        set_verdict "QUEUE_COMPLETE"
     else
         set_verdict "EMPTY"
     fi
 
     printf '\nverdict: %s' "$VERDICT"
     case "$VERDICT" in
-        WORKER_RUNNING)   printf ' - do not start another worker; wait for the report or the [worker-notify] message\n' ;;
-        ESCALATED)        printf ' - Task(s) %s need a Supervisor decision; read ESCALATION.md or the queue history\n' "${escalated:-?}" ;;
-        BLOCKED)          printf ' - RUN_STATE says blocked; resolve the blocker before resuming\n' ;;
-        CHECKPOINT)       printf ' - awaiting_human_qa: stop here; the human decides the next Phase\n' ;;
-        INCONSISTENT)     printf ' (%d issue(s)) - fix the issues above before resuming\n' "$ISSUES" ;;
-        REVIEW_OR_RESUME) printf ' task=%s - report acceptable=%s; review it, or re-run the same Task (run-worker.sh --allow-dirty)\n' "${in_progress%%,*}" "$([[ "$result_ok" -eq 1 || "$escalation_ok" -eq 1 ]] && echo yes || echo no)" ;;
-        NEXT)             printf ' task=%s - hand it off from the queue\n' "${pending%%,*}" ;;
-        PHASE_COMPLETE)   printf ' - run the phase final review, then awaiting_human_qa\n' ;;
-        EMPTY)            printf ' - no queue state found\n' ;;
+        WORKER_RUNNING)
+            printf ' - a worker or phase loop is alive; do not start another\n' ;;
+        INCONSISTENT)
+            printf ' (%d issue(s)) - fix the issues above before resuming\n' "$ISSUES" ;;
+        ESCALATED)
+            printf ' task=%s - Codex must resolve the blocker (queue history / ESCALATION.md)\n' "${escalated:-${rs_task:-?}}" ;;
+        CHECKPOINT)
+            printf ' task=%s - Codex decision needed (%s); read .agent/current/ then run run-phase.sh again\n' "${rs_task:-?}" "${rs_reason:-no stop_reason}" ;;
+        AWAITING_PHASE_REVIEW)
+            printf ' - all Tasks done; Codex phase review required (phase-gate.sh review-pass|review-fail)\n' ;;
+        AWAITING_HUMAN_QA)
+            printf ' - stop here; the human decides (phase-gate.sh qa-pass|qa-fail after the verdict)\n' ;;
+        RUNNING)
+            printf ' - next=%s in_progress=%s; continue with run-phase.sh\n' "${pending:-none}" "${in_progress:-none}" ;;
+        QUEUE_COMPLETE)
+            printf ' - no runnable Task left in phase %s; run run-phase.sh for the Phase verification, or add a Task (Codex)\n' "${phase:-?}" ;;
+        EMPTY)
+            printf ' - no queue state found (fresh project)\n' ;;
     esac
 
     [[ "$STOP" -eq 0 ]]

@@ -20,20 +20,17 @@
 ## Phase Acceptance Criteria
 - [ ] <observable end-to-end criterion>
 - [ ] <observable end-to-end criterion>
-- [ ] <automated verification green>
+- [ ] automated verification green
 
 ## Required Phase Verification
+<!-- These commands are ALSO machine-readable: keep them in TASK_QUEUE.json
+     "phase_verification" so run-phase.sh and phase-gate.sh can run them. -->
 - `<exact command>` - <expected result>
 - `<exact command>` - <expected result>
-- <manual check that does not need the human, if any>
 
 ## Human QA Required
 - <what the human must test by hand before accepting the Phase>
 - <how to run it (commands/UI steps)>
 
 ## Result
-<!-- Written ONLY at phase completion by the Supervisor -->
-- Tasks completed: <ids>
-- Verification: <commands + results>
-- Deviations from plan: <none | list + reasons>
-- Risks / follow-ups for later Phases: <none | list>
+<!-- Written by phase-gate.sh review-pass; do not hand-edit before the review. -->

@@ -30,4 +30,11 @@ specific action. Ambiguity means no.
 ## Escalation instead of guessing
 
 If a safety boundary blocks the Task, write `ESCALATION.md` with the exact
-permission or decision needed. Do not work around the boundary.
+permission or decision needed (see `escalation-policy.md` for the CHECKPOINT vs
+ESCALATE split). Do not work around the boundary.
+
+## After a stop
+
+The Phase loop (`run-phase.sh`) stops as well and hands the report to Codex. Do
+not continue with anything else, do not fix unrelated things, and do not start a
+different Task.
