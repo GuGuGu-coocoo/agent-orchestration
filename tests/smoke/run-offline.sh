@@ -46,7 +46,7 @@ else
 fi
 check "doctor.sh reports no problems" grep -q 'result: 0 problem' "$OUT_DIR/doctor.log"
 check "doctor.sh checks the shared background service" grep -q 'background service' "$OUT_DIR/doctor.log"
-check "doctor.sh reports the model policy" grep -q 'CHEAP_WORKER_MODELS not set' "$OUT_DIR/doctor.log"
+check "doctor.sh verifies no --model is passed" grep -q 'never passes --model' "$OUT_DIR/doctor.log"
 check "doctor.sh verifies no --standalone is used" grep -q 'never uses --standalone' "$OUT_DIR/doctor.log"
 
 # --- 3. run-worker.sh precondition failures ------------------------------------
@@ -65,22 +65,17 @@ write_task "$repo" "OFF1" "implement" "objective" "existing" "desired" \
     "- [ ] done" '`python3 app.py` exits 0' "none"
 
 # --- 3b. no model configuration layer ------------------------------------------
-# model policy: no --model is passed by default; the opt-in list is used verbatim
 worker_code="$(grep -v '^[[:space:]]*#' "$WORKER")"
-if printf '%s\n' "$worker_code" | grep -q 'CHEAP_WORKER_MODELS'; then
-    pass "run-worker.sh guards its model list behind CHEAP_WORKER_MODELS"
+if printf '%s\n' "$worker_code" | grep -q -- '--model'; then
+    fail "run-worker.sh must not pass --model"
 else
-    fail "run-worker.sh lost the CHEAP_WORKER_MODELS guard"
+    pass "run-worker.sh never passes --model"
 fi
 if printf '%s\n' "$worker_code" | grep -q -- '--standalone'; then
     fail "run-worker.sh must not use --standalone"
 else
     pass "run-worker.sh never uses --standalone"
 fi
-(cd "$repo" && "$WORKER" --mode implement --dry-run) >"$OUT_DIR/dryrun-nomodel.log" 2>&1 || true
-check "dry-run without CHEAP_WORKER_MODELS has no --model" bash -c "! sed -n '/^  command/p' '$OUT_DIR/dryrun-nomodel.log' | grep -q -- '--model'"
-(cd "$repo" && CHEAP_WORKER_MODELS="deepseek/deepseek-flash" "$WORKER" --mode implement --dry-run) >"$OUT_DIR/dryrun-model.log" 2>&1 || true
-check "dry-run reports the opt-in model priority" grep -q 'model priority: deepseek/deepseek-flash' "$OUT_DIR/dryrun-model.log"
 
 if (cd "$repo" && "$WORKER" --mode implement --model foo/bar) >"$OUT_DIR/model-flag.log" 2>&1; then
     fail "run-worker.sh should reject an unknown --model flag"
@@ -98,7 +93,7 @@ fi
 check "dry-run reports the task" grep -q 'task         : OFF1' "$OUT_DIR/dryrun.log"
 check "dry-run reports a session title" grep -q 'session title: cheap-worker · OFF1' "$OUT_DIR/dryrun.log"
 check "dry-run reports the opencode command" grep -q 'opencode run --agent' "$OUT_DIR/dryrun.log"
-if sed -n '/^  command/p' "$OUT_DIR/dryrun.log" | grep -q -- '--model' 2>/dev/null; then
+if grep -q -- '--model' "$OUT_DIR/dryrun.log" 2>/dev/null; then
     fail "dry-run must not mention --model"
 else
     pass "dry-run command has no --model"
@@ -492,53 +487,6 @@ FAKE_RC=0
     "$HRUN" --root "$hrepo" --allow-dirty --mode implement ) >"$OUT_DIR/fake-run2.log" 2>&1 || FAKE_RC=$?
 check_eq "harness: --root run succeeds from another directory" "0" "$FAKE_RC"
 check_eq "harness: opencode still ran in the project root" "$HROOT" "$(tail -1 "$HARNESS/cwd.log")"
-
-# --- CHEAP_WORKER_MODELS: free-first with quota-only fallback ---------------------
-QBIN="$HARNESS/qbin"
-mkdir -p "$QBIN"
-cp "$SMOKE_DIR/assets/fake-opencode.sh" "$QBIN/opencode"
-chmod +x "$QBIN/opencode"
-QARGS="$HARNESS/qbin.args"
-QCOUNTER="$HARNESS/qbin.counter"
-MODEL_FREE="opencode/muse-spark-1.3-contributor-free"
-MODEL_DS="deepseek/deepseek-flash"
-
-# no list -> no --model is passed (V1 default unchanged)
-rm -f "$QARGS"
-QF_RC=0
-( cd "$hrepo" && PATH="$QBIN:$PATH" FAKE_OPENCODE_MODE=result FAKE_TASK_ID=H01 \
-    FAKE_OPENCODE_ARGS_LOG="$QARGS" "$HRUN" --allow-dirty --mode implement ) >"$OUT_DIR/model-none.log" 2>&1 || QF_RC=$?
-check_eq "no model list -> run succeeds" "0" "$QF_RC"
-check "no model list -> no --model is passed" bash -c "! grep -q -- '--model' '$QARGS'"
-
-# quota on the first model -> the next model runs and the report is accepted
-rm -f "$QARGS" "$QCOUNTER"
-QF_RC=0
-( cd "$hrepo" && PATH="$QBIN:$PATH" CHEAP_WORKER_MODELS="$MODEL_FREE $MODEL_DS" \
-    FAKE_OPENCODE_MODE=quota-once FAKE_TASK_ID=H01 FAKE_OPENCODE_ARGS_LOG="$QARGS" \
-    FAKE_OPENCODE_COUNTER="$QCOUNTER" "$HRUN" --allow-dirty --mode implement ) >"$OUT_DIR/model-fallback.log" 2>&1 || QF_RC=$?
-check_eq "quota fallback -> exit 0 on the second model" "0" "$QF_RC"
-check "first attempt used the free model" bash -c "sed -n 1p '$QARGS' | grep -q -- '--model $MODEL_FREE'"
-check "second attempt used DeepSeek" bash -c "sed -n 2p '$QARGS' | grep -q -- '--model $MODEL_DS'"
-check "STATE records the model that produced the report" bash -c "jq -e '.model == \"$MODEL_DS\" and .model_attempts == 2' '$hrepo/.agent/current/STATE.json' >/dev/null"
-check "the fallback is announced" grep -q 'switching to deepseek/deepseek-flash' "$OUT_DIR/model-fallback.log"
-
-# quota on the last model -> stops with a plumbing failure (no infinite retry)
-rm -f "$QARGS"
-QF_RC=0
-( cd "$hrepo" && PATH="$QBIN:$PATH" CHEAP_WORKER_MODELS="$MODEL_FREE $MODEL_DS" \
-    FAKE_OPENCODE_MODE=quota-always FAKE_TASK_ID=H01 \
-    FAKE_OPENCODE_ARGS_LOG="$QARGS" \
-    "$HRUN" --allow-dirty --mode implement ) >/dev/null 2>&1 || QF_RC=$?
-check_eq "exhausted list -> plumbing failure (2)" "2" "$QF_RC"
-check_eq "exhausted list -> both models were tried" "2" "$(wc -l <"$QARGS" | tr -d ' ')"
-
-# an invalid entry fails fast
-QF_RC=0
-( cd "$hrepo" && PATH="$QBIN:$PATH" CHEAP_WORKER_MODELS="no/such-model $MODEL_DS" \
-    FAKE_OPENCODE_MODE=result FAKE_TASK_ID=H01 "$HRUN" --allow-dirty --mode implement ) >"$OUT_DIR/model-invalid.log" 2>&1 || QF_RC=$?
-check_eq "invalid model entry -> exit 1" "1" "$QF_RC"
-check "invalid entry message is explicit" grep -q 'is not in .opencode models. output' "$OUT_DIR/model-invalid.log"
 
 # --- 7. collect-result conflict + installer boundaries -----------------------------
 cat >"$repo/.agent/current/RESULT.md" <<'EOF'

@@ -124,22 +124,8 @@ wake-up to work.
 
 ## Backend and observability
 
-- By default the model is chosen entirely by OpenCode's own configuration;
-  `run-worker.sh` passes no `--model` unless you opt in.
-- Optional priority list with **quota-only** fallback:
-
-  ```sh
-  export CHEAP_WORKER_MODELS="opencode/muse-spark-1.3-contributor-free deepseek/deepseek-flash"
-  ```
-
-  Only a quota/rate-limit failure (`provider.quota`, e.g. HTTP 429) moves to the
-  next model; other failures do not switch. Entries are validated against
-  `opencode models` first, every attempt is logged
-  (`worker-<run>-<task>-aN.jsonl`), and `STATE.json` records the model that
-  produced the report plus the attempt count.
-- **Privacy:** the free models collect data (Muse Spark Contributor Free trains
-  Meta models; the NVIDIA free endpoints are trial-only: "do not submit personal
-  or confidential data"). Do not use a free-first list on confidential repos.
+- The model is chosen entirely by OpenCode's own configuration. `run-worker.sh`
+  never passes `--model` and has no model configuration of its own.
 - Every run uses the shared OpenCode background service (never `--standalone`),
   so the session shows up in OpenCode Desktop.
 - One Task = one OpenCode session, titled `cheap-worker · <task-id> · <title>`,

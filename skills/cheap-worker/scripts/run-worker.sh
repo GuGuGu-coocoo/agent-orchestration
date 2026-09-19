@@ -21,13 +21,6 @@
 #     BASELINE.patch (full `git diff HEAD --binary`)
 #   - opencode runs with cwd = project root, even when invoked from elsewhere
 #
-# Model policy (optional, opt-in):
-#   CHEAP_WORKER_MODELS="<model1> <model2> ..."  a priority list. The first model
-#   is tried first; only a quota/rate-limit failure moves to the next one. When
-#   the variable is unset, no --model is passed and OpenCode's configured default
-#   is used (V1's original behaviour). Every ID in the list is validated against
-#   `opencode models` before the run.
-#
 # Usage:
 #   run-worker.sh [--mode implement|investigate|fix|verify] [--root DIR]
 #                 [--task-id ID] [--title SHORT_TITLE] [--allow-dirty]
@@ -223,30 +216,6 @@ main() {
     local project_root
     project_root="$(resolve_project_root "$root_arg")"
 
-    # Optional model priority list (opt-in; empty = OpenCode's default model).
-    MODELS=()
-    if [[ -n "${CHEAP_WORKER_MODELS:-}" ]]; then
-        read -r -a MODELS <<<"${CHEAP_WORKER_MODELS}"
-        local model_list="" tries=0
-        while [[ "$tries" -lt 3 ]]; do
-            tries=$((tries + 1))
-            model_list="$(opencode models 2>/dev/null || true)"
-            local all_ok=1 m
-            for m in "${MODELS[@]}"; do
-                printf '%s\n' "$model_list" | grep -qxF "$m" || all_ok=0
-            done
-            [[ "$all_ok" -eq 1 ]] && break
-            sleep 2
-        done
-        local m
-        for m in "${MODELS[@]}"; do
-            if ! printf '%s\n' "$model_list" | grep -qxF "$m"; then
-                die "CHEAP_WORKER_MODELS entry '$m' is not in 'opencode models' output; fix the list (never guess model IDs)"
-            fi
-        done
-        printf 'run-worker: model priority: %s\n' "${MODELS[*]}"
-    fi
-
     local task_file="$project_root/.agent/current/TASK.md"
     [[ -f "$task_file" ]] || die "no Task found at $task_file (Supervisor must write it first)"
     validate_task_file "$task_file"
@@ -333,13 +302,7 @@ main() {
         printf '  run id       : %s\n' "$RUN_ID"
         printf '  opencode     : %s\n' "$opencode_version"
         printf '  review       : %s\n' "$has_review"
-        if [[ "${#MODELS[@]}" -gt 0 ]]; then
-            printf '  model priority: %s\n' "${MODELS[*]}"
-            printf '  command      : opencode run --agent %s --model %s --format json --title %s  (cwd=%s)\n' "$OPENCODE_AGENT" "${MODELS[0]}" "$session_title" "$project_root"
-        else
-            printf '  model priority: (unset) using OpenCode configured default\n'
-            printf '  command      : opencode run --agent %s --format json --title %s  (cwd=%s)\n' "$OPENCODE_AGENT" "$session_title" "$project_root"
-        fi
+        printf '  command      : opencode run --agent %s --format json --title %s  (cwd=%s)\n' "$OPENCODE_AGENT" "$session_title" "$project_root"
         exit 0
     fi
 
@@ -458,11 +421,7 @@ main() {
     printf 'run-worker: project=%s\n' "$project_root"
     printf 'run-worker: baseline=%s (dirty files before run: %s)\n' "${baseline:-<none>}" "$(printf '%s\n' "$dirty" | grep -c . || true)"
     printf 'run-worker: log=%s\n' "$log_file"
-    if [[ "${#MODELS[@]}" -gt 0 ]]; then
-        printf 'run-worker: model priority: %s\n' "${MODELS[*]}"
-    else
-        printf 'run-worker: model=OpenCode default (not passed explicitly)\n'
-    fi
+    printf 'run-worker: model=OpenCode default (not passed explicitly)\n'
 
     # Pre-write STATE.json so an interrupted run is still resumable.
     jq -n \
@@ -479,36 +438,19 @@ main() {
           project_root: $project_root, baseline_commit: $baseline_commit,
           baseline_dirty_count: $dirty_count, opencode_version: $opencode_version,
           session_id: "", started_at: $started_at, finished_at: "",
-          last_result: "", model: "", model_attempts: 0, log_file: $log_file}' >"$agent_dir/STATE.json"
+          last_result: "", log_file: $log_file}' >"$agent_dir/STATE.json"
 
     # --- run the worker ---------------------------------------------------------
     # Non-interactive run on the shared background service (never --standalone),
-    # one session per Task, with cwd pinned to the project root (H02). When
-    # CHEAP_WORKER_MODELS is set, a quota/rate-limit failure switches to the next
-    # model in the list instead of failing the Task.
-    local rc=0 attempt=0
-    local n_attempts=1
-    if [[ "${#MODELS[@]}" -gt 0 ]]; then n_attempts="${#MODELS[@]}"; fi
-    local model_used=""
-    local base_log="$log_file"
-
-    while :; do
-        attempt=$((attempt + 1))
-        local m=""
-        if [[ "${#MODELS[@]}" -gt 0 ]]; then m="${MODELS[$((attempt - 1))]}"; fi
-        local a_log="$base_log"
-        if [[ "$n_attempts" -gt 1 ]]; then a_log="${base_log%.jsonl}-a${attempt}.jsonl"; fi
-        local model_args=()
-        if [[ -n "$m" ]]; then model_args=(--model "$m"); fi
-
-        rc=0
-        {
-            cat "$sk_root/references/worker-prompt.md"
-            printf '\n## Working Contract (embedded)\n\n'
-            cat "$sk_root/references/worker-contract.md"
-            printf '\n## Safety Policy (embedded)\n\n'
-            cat "$sk_root/references/safety-policy.md"
-            cat <<EOF
+    # one session per Task, with cwd pinned to the project root (H02).
+    local rc=0
+    {
+        cat "$sk_root/references/worker-prompt.md"
+        printf '\n## Working Contract (embedded)\n\n'
+        cat "$sk_root/references/worker-contract.md"
+        printf '\n## Safety Policy (embedded)\n\n'
+        cat "$sk_root/references/safety-policy.md"
+        cat <<EOF
 
 ## This run
 
@@ -528,32 +470,13 @@ embedded above - do not try to open the skill directory yourself).
 
 Begin now. Read the Task, follow the contract, write exactly one report file, stop.
 EOF
-        } | ( cd "$project_root" && exec opencode run \
-                --agent "$OPENCODE_AGENT" \
-                ${model_args[@]+"${model_args[@]}"} \
-                --format json \
-                --title "$session_title" ) >"$a_log" 2>&1 &
-        WORKER_PID=$!
-        write_lock_info "$WORKER_PID"
-        wait "$WORKER_PID" || rc=$?
-
-        if [[ -n "$m" ]]; then model_used="$m"; fi
-        log_file="$a_log"
-
-        if [[ "$rc" -ne 0 && "$attempt" -lt "$n_attempts" && -s "$a_log" ]] \
-            && grep -q '"type":"provider.quota"' "$a_log" 2>/dev/null; then
-            printf 'run-worker: model %s hit a quota/rate limit; switching to %s\n' \
-                "${m:-<default>}" "${MODELS[$attempt]}" >&2
-            local dest="$project_root/.agent/history/attempts/${task_id}/${RUN_ID}-a${attempt}"
-            for f in RESULT.md ESCALATION.md; do
-                if [[ -e "$agent_dir/$f" ]]; then
-                    mkdir -p "$dest" && mv "$agent_dir/$f" "$dest/$f"
-                fi
-            done
-            continue
-        fi
-        break
-    done
+    } | ( cd "$project_root" && exec opencode run \
+            --agent "$OPENCODE_AGENT" \
+            --format json \
+            --title "$session_title" ) >"$log_file" 2>&1 &
+    WORKER_PID=$!
+    write_lock_info "$WORKER_PID"
+    wait "$WORKER_PID" || rc=$?
 
     local session_id=""
     session_id="$(jq -r 'select(.sessionID) | .sessionID' "$log_file" 2>/dev/null | head -1 || true)"
@@ -607,20 +530,16 @@ EOF
         --arg last_result "$last_result" \
         --arg log_file "$log_file" \
         --arg invalid_reason "$invalid_reason" \
-        --arg model "$model_used" \
         --argjson rc "$rc" \
-        --argjson model_attempts "$attempt" \
         --argjson dirty_count "$(printf '%s\n' "$dirty" | grep -c . || true)" \
         '{task_id: $task_id, mode: $mode, run_id: $run_id, status: $status,
           project_root: $project_root, baseline_commit: $baseline_commit,
           baseline_dirty_count: $dirty_count, opencode_version: $opencode_version,
           session_id: $session_id, started_at: $started_at, finished_at: $finished_at,
           last_result: $last_result, invalid_reason: $invalid_reason,
-          model: $model, model_attempts: $model_attempts,
           opencode_exit_code: $rc, log_file: $log_file}' >"$agent_dir/STATE.json"
 
     printf 'run-worker: opencode exit=%s session=%s\n' "$rc" "${session_id:-<none>}"
-    printf 'run-worker: model=%s attempts=%s\n' "${model_used:-<opencode default>}" "$attempt"
     printf 'run-worker: result=%s\n' "$status"
 
     release_lock

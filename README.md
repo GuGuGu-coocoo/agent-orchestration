@@ -196,35 +196,15 @@ verification, and the human checkpoint. It never asks "continue?" between Tasks.
 
 ## Model selection
 
-By default V1 has **no model layer**: `run-worker.sh` never passes `--model`, and
-the worker uses whatever OpenCode's own configuration selects (`~/.config/opencode/opencode.json`
--> `"model"`, or the Desktop/TUI selector).
+V1 has **no model layer of its own**. `run-worker.sh` never passes `--model`; the
+worker uses whatever OpenCode's own configuration selects:
 
-Optional (opt-in) **priority list with quota-only fallback**:
+- Global config: `~/.config/opencode/opencode.json` -> `"model"`
+- Or the OpenCode Desktop / TUI model selector (sessions can differ)
 
-```sh
-export CHEAP_WORKER_MODELS="opencode/muse-spark-1.3-contributor-free deepseek/deepseek-flash"
-```
-
-- The first model is tried first; **only a quota/rate-limit failure** (a
-  `provider.quota` event in the run log, e.g. HTTP 429) switches to the next one.
-  Other failures do not silently switch models.
-- All IDs are validated against `opencode models` before the run (retried a few
-  times, because that list can be transiently empty); a typo fails fast.
-- Every attempt is logged (`worker-<run>-<task>-aN.jsonl`); `STATE.json` records
-  the model that produced the report and how many attempts were made.
-- `doctor.sh` validates the list when the variable is set.
-
-There is still no router, no pool and no other automatic switching. Never put API
-keys in this repo or in a skill.
-
-### Privacy warning for free models
-
-The free Zen models are free because they collect data: Muse Spark Contributor
-Free trains Meta models on your prompts/completions, and the NVIDIA free endpoints
-are trial-only ("do not submit personal or confidential data"). Do **not** point
-`CHEAP_WORKER_MODELS` at free models for confidential or private repositories;
-DeepSeek/Zen paid models follow zero-retention policies.
+Check the available model IDs with `opencode models`, and change the default in
+OpenCode's own config if you want a different worker. There is no fallback, no
+router, no project-level model config and no automatic switching - by design.
 
 ## OpenCode Desktop observability
 
@@ -326,7 +306,7 @@ project has an `AGENTS.md`, the worker must read it.
 never touches real projects. See `tests/smoke/README.md`.
 
 ```sh
-tests/smoke/run-offline.sh                  # no model calls (183 checks)
+tests/smoke/run-offline.sh                  # no model calls (149 checks)
 tests/smoke/run-live.sh                     # all live tests (OpenCode default model)
 SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh  # keep the generated repos
 ```

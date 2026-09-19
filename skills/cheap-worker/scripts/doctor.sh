@@ -82,22 +82,10 @@ main() {
         else
             ok "run-worker.sh never uses --standalone"
         fi
-        if printf '%s\n' "$rw_code" | grep -q 'CHEAP_WORKER_MODELS'; then
-            if [[ -n "${CHEAP_WORKER_MODELS:-}" ]]; then
-                ok "optional model priority list: $CHEAP_WORKER_MODELS"
-                local ml entry bad_entry=""
-                ml="$(opencode models 2>/dev/null || true)"
-                for entry in ${CHEAP_WORKER_MODELS}; do
-                    printf '%s\n' "$ml" | grep -qxF "$entry" || bad_entry="$bad_entry $entry"
-                done
-                if [[ -n "$bad_entry" ]]; then
-                    bad "CHEAP_WORKER_MODELS entries not in 'opencode models':$bad_entry"
-                else
-                    ok "all CHEAP_WORKER_MODELS entries exist"
-                fi
-            else
-                ok "model: OpenCode default (CHEAP_WORKER_MODELS not set)"
-            fi
+        if printf '%s\n' "$rw_code" | grep -q -- '--model'; then
+            bad "run-worker.sh passes --model; the worker must use OpenCode's configured default model"
+        else
+            ok "run-worker.sh never passes --model (model comes from OpenCode config)"
         fi
     fi
 
