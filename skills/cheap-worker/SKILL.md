@@ -84,8 +84,9 @@ Priority: **Correctness > minimal change > verifiability > elegance.**
 - A project-level lock records the wrapper pid **and** the worker pid, refuses a
   second worker (`exit 7`), and never takes over a stale lock automatically
   (`exit 8`; clear it with `--break-lock` after verifying nothing runs). A
-  cancelled run (Ctrl-C / SIGTERM) stops its worker, **keeps the lock**, and
-  records the cancellation in the lock info.
+  cancelled run (Ctrl-C / SIGTERM) attempts to stop its worker (TERM + up to ~10s),
+  **keeps the lock**, and records the cancellation; killing the CLI is not proof
+  that a shared-service execution stopped.
 - Previous `RESULT.md`/`ESCALATION.md`/`BASELINE.*` are quarantined to
   `.agent/history/attempts/<task>/` before every run, so a stale report can never
   be mistaken for the current run's output.

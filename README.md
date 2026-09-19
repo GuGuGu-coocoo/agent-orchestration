@@ -146,8 +146,10 @@ Safety behaviours on every run:
 - a project-level lock (`.agent/current/.worker.lock`) records **both the wrapper
   pid and the worker pid**, refuses a second worker (`7`), and **never takes over a
   stale lock automatically**: use `--break-lock` after verifying nothing runs (`8`).
-  A cancelled run (Ctrl-C / SIGTERM) stops its worker and **keeps the lock**; the
-  next run must verify and pass `--break-lock`.
+  A cancelled run (Ctrl-C / SIGTERM) attempts to stop its worker (TERM plus up to
+  ~10s of waiting) and **always keeps the lock**; killing the CLI is not proof that
+  a shared-service execution stopped, so the next run must verify and pass
+  `--break-lock`.
 - previous `RESULT.md`/`ESCALATION.md`/`BASELINE.*` are quarantined to
   `.agent/history/attempts/<task>/` so a stale report can never be mistaken for
   this run's output

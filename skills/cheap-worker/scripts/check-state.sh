@@ -156,6 +156,13 @@ main() {
 
     # --- queue must exist for the current phase and be structurally sound -------
     local pending="" in_progress="" done_list="" escalated="" queue=""
+    local phase_required=0
+    if [[ "$rs_status" =~ ^(running|blocked|awaiting_human_qa)$ ]]; then
+        phase_required=1
+    fi
+    if [[ "$phase_required" -eq 1 && -z "$phase" ]]; then
+        issue "RUN_STATE.status='$rs_status' requires a current_phase, but none is set"
+    fi
     if [[ -n "$phase" ]]; then
         queue="$agent/phases/$phase/TASK_QUEUE.json"
         if [[ ! -e "$queue" ]]; then
@@ -165,10 +172,23 @@ main() {
         elif ! jq -e '(.tasks | type) == "array"' "$queue" >/dev/null 2>&1; then
             issue "$queue has no tasks array"
         else
+            # Each Task must be an object with a non-empty string id and a valid
+            # status; missing fields and type errors are ISSUES, not defaults.
             local bad=""
-            bad="$(jq -r '[.tasks[] | select((.id|type)!="string" or (.status|type)!="string" or ([.status] | inside(["pending","in_progress","done","escalated","dropped"])) | not)] | length' "$queue" 2>/dev/null || printf '1')"
+            bad="$(jq -r '[
+                .tasks[] | . as $t | select(
+                  ($t | type != "object")
+                  or ($t.id | (type != "string") or (length == 0))
+                  or ($t.status | (type != "string") or (["pending","in_progress","done","escalated","dropped"] | index($t.status) | not))
+                )] | length' "$queue" 2>/dev/null || printf '1')"
+            local dup="0"
+            if [[ "$bad" == "0" ]]; then
+                dup="$(jq -r '[.tasks[].id] as $ids | (($ids | length) - ($ids | unique | length))' "$queue" 2>/dev/null || printf '1')"
+            fi
             if [[ "$bad" != "0" ]]; then
-                issue "$queue has Tasks without a valid id/status"
+                issue "$queue has Tasks that are not objects, or have a missing/empty/non-string id, or an unknown status"
+            elif [[ "$dup" != "0" ]]; then
+                issue "$queue has duplicate Task ids"
             else
                 pending="$(jqv "$queue" '[.tasks[] | select(.status=="pending") | .id] | join(",")')"
                 in_progress="$(jqv "$queue" '[.tasks[] | select(.status=="in_progress") | .id] | join(",")')"
@@ -177,6 +197,11 @@ main() {
                 ok "queue: done=[${done_list:-none}] in_progress=[${in_progress:-none}] pending=[${pending:-none}] escalated=[${escalated:-none}]"
             fi
         fi
+    fi
+
+    # --- current/STATE.json must be readable when it exists ---------------------
+    if [[ -e "$current/STATE.json" ]] && ! valid_object "$current/STATE.json"; then
+        issue "current/STATE.json exists but is empty or not a JSON object"
     fi
 
     # --- current task / state / reports -----------------------------------------

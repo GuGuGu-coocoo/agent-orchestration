@@ -563,6 +563,18 @@ fi
 check "source-copy refusal message" grep -q 'source repo' "$OUT_DIR/uninstall-sourcecopy.log"
 check "source-copy skills survived" test -f "$SRCCOPY/skills/cheap-worker/SKILL.md"
 
+# no-HEAD repository: BASELINE.patch explains itself instead of being silently empty
+NOHREPO="$(new_repo smoke-no-head)"
+CLEANUP_DIRS+=("$NOHREPO")
+write_task "$NOHREPO" "N01" "implement" "no-head objective" "none" "something" \
+    "- app.py" "- app.py" "- any other file" "- [ ] works" '`python3 app.py` exits 0' "none"
+printf 'print("hi")\n' >"$NOHREPO/app.py"
+NOH_RC=0
+( cd "$NOHREPO" && PATH="$HARNESS/bin:$PATH" FAKE_OPENCODE_MODE=result FAKE_TASK_ID=N01 \
+    "$HRUN" --allow-dirty --mode implement ) >"$OUT_DIR/no-head.log" 2>&1 || NOH_RC=$?
+check_eq "no-HEAD repo runs with --allow-dirty -> exit 0" "0" "$NOH_RC"
+check "no-HEAD BASELINE.patch explains the limitation" grep -q 'no HEAD yet' "$NOHREPO/.agent/current/BASELINE.patch"
+
 # --- 7b. check-state fail-closed cases (M03) ----------------------------------------
 CSREPO="$(new_repo smoke-checkstate)"
 CLEANUP_DIRS+=("$CSREPO")
@@ -617,13 +629,18 @@ check_eq "check-state: archive without done -> exit 1" "1" "$CS_RC"
 check "check-state: suggests marking done" grep -q 'mark it done' "$OUT_DIR/cs-archived-not-done.log"
 
 # --- 7c. check-state fail-closed matrix (round-3 M03) ------------------------------
-cs_case() {  # cs_case <name> <queue-file-content-or-> <runstate-content> [result-content]
-    local name="$1" q="$2" rs="$3" res="${4:-}"
+cs_case() {  # cs_case <name> <queue-content> <runstate-content> [result-content] [state-content]
+    local name="$1" q="$2" rs="$3" res="${4:-}" st="${5:-}"
     printf '%s' "$q" >"$CSREPO/.agent/phases/A/TASK_QUEUE.json"
     printf '%s' "$rs" >"$CSREPO/.agent/RUN_STATE.json"
     printf '# Task\n\n## Task ID\nA02\n' >"$CSREPO/.agent/current/TASK.md"
-    printf '%s' '{"task_id":"A02","run_id":"r1","status":"running"}' >"$CSREPO/.agent/current/STATE.json"
+    if [[ -n "$st" ]]; then
+        printf '%s' "$st" >"$CSREPO/.agent/current/STATE.json"
+    else
+        printf '%s' '{"task_id":"A02","run_id":"r1","status":"running"}' >"$CSREPO/.agent/current/STATE.json"
+    fi
     rm -f "$CSREPO/.agent/current/RESULT.md" "$CSREPO/.agent/current/ESCALATION.md"
+    rm -rf "$CSREPO/.agent/history" "$CSREPO/.agent/current/.worker.lock"
     [[ -n "$res" ]] && printf '%s' "$res" >"$CSREPO/.agent/current/RESULT.md"
     CS_RC=0
     (cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-${name}.log" 2>&1 || CS_RC=$?
@@ -668,14 +685,54 @@ check "check-state: unacceptable report reported" grep -q 'not acceptable' "$OUT
 # survivor lock: a live worker_pid must produce WORKER_RUNNING, not "stale"
 sleep 30 &
 SURV=$!
+cs_case survivor-lock '{"tasks":[{"id":"A02","status":"in_progress"}]}' '{"current_phase":"A","current_task":"A02","status":"running"}'
 mkdir -p "$CSREPO/.agent/current/.worker.lock"
 printf 'pid=999999\nworker_pid=%s\nrun_id=survivor\n' "$SURV" >"$CSREPO/.agent/current/.worker.lock/info"
-cs_case survivor-lock '{"tasks":[{"id":"A02","status":"in_progress"}]}' '{"current_phase":"A","current_task":"A02","status":"running"}'
+CS_RC=0
+(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-survivor-lock.log" 2>&1 || CS_RC=$?
 check_eq "check-state: live worker_pid -> exit 1" "1" "$CS_RC"
 check "check-state: live worker_pid verdict" grep -q 'verdict: WORKER_RUNNING' "$OUT_DIR/cs-survivor-lock.log"
 rm -rf "$CSREPO/.agent/current/.worker.lock"
 kill "$SURV" 2>/dev/null || true
 wait "$SURV" 2>/dev/null || true
+
+# --- 7c-2. schema matrix from round 4 (M03) ----------------------------------------
+cs_case number-id '{"tasks":[{"id":42,"status":"pending"}]}' '{"current_phase":"A","status":"running"}'
+check_eq "check-state: numeric Task id -> exit 1" "1" "$CS_RC"
+check "check-state: numeric id reported" grep -q 'missing/empty/non-string id' "$OUT_DIR/cs-number-id.log"
+
+cs_case missing-id '{"tasks":[{"status":"pending"}]}' '{"current_phase":"A","status":"running"}'
+check_eq "check-state: missing Task id -> exit 1" "1" "$CS_RC"
+
+cs_case empty-id '{"tasks":[{"id":"","status":"pending"}]}' '{"current_phase":"A","status":"running"}'
+check_eq "check-state: empty Task id -> exit 1" "1" "$CS_RC"
+
+cs_case missing-status '{"tasks":[{"id":"A02"}]}' '{"current_phase":"A","status":"running"}'
+check_eq "check-state: missing Task status -> exit 1" "1" "$CS_RC"
+
+cs_case duplicate-id '{"tasks":[{"id":"A02","status":"pending"},{"id":"A02","status":"pending"}]}' \
+    '{"current_phase":"A","current_task":"A02","status":"running"}'
+check_eq "check-state: duplicate Task ids -> exit 1" "1" "$CS_RC"
+check "check-state: duplicate ids reported" grep -q 'duplicate Task ids' "$OUT_DIR/cs-duplicate-id.log"
+
+cs_case no-phase '{"tasks":[{"id":"A02","status":"pending"}]}' '{"status":"running"}'
+check_eq "check-state: running without a phase -> exit 1" "1" "$CS_RC"
+check "check-state: phase requirement reported" grep -q 'requires a current_phase' "$OUT_DIR/cs-no-phase.log"
+
+cs_case broken-state '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
+    '{"current_phase":"A","current_task":"A02","status":"running"}' '' '{broken'
+check_eq "check-state: broken STATE.json -> exit 1" "1" "$CS_RC"
+check "check-state: broken STATE reported" grep -q 'STATE.json exists but is empty or not a JSON object' "$OUT_DIR/cs-broken-state.log"
+
+# positive controls: the fixes must not block legitimate states
+cs_case valid-pending '{"tasks":[{"id":"A02","status":"pending"}]}' \
+    '{"current_phase":"A","current_task":"","status":"running"}' '' '{"task_id":"","run_id":"","status":"idle"}'
+check_eq "check-state: valid pending -> exit 0" "0" "$CS_RC"
+check "check-state: valid pending verdict" grep -q 'verdict: NEXT' "$OUT_DIR/cs-valid-pending.log"
+
+cs_case idle-empty '{"tasks":[]}' '{"status":"idle"}' '' '{"task_id":"","run_id":"","status":"idle"}'
+check_eq "check-state: idle intake -> exit 0" "0" "$CS_RC"
+check "check-state: idle verdict stays EMPTY" grep -q 'verdict: EMPTY' "$OUT_DIR/cs-idle-empty.log"
 
 # --- 7d. phase-driver obeys check-state (offline, no model calls) -------------------
 DREPO="$(new_repo smoke-driver-gate)"
@@ -688,7 +745,30 @@ DG_RC=0
 REPO="$DREPO" SMOKE_DIR="$SMOKE_DIR" REWORK_MODE=0 \
     bash "$SMOKE_DIR/lib/phase-driver.sh" >"$OUT_DIR/driver-gate.log" 2>&1 || DG_RC=$?
 check_eq "driver stops on a checkpoint verdict -> exit 2" "2" "$DG_RC"
-check "driver logged the stop" grep -q 'check-state says stop' "$OUT_DIR/driver-gate.log"
+check "driver logged the stop verdict" grep -q 'stop verdict CHECKPOINT' "$OUT_DIR/driver-gate.log"
+
+# a WORKER_RUNNING verdict must stop WITHOUT rewriting TASK.md (round-4 M04)
+LLREPO="$(new_repo smoke-driver-live-lock)"
+CLEANUP_DIRS+=("$LLREPO")
+mkdir -p "$LLREPO/.agent/phases/A/history" "$LLREPO/.agent/current"
+printf '%s' '{"phase":"A","status":"running","tasks":[{"id":"A02","title":"add shutdown(seconds)","mode":"implement","status":"in_progress","history":[]}]}' >"$LLREPO/.agent/phases/A/TASK_QUEUE.json"
+printf '%s' '{"current_phase":"A","current_task":"A02","status":"running"}' >"$LLREPO/.agent/RUN_STATE.json"
+printf '# Task\n\n## Task ID\nA02\n\n## Mode\nimplement\n\n## Marker\nAUDIT ORIGINAL DEFINITION\n' >"$LLREPO/.agent/current/TASK.md"
+printf '%s' '{"task_id":"A02","run_id":"r1","status":"running"}' >"$LLREPO/.agent/current/STATE.json"
+sleep 30 &
+SURV2=$!
+mkdir -p "$LLREPO/.agent/current/.worker.lock"
+printf 'pid=999999\nworker_pid=%s\nrun_id=live\n' "$SURV2" >"$LLREPO/.agent/current/.worker.lock/info"
+LL_RC=0
+REPO="$LLREPO" SMOKE_DIR="$SMOKE_DIR" REWORK_MODE=0 \
+    bash "$SMOKE_DIR/lib/phase-driver.sh" >"$OUT_DIR/driver-live-lock.log" 2>&1 || LL_RC=$?
+check_eq "driver stops on WORKER_RUNNING -> exit 2" "2" "$LL_RC"
+check "driver wrote no worker log" bash -c "[ ! -d '$LLREPO/.agent/current/logs' ] || [ -z \"\$(ls -A '$LLREPO/.agent/current/logs')\" ]"
+check "TASK.md was NOT rewritten" grep -q 'AUDIT ORIGINAL DEFINITION' "$LLREPO/.agent/current/TASK.md"
+check "the phase history copy was not created" bash -c "! test -e '$LLREPO/.agent/phases/A/history/TASK-A02.md'"
+rm -rf "$LLREPO/.agent/current/.worker.lock"
+kill "$SURV2" 2>/dev/null || true
+wait "$SURV2" 2>/dev/null || true
 
 # --- 7e. installer must not create a target it will refuse (M05 LOW) ----------------
 ESCAPE_HOME="$(mktemp -d "$TMP_BASE/escape-home.XXXXXX")"

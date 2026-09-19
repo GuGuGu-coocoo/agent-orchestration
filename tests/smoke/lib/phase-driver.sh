@@ -202,9 +202,17 @@ if [[ -x "$CHECK_STATE" ]]; then
         printf '%s\n' "$cs_issues" | sed 's/^/  [check-state]/' | while IFS= read -r line; do log "$line"; done
     fi
     if [[ "$cs_rc" -ne 0 ]]; then
+        cs_verdict="$(printf '%s' "$cs_out" | awk -F': ' '/^verdict: /{print $2}' | awk '{print $1}')"
+        case "$cs_verdict" in
+            WORKER_RUNNING|BLOCKED|CHECKPOINT|ESCALATED)
+                log "stop verdict $cs_verdict: no files are written; stopping"
+                exit 2
+                ;;
+        esac
         ip="$(jq -r '[.tasks[] | select(.status=="in_progress")][0].id // empty' "$QUEUE")"
         esc="$(jq -r '[.tasks[] | select(.status=="escalated")][0].id // empty' "$QUEUE")"
-        if [[ -n "$ip" && -z "$esc" ]]; then
+        other_issues="$(printf '%s\n' "$cs_issues" | grep -v 'current/TASK.md' || true)"
+        if [[ -n "$ip" && -z "$esc" && -n "$cs_issues" && -z "$other_issues" ]]; then
             log "reconciliation: re-rendering TASK.md for $ip from the queue definition"
             render_task "$ip" || { log "reconciliation failed (unknown Task); stopping"; exit 2; }
             cs_rc2=0
@@ -215,7 +223,7 @@ if [[ -x "$CHECK_STATE" ]]; then
                 exit 2
             fi
         else
-            log "check-state says stop and no reconciliation applies; stopping"
+            log "check-state: issues are not limited to TASK.md reconciliation; stopping without writes"
             exit 2
         fi
     fi
@@ -345,7 +353,7 @@ EOF
             exit 2
         fi
         jq --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-            '(.tasks[] | select(.id=="A02")) |= (.history += [{at: $now, decision: "REWORK", note: "edge case shutdown(0) required"}])' \
+            '(.tasks[] | select(.id=="A02")) |= (.history += [{at: $now, decision: "REWORK", note: "negative-seconds requirement added"}])' \
             "$QUEUE" >"$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
     fi
 
