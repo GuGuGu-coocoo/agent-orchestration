@@ -121,13 +121,16 @@ archived_count="$(ls -d "$repo"/.agent/history/*A0[23] 2>/dev/null | wc -l | tr 
 check_eq "A02 and A03 archived once each" "2" "$archived_count"
 check "A02 archive recorded ACCEPT" grep -q 'Decision: ACCEPT' "$repo"/.agent/history/*A02/REVIEW_DECISION.md
 check "A03 archive recorded ACCEPT" grep -q 'Decision: ACCEPT' "$repo"/.agent/history/*A03/REVIEW_DECISION.md
-check "A01 was never re-run (no worker log for it)" bash -c "! ls '$repo'/.agent/history/A01/logs/worker-*.jsonl >/dev/null 2>&1"
+check "A01 was never re-run (no archive for it)" bash -c "! ls -d '$repo'/.agent/history/*A01 >/dev/null 2>&1"
 
 if [[ "$REWORK_MODE" -eq 1 ]]; then
     check "the REWORK was recorded" bash -c \
         "jq -e '[.tasks[] | select(.id==\"A02\")][0].history | map(.decision) | index(\"REWORK\") != null' '$repo/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
-    check "a REWORK review was archived" bash -c "grep -l 'Decision' '$repo'/.agent/history/*A02/REVIEW_DECISION.md | xargs grep -l 'REWORK' >/dev/null"
-    check "the edge-case test survived the rework" bash -c "grep -q 'def test_shutdown_zero' '$repo/test_app.py'"
+    check "the forced rework ran after a proven failure" \
+        grep -q 'forcing a corrective round' "$OUT_DIR/worker-${TEST_NAME}.log"
+    check "no faked rework was needed" bash -c \
+        "! grep -q 'did not fail; refusing to fake a rework' '$OUT_DIR/worker-${TEST_NAME}.log'"
+    check "the edge-case test survived the rework" bash -c "grep -q 'def test_shutdown_negative' '$repo/test_app.py'"
 fi
 
 if [[ "$FAIL_COUNT" -gt 0 ]]; then

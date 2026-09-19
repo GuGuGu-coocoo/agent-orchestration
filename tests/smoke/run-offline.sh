@@ -164,12 +164,6 @@ else
 fi
 
 (cd "$repo" && "$NOTIFY" --print-message --simulate-exit 0 --task-id OFF2) >"$OUT_DIR/notify-msg-0.log" 2>&1 || true
-(cd "$repo" && "$NOTIFY" --print-message --simulate-exit 10 --task-id OFF2) >"$OUT_DIR/notify-msg-10.log" 2>&1 || true
-(cd "$repo" && "$NOTIFY" --print-message --simulate-exit 2 --task-id OFF2) >"$OUT_DIR/notify-msg-2.log" 2>&1 || true
-check "success message asks for review" grep -q '验收' "$OUT_DIR/notify-msg-0.log"
-check "escalation message asks for a decision" grep -q '决策' "$OUT_DIR/notify-msg-10.log"
-check "failure message names the exit code" grep -q 'exit=2' "$OUT_DIR/notify-msg-2.log"
-check "message carries absolute paths" grep -q '/\.agent/current/RESULT.md' "$OUT_DIR/notify-msg-0.log"
 
 # fake worker + fake codex: exercise the notify path offline
 cat >"$repo/.fake-worker.sh" <<'FAKEEOF'
@@ -209,9 +203,11 @@ exit 1
 FAKEEOF
 chmod +x "$repo/.fake-codex-fail"
 rm -f "$repo/.agent/current/NOTIFY_FAILED.md"
+NF_RC=0
 (cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-worker.sh" "$NOTIFY" \
     --foreground --codex-thread "smoke-thread" --codex-bin "$repo/.fake-codex-fail" \
-    --mode implement --task-id OFF2) >"$OUT_DIR/notify-fail.log" 2>&1 || true
+    --mode implement --task-id OFF2) >"$OUT_DIR/notify-fail.log" 2>&1 || NF_RC=$?
+check_eq "undelivered wake-up -> exit 15" "15" "$NF_RC"
 check "failed wake-up writes NOTIFY_FAILED.md" test -s "$repo/.agent/current/NOTIFY_FAILED.md"
 check "NOTIFY_FAILED.md contains the message" grep -q '\[worker-notify\]' "$repo/.agent/current/NOTIFY_FAILED.md"
 
@@ -251,64 +247,62 @@ else
     fail "detached worker did not notify within 10s"
 fi
 
-# --- 6c. session auto-discovery (fixture Codex home, fail-safe) ------------------
+# --- 6c. session identity: explicit only, fail closed (H04) ----------------------
 FAKE_HOME="$repo/.fake-codex-home"
 mkdir -p "$FAKE_HOME"
-PROJ="$(cd "$repo" && pwd -P)"
-NOW_MS="$(printf '%s' "$(date +%s)000")"
-OLD_MS=$((NOW_MS - 3600000))
-
-sqlite3 "$FAKE_HOME/thread_history_1.sqlite" \
-    "CREATE TABLE thread_items(thread_id TEXT, created_at_ms INTEGER);"
 sqlite3 "$FAKE_HOME/state_5.sqlite" \
     "CREATE TABLE threads(id TEXT, archived INTEGER, cwd TEXT, title TEXT, updated_at INTEGER);"
+sqlite3 "$FAKE_HOME/state_5.sqlite" \
+    "INSERT INTO threads VALUES ('sess-ok',0,'/tmp/p','ok',1), ('sess-archived',1,'/tmp/a','arch',2);"
 
-discover() {  # discover -> sets D_OUT / D_RC from --print-session
-    D_OUT=""
-    D_RC=0
-    D_OUT="$(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --print-session 2>/dev/null)" || D_RC=$?
+NOTIFY_HOME_TEST() {
+    (cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$@")
 }
 
-# unique recent, non-archived session -> detected
-sqlite3 "$FAKE_HOME/thread_history_1.sqlite" "INSERT INTO thread_items VALUES ('thread-solo', $NOW_MS);"
-sqlite3 "$FAKE_HOME/state_5.sqlite" "INSERT INTO threads VALUES ('thread-solo',0,'/tmp/elsewhere','solo',1);"
-discover
-check_eq "discovery: unique recent session is detected" "0" "$D_RC"
-check_eq "discovery: detected the right session" "thread-solo" "$(printf '%s' "$D_OUT" | cut -f1)"
+# no identity -> refuse (exit 1), never guess
+N_RC=0
+NOTIFY_HOME_TEST env -u CODEX_THREAD_ID "$NOTIFY" --print-target >"$OUT_DIR/target-none.log" 2>&1 || N_RC=$?
+check_eq "identity: no CODEX_THREAD_ID and no flag -> exit 1" "1" "$N_RC"
+check "identity: refusal message is explicit" grep -q 'no target' "$OUT_DIR/target-none.log"
 
-# archived sessions are never returned
-sqlite3 "$FAKE_HOME/state_5.sqlite" "UPDATE threads SET archived=1 WHERE id='thread-solo';"
-discover
-check_eq "discovery: archived-only -> exit 1" "1" "$D_RC"
+# explicit flag wins
+N_RC=0
+NOTIFY_HOME_TEST "$NOTIFY" --print-target --codex-thread sess-ok >"$OUT_DIR/target-flag.log" 2>&1 || N_RC=$?
+check_eq "identity: explicit --codex-thread is used" "0" "$N_RC"
+check "identity: prints the explicit target" grep -q '^sess-ok' "$OUT_DIR/target-flag.log"
 
-# unique project-cwd match wins among several recent sessions
-sqlite3 "$FAKE_HOME/thread_history_1.sqlite" \
-    "INSERT INTO thread_items VALUES ('thread-other', $((NOW_MS + 1000))), ('thread-project', $((NOW_MS - 1000)));"
-sqlite3 "$FAKE_HOME/state_5.sqlite" \
-    "INSERT INTO threads VALUES ('thread-other',0,'/tmp/elsewhere','other',2),
-                                ('thread-project',0,'$PROJ','project',3);"
-discover
-check_eq "discovery: unique project-cwd match wins" "0" "$D_RC"
-check_eq "discovery: detected the project session" "thread-project" "$(printf '%s' "$D_OUT" | cut -f1)"
+# CODEX_THREAD_ID from the calling runtime is honored
+N_RC=0
+NOTIFY_HOME_TEST env CODEX_THREAD_ID=sess-ok "$NOTIFY" --print-target >"$OUT_DIR/target-env.log" 2>&1 || N_RC=$?
+check_eq "identity: CODEX_THREAD_ID is honored" "0" "$N_RC"
 
-# two recent sessions for the same project -> refuse to guess (H04)
-sqlite3 "$FAKE_HOME/state_5.sqlite" "UPDATE threads SET archived=0 WHERE id IN ('thread-solo','thread-other','thread-project');
-                                      UPDATE threads SET cwd='$PROJ' WHERE id IN ('thread-other','thread-project');"
-discover
-check_eq "discovery: ambiguous sessions -> exit 3 (refuse to guess)" "3" "$D_RC"
+# archived target is refused with a hint
+N_RC=0
+NOTIFY_HOME_TEST "$NOTIFY" --print-target --codex-thread sess-archived >"$OUT_DIR/target-arch.log" 2>&1 || N_RC=$?
+check_eq "identity: archived target -> exit 3" "3" "$N_RC"
+check "identity: archived hint present" grep -q 'ARCHIVED' "$OUT_DIR/target-arch.log"
 
-# the handoff command must refuse to run on an ambiguous session
+# handoff without an identity fails closed instead of guessing
 rm -f "$repo/.agent/current/RESULT.md"
-NOTIFY_RC=0
-(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --mode implement --task-id OFF2) >"$OUT_DIR/notify-ambiguous.log" 2>&1 || NOTIFY_RC=$?
-check_eq "worker-notify: ambiguous session -> exit 13" "13" "$NOTIFY_RC"
-check "worker-notify: ambiguity message is explicit" grep -q 'refusing to guess' "$OUT_DIR/notify-ambiguous.log"
+N_RC=0
+NOTIFY_HOME_TEST env -u CODEX_THREAD_ID "$NOTIFY" --mode implement --task-id OFF2 >"$OUT_DIR/notify-no-target.log" 2>&1 || N_RC=$?
+check_eq "worker-notify: no target -> exit 14 (refusing to guess)" "14" "$N_RC"
+check "worker-notify: refusal is explicit" grep -q 'refusing to guess' "$OUT_DIR/notify-no-target.log"
 
-# old activity outside the window is not considered
-sqlite3 "$FAKE_HOME/thread_history_1.sqlite" "DELETE FROM thread_items;"
-sqlite3 "$FAKE_HOME/thread_history_1.sqlite" "INSERT INTO thread_items VALUES ('thread-old', $OLD_MS);"
-discover
-check_eq "discovery: stale activity -> exit 1" "1" "$D_RC"
+# message wording for the new exit codes (N01)
+(NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 0 --task-id OFF2) >"$OUT_DIR/notify-msg-0.log" 2>&1 || true
+(NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 5 --task-id OFF2) >"$OUT_DIR/notify-msg-5.log" 2>&1 || true
+(NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 6 --task-id OFF2) >"$OUT_DIR/notify-msg-6.log" 2>&1 || true
+(NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 7 --task-id OFF2) >"$OUT_DIR/notify-msg-7.log" 2>&1 || true
+(NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 10 --task-id OFF2) >"$OUT_DIR/notify-msg-10.log" 2>&1 || true
+(NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 2 --task-id OFF2) >"$OUT_DIR/notify-msg-2.log" 2>&1 || true
+check "success message asks for review" grep -q '验收' "$OUT_DIR/notify-msg-0.log"
+check "exit 5 asks to read the existing RESULT" grep -q '有 RESULT.md' "$OUT_DIR/notify-msg-5.log"
+check "exit 6 asks to inspect current/ and attempts/" grep -q 'attempts' "$OUT_DIR/notify-msg-6.log"
+check "exit 7 says a worker is already running" grep -q '已有 worker' "$OUT_DIR/notify-msg-7.log"
+check "escalation message asks for a decision" grep -q '决策' "$OUT_DIR/notify-msg-10.log"
+check "failure (no report) message says so" grep -q '无报告' "$OUT_DIR/notify-msg-2.log"
+check "message carries absolute paths" grep -q '/\.agent/current/RESULT.md' "$OUT_DIR/notify-msg-0.log"
 
 # --- 6d. run-worker.sh safety harness (fake opencode, offline) --------------------
 HARNESS="$repo/.harness"
@@ -376,18 +370,34 @@ check_eq "harness: stale report quarantined, no report -> exit 3" "3" "$FAKE_RC"
 check "harness: stale report moved to attempts/" bash -c "grep -rl 'stale report from an earlier attempt' '$hrepo/.agent/history/attempts' >/dev/null 2>&1"
 check "harness: current/RESULT.md is gone" bash -c "! test -e '$hrepo/.agent/current/RESULT.md'"
 
-# single-run lock (H03)
+# single-run lock identity (H03)
 sleep 30 &
 LOCKER=$!
 mkdir -p "$hrepo/.agent/current/.worker.lock"
-printf 'pid=%s\nrun_id=live\n' "$LOCKER" >"$hrepo/.agent/current/.worker.lock/info"
+printf 'pid=%s\nworker_pid=\nrun_id=live\n' "$LOCKER" >"$hrepo/.agent/current/.worker.lock/info"
 run_fake result 0 --allow-dirty --mode implement
-check_eq "harness: live lock refuses a second worker -> exit 7" "7" "$FAKE_RC"
+check_eq "harness: live wrapper lock refuses a second worker -> exit 7" "7" "$FAKE_RC"
 kill "$LOCKER" 2>/dev/null || true
 wait "$LOCKER" 2>/dev/null || true
-printf 'pid=999999\nrun_id=dead\n' >"$hrepo/.agent/current/.worker.lock/info"
+
+# dead wrapper but a recorded live worker pid must still refuse (H03 core case)
+sleep 30 &
+SURVIVOR=$!
+printf 'pid=999999\nworker_pid=%s\nrun_id=survivor\n' "$SURVIVOR" >"$hrepo/.agent/current/.worker.lock/info"
 run_fake result 0 --allow-dirty --mode implement
-check_eq "harness: stale lock is taken over -> exit 0" "0" "$FAKE_RC"
+check_eq "harness: dead wrapper + live worker pid -> exit 7" "7" "$FAKE_RC"
+kill "$SURVIVOR" 2>/dev/null || true
+wait "$SURVIVOR" 2>/dev/null || true
+
+# no live pid at all: never taken over automatically (fail closed)
+printf 'pid=999999\nworker_pid=999998\nrun_id=dead\n' >"$hrepo/.agent/current/.worker.lock/info"
+run_fake result 0 --allow-dirty --mode implement
+check_eq "harness: unprovable stale lock -> exit 8" "8" "$FAKE_RC"
+check "harness: exit 8 explains --break-lock" grep -q -- '--break-lock' "$OUT_DIR/fake-run.log"
+
+# explicit --break-lock takes over and the lock is released afterwards
+run_fake result 0 --allow-dirty --mode implement --break-lock
+check_eq "harness: --break-lock takes over -> exit 0" "0" "$FAKE_RC"
 check "harness: stale lock moved aside" bash -c "ls -d '$hrepo'/.agent/history/attempts/stale-locks/* >/dev/null 2>&1"
 check "harness: lock released after the run" bash -c "! test -e '$hrepo/.agent/current/.worker.lock'"
 
@@ -402,6 +412,30 @@ check_eq "harness: --task-id mismatch -> exit 1" "1" "$FAKE_RC"
 run_fake result 0 --allow-dirty --mode verify
 check_eq "harness: --mode mismatch -> exit 1" "1" "$FAKE_RC"
 
+# template list placeholders are still placeholders (M02)
+cp "$HARNESS/TASK.good" "$hrepo/.agent/current/TASK.md"
+sed -i '' 's/^- \[ \] works$/- [ ] <observable, checkable criterion>/' "$hrepo/.agent/current/TASK.md"
+sed -i '' 's/^- app\.py$/- <exact files>/' "$hrepo/.agent/current/TASK.md"
+run_fake result 0 --allow-dirty --mode implement
+check_eq "harness: list placeholders rejected -> exit 1" "1" "$FAKE_RC"
+check "harness: placeholder message names the section" grep -q 'placeholder' "$OUT_DIR/fake-run.log"
+cp "$HARNESS/TASK.good" "$hrepo/.agent/current/TASK.md"
+
+# REVIEW.md without a Task ID is rejected (M02)
+cat >"$hrepo/.agent/current/REVIEW.md" <<'EOF'
+# Review
+
+## Decision
+REWORK
+
+## Required Corrections
+- fix it
+EOF
+run_fake result 0 --allow-dirty --mode implement
+check_eq "harness: REVIEW.md without Task ID -> exit 1" "1" "$FAKE_RC"
+check "harness: REVIEW message is explicit" grep -q 'REVIEW.md has no' "$OUT_DIR/fake-run.log"
+rm -f "$hrepo/.agent/current/REVIEW.md"
+
 # dirty tree handling + baseline evidence (M01)
 printf 'print("local change")\n' >>"$hrepo/app.py"
 run_fake result 0 --mode implement
@@ -409,6 +443,7 @@ check_eq "harness: dirty tree without --allow-dirty -> exit 1" "1" "$FAKE_RC"
 run_fake result 0 --allow-dirty --mode implement
 check_eq "harness: dirty tree with --allow-dirty -> exit 0" "0" "$FAKE_RC"
 check "harness: BASELINE.md lists the dirty file" grep -q 'M app.py' "$hrepo/.agent/current/BASELINE.md"
+check "harness: BASELINE.patch holds the full pre-run patch" grep -q 'local change' "$hrepo/.agent/current/BASELINE.patch"
 
 # cwd pinning when invoked from elsewhere (H02)
 OTHER="$(new_repo smoke-caller)"
@@ -465,6 +500,90 @@ else
     fail "installer failed on a fresh HOME (see $OUT_DIR/install-fresh-home.log)"
 fi
 check "fresh HOME install created both skills" test -f "$FRESH_HOME/.agents/skills/phase-runner/SKILL.md"
+
+# physical-target policy: a parent symlink escaping $HOME is refused (M05)
+LINK_HOME="$(mktemp -d "$TMP_BASE/linkhome.XXXXXX")"
+ALTERNATE="$(mktemp -d "$TMP_BASE/alternate.XXXXXX")"
+CLEANUP_DIRS+=("$LINK_HOME" "$ALTERNATE")
+mkdir -p "$ALTERNATE"
+ln -s "$ALTERNATE" "$LINK_HOME/.agents"
+if HOME="$LINK_HOME" "$PROJECT_ROOT/scripts/install-skills.sh" --quiet >"$OUT_DIR/install-symlink-escape.log" 2>&1; then
+    fail "installer must refuse a parent symlink escaping HOME"
+else
+    pass "installer refuses a parent symlink escaping HOME"
+fi
+check "symlink-escape message" grep -q 'outside \$HOME' "$OUT_DIR/install-symlink-escape.log"
+
+# uninstaller must refuse a source-tree target even with the test gate (M05)
+SRCCOPY="$(mktemp -d "$TMP_BASE/sourcecopy.XXXXXX")"
+CLEANUP_DIRS+=("$SRCCOPY")
+mkdir -p "$SRCCOPY/skills" "$SRCCOPY/scripts"
+cp -R "$PROJECT_ROOT/skills/cheap-worker" "$SRCCOPY/skills/cheap-worker"
+cp -R "$PROJECT_ROOT/skills/phase-runner" "$SRCCOPY/skills/phase-runner"
+cp "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" "$SRCCOPY/scripts/"
+printf 'installed\n' >"$SRCCOPY/skills/cheap-worker/.installed-by-agent-orchestration"
+printf 'installed\n' >"$SRCCOPY/skills/phase-runner/.installed-by-agent-orchestration"
+if AGENT_ORCHESTRATION_TEST_TARGET=1 "$SRCCOPY/scripts/uninstall-managed-skills.sh" \
+        --target "$SRCCOPY/skills" --force --yes >"$OUT_DIR/uninstall-sourcecopy.log" 2>&1; then
+    fail "uninstaller must refuse a source-copy target"
+else
+    pass "uninstaller refuses a source-copy target"
+fi
+check "source-copy refusal message" grep -q 'source repo' "$OUT_DIR/uninstall-sourcecopy.log"
+check "source-copy skills survived" test -f "$SRCCOPY/skills/cheap-worker/SKILL.md"
+
+# --- 7b. check-state fail-closed cases (M03) ----------------------------------------
+CSREPO="$(new_repo smoke-checkstate)"
+CLEANUP_DIRS+=("$CSREPO")
+mkdir -p "$CSREPO/.agent/phases/A" "$CSREPO/.agent/current"
+sstate() {  # sstate <queue-json> <run-state-json> <task-md> <state-json>
+    printf '%s' "$1" >"$CSREPO/.agent/phases/A/TASK_QUEUE.json"
+    printf '%s' "$2" >"$CSREPO/.agent/RUN_STATE.json"
+    printf '%s' "$3" >"$CSREPO/.agent/current/TASK.md"
+    printf '%s' "$4" >"$CSREPO/.agent/current/STATE.json"
+    rm -f "$CSREPO/.agent/current/RESULT.md" "$CSREPO/.agent/current/ESCALATION.md"
+}
+CS="$HOME/.agents/skills/cheap-worker/scripts/check-state.sh"
+
+sstate '{broken' '{"current_phase":"A","current_task":"A02","status":"running"}' '' '{}'
+CS_RC=0
+(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-badjson.log" 2>&1 || CS_RC=$?
+check_eq "check-state: broken queue JSON -> exit 1" "1" "$CS_RC"
+check "check-state: broken JSON is reported" grep -q 'not valid JSON' "$OUT_DIR/cs-badjson.log"
+
+sstate '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
+       '{"current_phase":"A","current_task":"WRONG","status":"running"}' \
+       '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+CS_RC=0
+(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-runstate.log" 2>&1 || CS_RC=$?
+check_eq "check-state: RUN_STATE task mismatch -> exit 1" "1" "$CS_RC"
+check "check-state: mismatch is reported" grep -q 'does not match the queue' "$OUT_DIR/cs-runstate.log"
+
+sstate '{"tasks":[{"id":"A02","status":"in_progress"},{"id":"A03","status":"in_progress"}]}' \
+       '{"current_phase":"A","current_task":"A02","status":"running"}' \
+       '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+CS_RC=0
+(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-two-inprogress.log" 2>&1 || CS_RC=$?
+check_eq "check-state: two in_progress -> exit 1" "1" "$CS_RC"
+check "check-state: two in_progress reported" grep -q 'more than one Task is in_progress' "$OUT_DIR/cs-two-inprogress.log"
+
+mkdir -p "$CSREPO/.agent/history/20260101T000000Z-A02"
+sstate '{"tasks":[{"id":"A02","status":"in_progress"}]}' \
+       '{"current_phase":"A","current_task":"A02","status":"running"}' \
+       '# Task
+
+## Task ID
+A02' '{"task_id":"A02"}'
+CS_RC=0
+(cd "$CSREPO" && "$CS") >"$OUT_DIR/cs-archived-not-done.log" 2>&1 || CS_RC=$?
+check_eq "check-state: archive without done -> exit 1" "1" "$CS_RC"
+check "check-state: suggests marking done" grep -q 'mark it done' "$OUT_DIR/cs-archived-not-done.log"
 
 # --- 8. uninstall safety (dry-run only) -------------------------------------------
 if "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" --dry-run >"$OUT_DIR/uninstall-dry.log" 2>&1; then

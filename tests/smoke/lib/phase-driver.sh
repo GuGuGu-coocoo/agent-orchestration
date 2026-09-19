@@ -31,6 +31,12 @@ CURRENT="$REPO/.agent/current"
 
 log() { printf '[phase-driver] %s\n' "$*"; }
 
+# The skill says to consult check-state before resuming; the double logs it too.
+if [[ -x "$HOME/.agents/skills/cheap-worker/scripts/check-state.sh" ]]; then
+    log "check-state verdict:"
+    (cd "$REPO" && "$HOME/.agents/skills/cheap-worker/scripts/check-state.sh" 2>&1 | grep -E 'verdict:|ISSUE' | sed 's/^/  /') || true
+fi
+
 archive_current() {
     local id="$1" decision="$2"
     (cd "$REPO" && "$ARCHIVER" --yes --task-id "$id" --decision "$decision") >/dev/null
@@ -71,6 +77,14 @@ next_task_id() {
 
 task_title() {
     jq -r --arg id "$1" '.tasks[] | select(.id==$id) | .title' "$QUEUE"
+}
+
+task_mode() {
+    jq -r --arg id "$1" '.tasks[] | select(.id==$id) | .mode' "$QUEUE"
+}
+
+escalated_task() {
+    jq -r '[.tasks[] | select(.status == "escalated") | .id] | join(",")' "$QUEUE"
 }
 
 write_task_md() {
@@ -180,6 +194,14 @@ review_task() {
 }
 
 while :; do
+    esc="$(escalated_task)"
+    if [[ -n "$esc" ]]; then
+        log "task(s) escalated: $esc - stopping (not a completed phase)"
+        update_queue_status "blocked"
+        update_run_state "blocked" "${esc%%,*}"
+        exit 2
+    fi
+
     next_id="$(next_task_id)"
     if [[ -z "$next_id" ]]; then
         log "no pending or in_progress tasks left"
@@ -229,7 +251,7 @@ EOF
         jq --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
             '(.tasks[] | select(.id=="'"$next_id"'")) |= (.history += [{at: $now, decision: "REWORK", note: "acceptance check failed"}])' \
             "$QUEUE" >"$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
-        if ! run_one_task "$next_id" "fix" "" "$(task_title "$next_id")"; then
+        if ! run_one_task "$next_id" "$(task_mode "$next_id")" "" "$(task_title "$next_id")"; then
             log "reworked $next_id still failed; stopping"
             jq_update_task "$next_id" ".status = \"escalated\""
             update_run_state "blocked" "$next_id"
@@ -247,14 +269,23 @@ EOF
     if [[ "$REWORK_MODE" -eq 1 && "$next_id" == "A02" ]]; then
         # Forced corrective round BEFORE acceptance: a stricter requirement is
         # appended to the test suite and the same Task must satisfy it.
-        log "REWORK_MODE: forcing a corrective round on A02 (edge case shutdown(0))"
+        log "REWORK_MODE: forcing a corrective round on A02 (negative seconds must raise)"
         cat >>"$REPO/test_app.py" <<'EOF'
 
 
-def test_shutdown_zero():
+def test_shutdown_negative():
+    import pytest
     from app import shutdown
-    assert shutdown(0) == "shutting down in 0s"
+    with pytest.raises(ValueError):
+        shutdown(-1)
 EOF
+        # Prove the new requirement actually fails before calling it a rework.
+        if (cd "$REPO" && python3 -m pytest -q test_app.py) >/dev/null 2>&1; then
+            log "REWORK_MODE: appended requirement did not fail; refusing to fake a rework"
+            jq_update_task "A02" ".status = \"escalated\""
+            update_run_state "blocked" "A02"
+            exit 2
+        fi
         cat >"$CURRENT/REVIEW.md" <<'EOF'
 # Review
 
@@ -265,16 +296,16 @@ A02
 REWORK
 
 ## Findings
-- test_app.py now contains test_shutdown_zero, which fails: shutdown(0) must return "shutting down in 0s".
+- test_app.py now contains test_shutdown_negative, which fails: shutdown(-1) must raise ValueError.
 
 ## Required Corrections
-- Make shutdown(0) return exactly "shutting down in 0s".
+- Make shutdown(seconds) raise ValueError for negative seconds.
 - Keep test_uppercase and test_shutdown passing.
 
 ## Keep
 - uppercase() and shutdown(5) behavior must stay correct.
 EOF
-        if ! run_one_task "A02" "fix" "" "add shutdown(seconds)"; then
+        if ! run_one_task "A02" "$(task_mode "A02")" "" "add shutdown(seconds)"; then
             log "REWORK_MODE corrective round failed"
             jq_update_task "A02" ".status = \"escalated\""
             update_run_state "blocked" "A02"

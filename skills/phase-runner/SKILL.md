@@ -38,32 +38,32 @@ Phase C
 7. **One Task = one OpenCode session.** The worker runs on the shared background
    service so the human can watch it in OpenCode Desktop; never pass `--standalone`
    or `--model`, and give each session a clear title.
-8. **Wake-up handoff is allowed and preferred when the human names a session.** The
-   helper `worker-notify.sh` runs the worker in the background and wakes THIS Codex
-   session with `codex queue` when the Task ends. That is the sanctioned way for the
-   Supervisor to stop occupying its turn while the worker runs - not a callback the
-   Supervisor has to build.
+8. **Wake-up handoff needs an exact target.** `worker-notify.sh` runs the worker in
+   the background and wakes a session with `codex queue`. The target must be named
+   by the human (`--codex-thread`) or provided as `CODEX_THREAD_ID`; the helper
+   never guesses, and falls back to blocking mode when no target exists.
 
 ## Background handoff (wake-up mode)
 
-The human only has to say: *"用 $phase-runner 做到 Phase C"*. No session naming.
+Wake-up needs an exact target: the human names this session (e.g. `编排`) or the
+runtime provides `CODEX_THREAD_ID`. There is no auto-detection - the helper refuses
+to guess (exit 14) and you use blocking mode instead.
 
-Handoff: run `worker-notify.sh ...` (no session argument needed - the helper detects
-this Codex session from Codex's local history: the thread with the most recent
-activity, archived ones skipped, a session rooted at this project preferred). Report
-the plan in one line and end your turn. You will receive a short `[worker-notify]`
-message when the Task ends:
+Handoff: run `worker-notify.sh --codex-thread "<id-or-name>" ...`, report the plan in
+one line and end your turn. You will receive a short `[worker-notify]` message when
+the Task ends:
 
-- `完成` -> do the normal review (step 14-15) and hand off the next Task.
+- `完成` -> do the normal review (step 13-14) and hand off the next Task.
 - `需要你决策` -> read `ESCALATION.md`, resolve or ask the human, then continue.
-- `失败` -> inspect `STATE.json` and the logs, then retry or escalate.
+- anything else (exit 5/6/7/2/3) -> inspect the named report/state first; do not
+  retry blindly. Exit 15 means the wake-up itself failed: the message is in
+  `.agent/current/NOTIFY_FAILED.md`.
 
-Prerequisites: the ChatGPT/Codex desktop app stays running **with this session open**
-(an open session can be woken by `codex queue`; a closed or archived one cannot).
-If detection picks the wrong session (several sessions active), pass
-`--codex-thread <name-or-id>` explicitly.
+Prerequisites: the ChatGPT/Codex desktop app stays running **with the target session
+open** (an open session can be woken by `codex queue`; a closed or archived one
+cannot).
 
-If the app was closed or the session could not be reached, the helper writes
+If the app was closed or the target could not be reached, the helper writes
 `.agent/current/NOTIFY_FAILED.md` with the message and a hint; read it on your next
 turn to see what ended. Keep wake-up messages short - they enter this conversation
 as a user message and cost tokens on every wake-up.
@@ -111,25 +111,24 @@ Details and sizing rules: `references/phase-planning.md`.
     `.agent/current/BASELINE.md`, and the review must compare against it so that
     old changes are not mistaken for this Task's diff.
 12. Hand off the Task to the worker - exactly one Task at a time - in one of two modes:
-    - **Background + wake-up** (use when a target is available):
-      `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --mode <mode> --task-id <id> --title "<queue title>" [--allow-dirty]`
-      The command returns immediately. End your turn and wait. When the worker
-      finishes, `codex queue` delivers a short message into this session and you
-      wake up to review it.
-      The session is only auto-detected when the detection is unambiguous; on
-      `exit 13` (ambiguous) or `exit 14` (none found) the script refuses to guess:
-      rerun with an explicit `--codex-thread <id-or-name>` or fall back to blocking.
-    - **Blocking (default fallback, and when the human wants to watch live)**:
+    - **Blocking (default, always safe)**:
       `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode> --task-id <id> --title "<queue title>" [--allow-dirty]`
       This blocks until the worker finishes, then continue in the same turn.
+    - **Background + wake-up (only with an exact target)**:
+      `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --codex-thread "<id-or-name>" --mode <mode> --task-id <id> --title "<queue title>" [--allow-dirty]`
+      Use it when the human named this session (or the runtime sets
+      `CODEX_THREAD_ID`). It returns immediately, you end your turn, and `codex
+      queue` wakes that session when the worker is done. The helper never guesses a
+      session: without an exact target it exits `14` - fall back to blocking.
     Model choice belongs to OpenCode's own configuration; neither script passes
     `--model` and neither starts a private server. One Task = one OpenCode session,
     visible in OpenCode Desktop.
     Worker exit codes: `0` fresh valid RESULT, `5` RESULT but opencode failed
     (review carefully), `10` ESCALATION, `6` stale/mismatched report, `7` another
-    worker is running, `2/3/4` plumbing failures. The script validates TASK.md
-    (required sections, real Task ID, matching `--mode`/`--task-id`) and quarantines
-    previous reports to `.agent/history/attempts/<task>/` before each run.
+    worker is running, `8` stale lock needs `--break-lock`, `2/3/4` plumbing
+    failures. The script validates TASK.md (required sections, real Task ID,
+    matching `--mode`/`--task-id`, REVIEW.md identity) and quarantines previous
+    reports to `.agent/history/attempts/<task>/` before each run.
 13. Review the result per `references/task-review.md`: read `TASK.md`, `RESULT.md`,
     `git diff --stat`/`git diff`, `BASELINE.md`, test output, plus only the files
     that changed. `check-state.sh` prints the cross-file consistency verdict when
@@ -174,7 +173,10 @@ Any time a session starts, before anything else:
 
 1. Run `~/.agents/skills/cheap-worker/scripts/check-state.sh` in the project. It
    cross-checks the lock, queue, `RUN_STATE.json`, the current TASK/STATE and the
-   reports, and prints a single verdict. Trust the verdict before acting.
+   reports, and prints a single verdict. An `INCONSISTENT` verdict is blocking:
+   fix the listed items (or run the reconciliation named in the message) before
+   acting. `check-state.sh` is fail-closed on unreadable JSON; it is a diagnostic,
+   not a substitute for reading the files it points at.
 2. Read `.agent/RUN_STATE.json` and `.agent/phases/<phase>/TASK_QUEUE.json`.
 
 | check-state verdict | action |

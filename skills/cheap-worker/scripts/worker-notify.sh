@@ -8,36 +8,37 @@
 # review (ACCEPT / REWORK) and hand off the next Task.
 #
 # Usage:
-#   worker-notify.sh [run-worker options...]          # session auto-detected
-#   worker-notify.sh --codex-thread NAME_OR_ID [...]  # explicit session
-#   worker-notify.sh --foreground [...]               # stay attached (debug)
-#   worker-notify.sh --print-message --simulate-exit 10
-#   worker-notify.sh --print-session                  # show the detected session
+#   worker-notify.sh --codex-thread <id-or-name> [run-worker options...]
+#   worker-notify.sh [run-worker options...]   # uses CODEX_THREAD_ID if the runtime set it
+#   worker-notify.sh --foreground [...]        # stay attached (debug)
+#   worker-notify.sh --print-message --simulate-exit 5
+#   worker-notify.sh --print-target            # show the resolved target, if any
 #
-# The Codex session is auto-detected only when the detection is unambiguous
-# (exactly one recently active, non-archived session, or a unique project-cwd
-# match). Anything ambiguous fails fast (exit 13/14): pass --codex-thread
-# <id-or-name>, or use run-worker.sh (blocking) instead. Overrides:
-# --codex-thread NAME_OR_ID, --print-session (show what would be detected).
+# The wake-up target must be identified exactly: pass --codex-thread, or have the
+# runtime provide CODEX_THREAD_ID. There is NO guessing from local history - a
+# wrong guess would wake another conversation. Without a target the helper fails
+# closed (exit 14) and the Supervisor uses run-worker.sh (blocking) instead.
 #
 # Options (all other options are forwarded to run-worker.sh):
-#   --codex-thread NAME    Codex session name or id (default: fail-safe detect)
+#   --codex-thread NAME    Codex session id or exact name (required unless
+#                          CODEX_THREAD_ID is set by the calling runtime) or --no-notify
 #   --no-notify            run the worker but do not wake Codex
 #   --foreground           do not detach (default: detached; use for tests/debug)
 #   --print-message        dry-run: print the wake-up message and exit
-#   --print-session        print the detected session (id, title, cwd) and exit
-#                          (0 = unique, 3 = ambiguous, 1 = none)
-#   --simulate-exit N      exit code to use with --print-message (0|10|other)
+#   --print-target         print the resolved target session and exit
+#   --simulate-exit N      exit code to use with --print-message (0|5|10|other)
 #   --message-prefix STR   optional prefix for the wake-up message
 #   --codex-bin PATH       codex CLI path (default: auto-detect)
 #   -h|--help
 #
-# Environment: WORKER_NOTIFY_CODEX_HOME (default ~/.codex), CODEX_BIN,
+# Environment: CODEX_THREAD_ID (exact calling session, when provided),
+#              WORKER_NOTIFY_CODEX_HOME (default ~/.codex), CODEX_BIN,
 #              WORKER_NOTIFY_RUN_WORKER (default: sibling run-worker.sh)
 #
-# Exit codes: the worker's exit code (foreground/print mode);
+# Exit codes: the worker's exit code (foreground mode);
 #             0 when the background launch succeeded;
-#             13 ambiguous session, 14 no session found (refusing to guess).
+#             14 no exact target (refusing to guess);
+#             15 the worker finished but the wake-up could not be delivered.
 #
 # This script never commits, pushes, merges or deletes anything.
 
@@ -47,7 +48,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_WORKER="${WORKER_NOTIFY_RUN_WORKER:-$SCRIPT_DIR/run-worker.sh}"
 DETACHED="${WORKER_NOTIFY_DETACHED:-0}"
 
+CODEX_THREAD_ARG=""
 CODEX_THREAD=""
+NOTIFY_FAILED=0
 NO_NOTIFY=0
 FOREGROUND=0
 PRINT_MESSAGE=0
@@ -66,11 +69,11 @@ usage() { sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 # --- argument parsing ---------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --codex-thread)   CODEX_THREAD="${2:-}"; shift 2 ;;
+        --codex-thread)   CODEX_THREAD_ARG="${2:-}"; shift 2 ;;
         --no-notify)      NO_NOTIFY=1; shift ;;
         --foreground)     FOREGROUND=1; shift ;;
         --print-message)  PRINT_MESSAGE=1; shift ;;
-        --print-session)  PRINT_SESSION=1; shift ;;
+        --print-session|--print-target) PRINT_SESSION=1; shift ;;
         --simulate-exit)  SIMULATE_EXIT="${2:-0}"; shift 2 ;;
         --message-prefix) MESSAGE_PREFIX="${2:-}"; shift 2 ;;
         --codex-bin)      CODEX_BIN_OPT="${2:-}"; shift 2 ;;
@@ -79,8 +82,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$PRINT_MESSAGE" -eq 0 && "$PRINT_SESSION" -eq 0 && "$NO_NOTIFY" -eq 0 && "$CODEX_THREAD" == "auto" ]]; then
-    CODEX_THREAD=""
+if [[ "$PRINT_MESSAGE" -eq 0 && "$PRINT_SESSION" -eq 0 && "$NO_NOTIFY" -eq 0 && "$CODEX_THREAD_ARG" == "auto" ]]; then
+    CODEX_THREAD_ARG=""
 fi
 [[ -x "$RUN_WORKER" ]] || die "run-worker.sh not found or not executable: $RUN_WORKER"
 
@@ -120,18 +123,16 @@ read_task_id() {
     printf '%s' "${id:--}"
 }
 
-# --- Codex session auto-discovery ---------------------------------------------
-# Auto-discovery is deliberately fail-safe: it only returns a session when there
-# is exactly ONE plausible candidate (recent activity, not archived; when several
-# are recent, a unique project-cwd match decides). Anything ambiguous returns 3
-# and the caller must use an explicit --codex-thread or blocking mode instead of
-# guessing another session.
+# --- Codex session identity -----------------------------------------------------
+# Wake-up targets a session ONLY when it can be identified exactly:
+#   1) --codex-thread <id-or-name> from the Supervisor, or
+#   2) CODEX_THREAD_ID from the calling environment (when the runtime provides it).
+# There is deliberately no guessing from local history: reading Codex's private
+# DBs to infer "the most recent session" cannot prove who the caller is, and a
+# wrong guess sends the wake-up to another conversation. When no identity is
+# available the helper fails closed (exit 14) and the Supervisor uses blocking.
 state_db_path() {
     ls -t "$CODEX_HOME_DIR"/state_*.sqlite 2>/dev/null | head -1
-}
-
-history_db_path() {
-    ls -t "$CODEX_HOME_DIR"/thread_history_*.sqlite 2>/dev/null | head -1
 }
 
 thread_row() {
@@ -143,89 +144,45 @@ thread_row() {
         2>/dev/null || true
 }
 
-# discover_thread -> prints the session id (exit 0);
-# exit 3 = ambiguous (candidates on stderr), exit 1 = none.
-discover_thread() {
-    local hist state now_ms window_ms id arch last row title cwd
-    command -v sqlite3 >/dev/null 2>&1 || return 1
-    hist="$(history_db_path)"
-    state="$(state_db_path)"
-    [[ -n "$hist" ]] || return 1
-    now_ms="$(printf '%s' "$(date +%s)000")"
-    window_ms=180000
-
-    local rows=""
-    rows="$(sqlite3 -separator '|' "$hist" \
-        "SELECT thread_id, max(created_at_ms) FROM thread_items GROUP BY thread_id ORDER BY max(created_at_ms) DESC LIMIT 50;" \
-        2>/dev/null || true)"
-    [[ -n "$rows" ]] || return 1
-
-    local recent="" recent_cwd=""
-    while IFS='|' read -r id last; do
-        [[ -n "$id" && -n "$last" ]] || continue
-        [[ "$last" =~ ^[0-9]+$ ]] || continue
-        (( last >= now_ms - window_ms )) || continue
-        arch=""
-        if [[ -n "$state" ]]; then
-            arch="$(sqlite3 "$state" "SELECT archived FROM threads WHERE id='$id' LIMIT 1;" 2>/dev/null || true)"
-        fi
-        [[ "$arch" == "1" ]] && continue
-        row="$(thread_row "$state" "$id")"
-        title="${row%%|*}"; row="${row#*|}"; cwd="${row%%|*}"
-        recent="${recent}${id}|${title}|${cwd}"$'\n'
-        if [[ -n "$cwd" && ( "$ROOT" == "$cwd" || "$ROOT" == "$cwd"/* \
-            || "$ROOT_PHYS" == "$cwd" || "$ROOT_PHYS" == "$cwd"/* ) ]]; then
-            recent_cwd="${recent_cwd}${id}|${title}|${cwd}"$'\n'
-        fi
-    done <<EOF2
-$rows
-EOF2
-
-    local n_recent n_cwd
-    n_recent="$(printf '%s' "$recent" | grep -c . || true)"
-    n_cwd="$(printf '%s' "$recent_cwd" | grep -c . || true)"
-
-    if [[ "$n_recent" -eq 1 ]]; then
-        printf '%s' "$recent" | head -1 | cut -d'|' -f1
+# resolve_thread_id -> prints the target id (exit 0) or returns 1
+resolve_thread_id() {
+    if [[ -n "$CODEX_THREAD_ARG" ]]; then
+        printf '%s' "$CODEX_THREAD_ARG"
         return 0
     fi
-    if [[ "$n_recent" -gt 1 ]]; then
-        if [[ "$n_cwd" -eq 1 ]]; then
-            printf '%s' "$recent_cwd" | head -1 | cut -d'|' -f1
-            return 0
-        fi
-        printf '%s' "$recent" | grep . >&2 || true
-        return 3
+    if [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+        printf '%s' "$CODEX_THREAD_ID"
+        return 0
     fi
     return 1
 }
 
+# target_archived <id-or-name> -> 0 when the state DB says that thread is archived
+target_archived() {
+    local state id
+    state="$(state_db_path)"
+    [[ -n "$state" ]] || return 1
+    id="$1"
+    [[ -n "$id" ]] || return 1
+    [[ "$(sqlite3 "$state" "SELECT archived FROM threads WHERE id='$id' OR title='$id' LIMIT 1;" 2>/dev/null || true)" == "1" ]]
+}
+
 ROOT="$(resolve_root)"
-ROOT_PHYS="$(cd "$ROOT" 2>/dev/null && pwd -P || printf '%s' "$ROOT")"
 TASK_ID="$(read_task_id "$ROOT")"
 
 if [[ "$PRINT_SESSION" -eq 1 ]]; then
-    set +e
-    DISCOVERED="$(discover_thread 2>/dev/null)"
-    D_RC=$?
-    set -e
-    case "$D_RC" in
-        0)
-            STATE_DB="$(state_db_path)"
-            ROW="$(thread_row "$STATE_DB" "$DISCOVERED")"
-            printf '%s\t%s\n' "$DISCOVERED" "${ROW:-<no thread metadata>}"
-            exit 0
-            ;;
-        3)
-            printf 'ambiguous: more than one recently active Codex session\n' >&2
-            discover_thread 2>&1 >/dev/null || true
+    if TARGET_ID="$(resolve_thread_id)"; then
+        STATE_DB="$(state_db_path)"
+        ROW="$(thread_row "$STATE_DB" "$TARGET_ID")"
+        printf '%s\t%s\n' "$TARGET_ID" "${ROW:-<no thread metadata>}"
+        if target_archived "$TARGET_ID"; then
+            printf 'target is ARCHIVED: reopen it in the app (or codex unarchive) before wake-up\n' >&2
             exit 3
-            ;;
-        *)
-            printf 'none: no recently active Codex session found in %s\n' "$CODEX_HOME_DIR" >&2
-            exit 1
-            ;;
-    esac
+        fi
+        exit 0
+    fi
+    printf 'no target: pass --codex-thread <id-or-name> or set CODEX_THREAD_ID\n' >&2
+    exit 1
 fi
 
 # --- wake-up message ----------------------------------------------------------
@@ -235,11 +192,26 @@ compose_message() {
         0)
             msg="[worker-notify] $id 完成。请验收：读 $root/.agent/current/RESULT.md + git diff + 必要测试 → ACCEPT（归档并发下一个 Task）或 REWORK（写 REVIEW.md 后重新投递）。"
             ;;
+        5)
+            msg="[worker-notify] $id 有 RESULT.md 但 opencode 非零退出（exit=5）。先检查 $root/.agent/current/RESULT.md、BASELINE.md 与 logs/，再决定接受、返工或重跑。"
+            ;;
+        4)
+            msg="[worker-notify] $id 同时存在 RESULT.md 与 ESCALATION.md（exit=4）。需要你裁决：读两份报告后决定以哪一份为准。"
+            ;;
+        6)
+            msg="[worker-notify] $id 的报告无效或过期（exit=6）。检查 $root/.agent/current/ 与 history/attempts/ 后再决定重跑或人工处理。"
+            ;;
+        7)
+            msg="[worker-notify] $id 未启动：已有 worker 在运行（exit=7）。不要重复投递；先运行 check-state.sh 查看状态。"
+            ;;
         10)
             msg="[worker-notify] $id 需要你决策（ESCALATION.md）。请读 $root/.agent/current/ESCALATION.md，处理后决定下一步。"
             ;;
+        2|3)
+            msg="[worker-notify] $id 失败（exit=${rc}，无报告）。请检查 $root/.agent/current/STATE.json 与 logs/，决定重试或升级。"
+            ;;
         *)
-            msg="[worker-notify] $id 失败（exit=${rc}，无报告）。请检查 $root/.agent/current/STATE.json 与 $root/.agent/current/logs/，决定重试或升级。"
+            msg="[worker-notify] $id 结束（exit=${rc}，未预期状态）。请检查 $root/.agent/current/STATE.json 与 logs/ 后再决定。"
             ;;
     esac
     if [[ -n "$MESSAGE_PREFIX" ]]; then
@@ -253,28 +225,22 @@ if [[ "$PRINT_MESSAGE" -eq 1 ]]; then
     exit 0
 fi
 
-# --- resolve the Codex session (explicit name/id, else fail-safe discovery) ---
+# --- resolve the target session (explicit id/name, else CODEX_THREAD_ID) -------
 if [[ "$NO_NOTIFY" -eq 0 && -z "$CODEX_THREAD" ]]; then
     set +e
-    CODEX_THREAD="$(discover_thread 2>/dev/null)"
-    D_RC=$?
+    CODEX_THREAD="$(resolve_thread_id)"
+    R_RC=$?
     set -e
-    case "$D_RC" in
-        0)
-            printf 'worker-notify: session auto-detected: %s\n' "$CODEX_THREAD"
-            ;;
-        3)
-            printf 'worker-notify: ERROR more than one recently active Codex session; refusing to guess:\n' >&2
-            discover_thread 2>&1 >/dev/null || true
-            printf 'worker-notify: pass --codex-thread <id-or-name>, or use run-worker.sh (blocking mode)\n' >&2
-            exit 13
-            ;;
-        *)
-            printf 'worker-notify: ERROR no recently active Codex session found; refusing to guess\n' >&2
-            printf 'worker-notify: pass --codex-thread <id-or-name>, or use run-worker.sh (blocking mode)\n' >&2
-            exit 14
-            ;;
-    esac
+    if [[ "$R_RC" -ne 0 ]]; then
+        printf 'worker-notify: ERROR no exact target session: pass --codex-thread <id-or-name> or set CODEX_THREAD_ID\n' >&2
+        printf 'worker-notify: refusing to guess from local history; use run-worker.sh (blocking mode) instead\n' >&2
+        exit 14
+    fi
+    if target_archived "$CODEX_THREAD"; then
+        printf 'worker-notify: ERROR target session "%s" is archived; reopen it (or codex unarchive) first\n' "$CODEX_THREAD" >&2
+        exit 14
+    fi
+    printf 'worker-notify: target session: %s\n' "$CODEX_THREAD"
 fi
 
 # --- detach (default): re-exec in the background and return immediately -------
@@ -332,6 +298,7 @@ detect_codex_bin() {
 
 notify_failed() {
     local msg="$1" reason="$2" hint="${3:-}"
+    NOTIFY_FAILED=1
     printf 'worker-notify: WARNING could not reach Codex session "%s": %s\n' "$CODEX_THREAD" "$reason" >&2
     {
         printf '# Notification not delivered\n\n'
@@ -351,11 +318,11 @@ notify_failed() {
 
 MESSAGE="$(compose_message "$worker_rc" "$TASK_ID" "$ROOT")"
 
-# No guessing at wake time: without a resolved target the message is preserved.
+# No target means no wake-up: preserve the message and report it distinctly.
 if [[ -z "$CODEX_THREAD" ]]; then
     notify_failed "$MESSAGE" "no Codex session target was resolved" \
         "pass --codex-thread <name or id>, or use run-worker.sh (blocking mode)"
-    exit "$worker_rc"
+    exit 15
 fi
 
 CODEX_BIN_PATH=""
@@ -382,4 +349,8 @@ else
     notify_failed "$MESSAGE" "codex CLI not found (install ChatGPT desktop app or set --codex-bin)"
 fi
 
+if [[ "${NOTIFY_FAILED:-0}" -eq 1 ]]; then
+    printf 'worker-notify: worker exit=%s but the wake-up was NOT delivered (exit 15); see NOTIFY_FAILED.md\n' "$worker_rc" >&2
+    exit 15
+fi
 exit "$worker_rc"

@@ -138,22 +138,25 @@ to use - the script never passes `--model` and never uses `--standalone`.
 | 3 | opencode finished but wrote no report |
 | 4 | both reports valid (inconsistent) |
 | 6 | report is stale, malformed, or for another Task |
-| 7 | another worker is already running for this project |
+| 7 | another worker (or a surviving worker process) is already running |
+| 8 | stale lock could not be proven dead; re-run with `--break-lock` after checking |
 
 Safety behaviours on every run:
 
-- a project-level lock (`.agent/current/.worker.lock`) refuses a second worker;
-  a stale lock (dead pid) is moved to `.agent/history/attempts/stale-locks/`
-  before the new run
-- previous `RESULT.md`/`ESCALATION.md`/`BASELINE.md` are quarantined to
+- a project-level lock (`.agent/current/.worker.lock`) records **both the wrapper
+  pid and the worker pid**, refuses a second worker (`7`), and **never takes over a
+  stale lock automatically**: use `--break-lock` after verifying nothing runs (`8`)
+- previous `RESULT.md`/`ESCALATION.md`/`BASELINE.*` are quarantined to
   `.agent/history/attempts/<task>/` so a stale report can never be mistaken for
   this run's output
 - `TASK.md` must contain the required sections (Task ID, Mode, Objective,
   Acceptance Criteria, Required Verification, Allowed Changes, Forbidden Changes)
-  with real content; `--task-id`/`--mode` must match the file
-- `--allow-dirty` records the pre-run dirty evidence (tracked, staged, untracked)
-  into `.agent/current/BASELINE.md`, so an accepted-but-uncommitted Task is not
-  confused with the next Task's changes
+  with real content - list placeholders such as `- <...>` / `- [ ] <...>` count as
+  missing; `--task-id`/`--mode` must match the file; a `REVIEW.md` must carry the
+  same Task ID
+- `--allow-dirty` records the pre-run tracked/staged/untracked status in
+  `.agent/current/BASELINE.md` plus the full `git diff HEAD --binary` in
+  `BASELINE.patch`
 - opencode always runs with `cwd` = project root, even when invoked elsewhere
 
 Other helper scripts:
@@ -219,33 +222,32 @@ for you).
 ln -sfn ~/.agents/skills/phase-runner ~/.codex/skills/phase-runner
 ```
 
-Then in a new Codex conversation, you only need one sentence:
+Then in a new Codex conversation:
 
 > 用 $phase-runner 做到 Phase C。
+> 我的会话名是 `编排`（用于后台唤醒；不写就用 blocking 模式）。
 
-The Supervisor takes it from there: it plans the Phase, hands off each Task with
-`worker-notify.sh` (background, auto-detected session, no naming needed), and wakes
-up in the same session to review. Ask for the blocking mode only when you want to
-watch a Task live.
+The Supervisor plans the Phase and hands off each Task with `worker-notify.sh`
+(background, explicit session target) or `run-worker.sh` (blocking). Without a
+session target the blocking mode is the safe default; there is no auto-detection.
 
 ### Two handoff modes
 
 | Mode | Command | Codex behavior | Use when |
 | --- | --- | --- | --- |
-| Background + wake-up | `worker-notify.sh ...` (session auto-detected) | returns immediately and ends the turn; `codex queue` wakes the SAME session when the Task ends | unattended / long Tasks (default) |
-| Blocking | `run-worker.sh ...` | waits inside the turn, then continues | watching live |
+| Blocking | `run-worker.sh ...` | waits inside the turn, then continues | default; always available |
+| Background + wake-up | `worker-notify.sh --codex-thread <id-or-name> ...` | returns immediately and ends the turn; `codex queue` wakes that session when the Task ends | you want to leave the machine and a target session is known |
 
 Wake-up details:
 
-- The Codex session is auto-detected **only when unambiguous** (exactly one
-  recently active, non-archived session; a unique project-cwd match decides when
-  several are recent). Ambiguity fails fast (`exit 13`) / no candidate (`exit 14`):
-  rerun with an explicit `--codex-thread <id-or-name>`, or use the blocking mode.
-  `--print-session` shows what would be detected.
-- Requires the ChatGPT/Codex desktop app to stay open **with the orchestration
-  session open**: an open session can be woken; a closed or archived one cannot
-  (the message waits in the queue, and the helper writes `NOTIFY_FAILED.md` with a
-  hint when delivery fails).
+- The target must be **exact**: `--codex-thread <id-or-name>`, or `CODEX_THREAD_ID`
+  when the calling runtime provides it. There is **no guessing from local history**
+  (a wrong guess would wake another conversation); without a target the helper
+  fails closed (`exit 14`) and the Supervisor stays in blocking mode.
+- `exit 15` means the worker finished but the wake-up could not be delivered:
+  the message is preserved in `.agent/current/NOTIFY_FAILED.md`.
+- Requires the ChatGPT/Codex desktop app to stay open **with the target session
+  open**: an open session can be woken; a closed or archived one cannot.
 - The wake-up message is a short `[worker-notify] ...` user message in the same
   session. It enters the context, so keep it short.
 - While the worker runs, the helper holds a `caffeinate -i` assertion so the Mac
@@ -295,7 +297,7 @@ project has an `AGENTS.md`, the worker must read it.
 never touches real projects. See `tests/smoke/README.md`.
 
 ```sh
-tests/smoke/run-offline.sh                  # no model calls (93 checks)
+tests/smoke/run-offline.sh                  # no model calls (125 checks)
 tests/smoke/run-live.sh                     # all live tests (OpenCode default model)
 SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh  # keep the generated repos
 ```
@@ -332,12 +334,14 @@ Defects reported during manual QA become new Tasks with the same loop. See
   separate orchestrator daemon. Wake-up mode requires the ChatGPT/Codex desktop app
   to stay open with the orchestration session open (its daemon owns the session and
   the message queue; closed or archived sessions cannot be woken).
-- Session auto-detection reads Codex's own local state DBs. It refuses ambiguous
-  cases instead of guessing, but it is the most fragile part of the design; passing
-  an explicit session id (or using blocking mode) is always stronger.
+- Session wake-up requires an **exact** target (`--codex-thread` or
+  `CODEX_THREAD_ID`); the helper refuses to guess from Codex's local history, so
+  without a target the Supervisor falls back to blocking mode.
 - `run-worker.sh` has no built-in wall-clock timeout (OpenCode's own behavior and
   the caller's timeout apply). `worker-notify.sh` solves the timeout problem by
-  detaching, but it cannot prevent lid-close sleep or a manual shutdown.
+  detaching, but it cannot prevent lid-close sleep or a manual shutdown, and
+  a worker that is still alive behind a dead wrapper blocks new runs until the
+  lock is cleared with `--break-lock`.
 - Reports are model-written Markdown; they can be wrong. The diff and command
   output are the evidence.
 - The worker prompt embeds the contract, so the worker never needs to read the

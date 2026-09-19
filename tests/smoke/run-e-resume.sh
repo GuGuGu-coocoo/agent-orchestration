@@ -155,7 +155,7 @@ check_eq "driver resumed and finished" "0" "$driver_rc"
 check "driver logged the resume" grep -q 'resuming in_progress task A02' "$OUT_DIR/worker-${TEST_NAME}.log"
 check "A02 is done" bash -c "jq -e '[.tasks[] | select(.id==\"A02\")][0].status == \"done\"' '$repo/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
 check "A01 history untouched" bash -c "jq -e '[.tasks[] | select(.id==\"A01\")][0].history | length == 1' '$repo/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
-check "A01 was never re-run" bash -c "! ls '$repo'/.agent/history/A01/logs/worker-*.jsonl >/dev/null 2>&1"
+check "A01 was never re-run" bash -c "! ls -d '$repo'/.agent/history/*A01 >/dev/null 2>&1"
 check "A02 archived" bash -c "ls -d '$repo'/.agent/history/*A02 >/dev/null 2>&1"
 check "the rebuilt TASK.md was saved to history" test -s "$repo/.agent/phases/A/history/TASK-A02.md"
 

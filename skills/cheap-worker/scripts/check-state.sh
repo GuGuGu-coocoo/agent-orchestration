@@ -41,6 +41,13 @@ jqv() {
     printf '%s' "$fallback"
 }
 
+# json_ok <file> -> 0 when the file does not exist or parses; 1 when it exists and is broken
+json_ok() {
+    local file="$1"
+    [[ -e "$file" ]] || return 0
+    jq empty "$file" >/dev/null 2>&1
+}
+
 task_id_of() {
     [[ -f "$1" ]] || { printf ''; return 0; }
     awk '/^## Task ID[[:space:]]*$/{getline; gsub(/[[:space:]]/,""); print; exit}' "$1"
@@ -63,6 +70,21 @@ main() {
     current="$agent/current"
 
     printf 'check-state: %s\n\n' "$root"
+
+    # --- fail closed on unusable state files -------------------------------------
+    local broken="" phase_for_check
+    phase_for_check="$(jqv "$agent/RUN_STATE.json" '.current_phase')"
+    for f in "$agent/RUN_STATE.json" "$current/STATE.json"; do
+        if ! json_ok "$f"; then
+            issue "$f exists but is not valid JSON; treat the state as unknown and repair it before resuming"
+            broken=1
+        fi
+    done
+    if [[ -n "$phase_for_check" ]] && ! json_ok "$agent/phases/$phase_for_check/TASK_QUEUE.json"; then
+        issue "$agent/phases/$phase_for_check/TASK_QUEUE.json is not valid JSON"
+        broken=1
+    fi
+    [[ -n "$broken" ]] && printf '\n'
 
     # --- lock / live worker -----------------------------------------------------
     local lock="$current/.worker.lock" lock_live=0
@@ -126,10 +148,24 @@ main() {
         if [[ "$result" != "none" && "$result" != "$ip_first" ]]; then
             issue "RESULT.md belongs to task '$result' but the queue is on '$ip_first' (stale report? check .agent/history/attempts/)"
         fi
+        if [[ "$escalation" != "none" && "$escalation" != "$ip_first" ]]; then
+            issue "ESCALATION.md belongs to task '$escalation' but the queue is on '$ip_first'"
+        fi
+        if [[ -n "$rs_task" && "$rs_task" != "$ip_first" ]]; then
+            issue "RUN_STATE.current_task='$rs_task' does not match the queue in_progress='$ip_first'"
+        fi
+        if [[ "$in_progress" == *","* ]]; then
+            issue "more than one Task is in_progress in the queue: $in_progress (only one may be)"
+        fi
+        if ls -d "$agent/history"/*"-${ip_first}" >/dev/null 2>&1; then
+            issue "Task '$ip_first' already has an archive but is still in_progress (verify the archived RESULT, then mark it done instead of re-running)"
+        fi
     elif [[ -z "$pending" && -n "$done_list" ]]; then
         if [[ "$rs_status" != "awaiting_human_qa" && "$rs_status" != "done" ]]; then
             warn "all queue tasks are done but RUN_STATE.status=$rs_status (expected awaiting_human_qa after the phase review)"
         fi
+    elif [[ -n "$rs_task" && -z "$pending" && -z "$done_list" ]]; then
+        warn "RUN_STATE.current_task='$rs_task' but the queue is empty"
     fi
     if [[ "$result" != "none" && "$escalation" != "none" ]]; then
         issue "both RESULT.md and ESCALATION.md exist; resolve before resuming"

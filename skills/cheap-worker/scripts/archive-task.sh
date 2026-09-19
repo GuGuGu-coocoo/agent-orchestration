@@ -9,7 +9,7 @@
 #   archive-task.sh [--root DIR] [--task-id ID] --yes [--decision ACCEPT|REWORK|ESCALATE]
 #
 # Effects:
-#   .agent/current/{TASK.md,RESULT.md,REVIEW.md,ESCALATION.md,STATE.json,logs/}
+#   .agent/current/{TASK.md,RESULT.md,REVIEW.md,ESCALATION.md,STATE.json,BASELINE.md,BASELINE.patch,logs/}
 #     -> .agent/history/<UTC timestamp>-<task-id>/
 #   .agent/current/{TASK.md,STATE.json} are re-seeded from the skill templates.
 #
@@ -94,7 +94,7 @@ main() {
     fi
 
     mkdir -p "$archive"
-    for f in TASK.md RESULT.md REVIEW.md ESCALATION.md STATE.json; do
+    for f in TASK.md RESULT.md REVIEW.md ESCALATION.md STATE.json BASELINE.md BASELINE.patch; do
         [[ -e "$current/$f" ]] && mv "$current/$f" "$archive/$f"
     done
     if [[ -d "$current/logs" ]]; then

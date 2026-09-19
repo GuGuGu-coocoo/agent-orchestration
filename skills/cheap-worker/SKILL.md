@@ -81,19 +81,22 @@ Priority: **Correctness > minimal change > verifiability > elegance.**
 
 ## Safety behaviours (hard-enforced)
 
-- A project-level lock refuses a second concurrent worker (`exit 7`); stale locks
-  are moved to `.agent/history/attempts/stale-locks/`.
-- Previous `RESULT.md`/`ESCALATION.md`/`BASELINE.md` are quarantined to
+- A project-level lock records the wrapper pid **and** the worker pid, refuses a
+  second worker (`exit 7`), and never takes over a stale lock automatically
+  (`exit 8`; clear it with `--break-lock` after verifying nothing runs).
+- Previous `RESULT.md`/`ESCALATION.md`/`BASELINE.*` are quarantined to
   `.agent/history/attempts/<task>/` before every run, so a stale report can never
   be mistaken for the current run's output.
 - The report must be fresh and carry this Task ID; `RESULT.md` must say `DONE`.
   Anything else exits `6` (invalid report) or `5` (valid RESULT but opencode
   failed) instead of claiming success.
 - `TASK.md` is validated (required sections, real Task ID, no placeholders) and
-  `--task-id`/`--mode` must match the file.
+  `--task-id`/`--mode` must match the file; `REVIEW.md` must carry the same Task ID.
 - `--allow-dirty` records the pre-run tracked/staged/untracked evidence in
-  `.agent/current/BASELINE.md`.
+  `.agent/current/BASELINE.md` plus the full patch in `BASELINE.patch`.
 - opencode always runs with `cwd` = project root.
+- Wake-up targets are exact (`--codex-thread` or `CODEX_THREAD_ID`); the helper
+  never guesses a session and exits `14`/`15` when it cannot deliver.
 
 ## Background handoff (worker-notify.sh)
 
@@ -105,16 +108,16 @@ turn and be woken up when there is something to review.
 
 ```sh
 ~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
-  --mode implement --task-id C01 --title "Coarse task title"
+  --codex-thread "编排" --mode implement --task-id C01 --title "Coarse task title"
 ```
 
-The Codex session is auto-detected (most recent activity in Codex's own history,
-archived sessions skipped, a session rooted at this project preferred);
-`--codex-thread <name-or-id>` overrides it and `--print-session` shows the result.
-It forwards every other option to `run-worker.sh`, and writes
-`.agent/current/NOTIFY_FAILED.md` (plus a desktop notification) if the Codex
-session cannot be reached - for example when the app is closed or the session is
-archived. Keep the orchestration session open for wake-up to work.
+The target session must be exact (`--codex-thread <id-or-name>`, or
+`CODEX_THREAD_ID` when the runtime provides it); the helper never guesses from
+Codex's local history. Without a target it exits `14` and the Supervisor uses
+blocking mode instead. It forwards every other option to `run-worker.sh`, and
+writes `.agent/current/NOTIFY_FAILED.md` (plus a desktop notification) and exits
+`15` if the wake-up cannot be delivered. Keep the orchestration session open for
+wake-up to work.
 
 ## Backend and observability
 

@@ -11,16 +11,20 @@
 #     defaults to "ask" and auto-rejects in non-interactive runs).
 #
 # Safety properties:
-#   - a single project-level lock refuses a second concurrent worker
-#   - previous RESULT/ESCALATION/BASELINE are quarantined before the run, so a
+#   - a single project-level lock refuses a second concurrent worker; the lock
+#     records both the wrapper pid and the worker pid, and a stale lock is never
+#     taken over automatically (use --break-lock after verifying nothing runs)
+#   - previous RESULT/ESCALATION/BASELINE* are quarantined before the run, so a
 #     stale report can never be mistaken for this run's output
 #   - the report must be fresh, carry this Task ID, and be well formed
-#   - `--allow-dirty` records the pre-run dirty evidence in BASELINE.md
+#   - `--allow-dirty` records the pre-run dirty evidence in BASELINE.md +
+#     BASELINE.patch (full `git diff HEAD --binary`)
 #   - opencode runs with cwd = project root, even when invoked from elsewhere
 #
 # Usage:
 #   run-worker.sh [--mode implement|investigate|fix|verify] [--root DIR]
-#                 [--task-id ID] [--title SHORT_TITLE] [--allow-dirty] [--dry-run]
+#                 [--task-id ID] [--title SHORT_TITLE] [--allow-dirty]
+#                 [--break-lock] [--dry-run]
 #
 # --title is the short Task title (e.g. "Add retry queue"). The OpenCode session
 # title becomes "cheap-worker · <task-id> · <SHORT_TITLE>", or "cheap-worker ·
@@ -28,14 +32,15 @@
 #
 # Exit codes:
 #   0  fresh, valid RESULT.md from this run (opencode exited 0)
-#   5  fresh, valid RESULT.md but opencode exited non-zero (review carefully)
-#   10 fresh, valid ESCALATION.md (Supervisor decision required)
 #   1  invalid invocation / invalid or inconsistent TASK.md / other precondition
 #   2  opencode failed and wrote no report
 #   3  opencode finished but wrote no report
 #   4  both reports exist and are valid (inconsistent)
+#   5  fresh, valid RESULT.md but opencode exited non-zero (review carefully)
 #   6  a report exists but is stale, malformed, or for another Task
 #   7  another worker is already running for this project
+#   8  stale lock could not be proven dead; re-run with --break-lock after checking
+#   10 fresh, valid ESCALATION.md (Supervisor decision required)
 #
 # This script never commits, pushes, merges or deletes anything.
 
@@ -99,7 +104,7 @@ section_text() {
         $0 == "## " h || $0 ~ "^## " h "[[:space:]]*$" { f=1; next }
         /^## / { f=0 }
         f { print }
-    ' "$1" | grep -v '^[[:space:]]*<!--' | grep -v '^[[:space:]]*$' | head -3
+    ' "$1" | grep -v '^[[:space:]]*<!--' | grep -v '^[[:space:]]*$' | head -3 || true
 }
 validate_task_file() {
     local file="$1" missing="" header content
@@ -109,7 +114,7 @@ validate_task_file() {
             missing="$missing '$header'"
             continue
         fi
-        if printf '%s\n' "$content" | grep -q '^[[:space:]]*<'; then
+        if printf '%s\n' "$content" | grep -Eq '^[[:space:]]*(- \[ \][[:space:]]*|- )?<'; then
             missing="$missing '$header(placeholder)'"
         fi
     done
@@ -180,7 +185,7 @@ release_lock() {
 # ---------------------------------------------------------------------------
 
 main() {
-    local mode="" root_arg="" task_id_arg="" title_arg="" allow_dirty=0 dry_run=0
+    local mode="" root_arg="" task_id_arg="" title_arg="" allow_dirty=0 dry_run=0 break_lock=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -189,6 +194,7 @@ main() {
             --task-id)    task_id_arg="${2:-}"; shift 2 ;;
             --title)      title_arg="${2:-}"; shift 2 ;;
             --allow-dirty) allow_dirty=1; shift ;;
+            --break-lock) break_lock=1; shift ;;
             --dry-run)    dry_run=1; shift ;;
             -h|--help)    usage; exit 0 ;;
             *)            die "unknown argument '$1' (try --help)" ;;
@@ -231,12 +237,15 @@ main() {
     TASK_ID="$task_id"   # used by the report validators below
     [[ -n "$mode" ]] || mode="$file_mode"
 
-    # A REVIEW.md (rework) must belong to the same Task.
+    # A REVIEW.md (rework) must carry this Task's ID.
     local review_file="$project_root/.agent/current/REVIEW.md"
     if [[ -f "$review_file" ]]; then
         local review_id
         review_id="$(read_task_id "$review_file")"
-        if [[ -n "$review_id" && "$review_id" != "$task_id" ]]; then
+        if [[ -z "$review_id" ]]; then
+            die "REVIEW.md has no '## Task ID' (required so a rework cannot be applied to the wrong Task)"
+        fi
+        if [[ "$review_id" != "$task_id" ]]; then
             die "REVIEW.md is for Task '$review_id' but TASK.md is '$task_id'"
         fi
     fi
@@ -297,29 +306,45 @@ main() {
     fi
 
     # --- single-run lock (H03) -------------------------------------------------
+    # The lock records both the wrapper pid and the worker process pid. A wrapper
+    # death does NOT prove the worker died, so a lock with no live pid is never
+    # taken over automatically: the Supervisor must pass --break-lock after
+    # verifying nothing is running.
     LOCK_DIR="$agent_dir/.worker.lock"
+    write_lock_info() {
+        printf 'pid=%s\nworker_pid=%s\nrun_id=%s\ntask_id=%s\nmode=%s\nstarted_at=%s\n' \
+            "$$" "${1:-}" "$RUN_ID" "$task_id" "$mode" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK_DIR/info"
+    }
     acquire_lock() {
         if mkdir "$LOCK_DIR" 2>/dev/null; then
-            printf 'pid=%s\nrun_id=%s\ntask_id=%s\nmode=%s\nstarted_at=%s\n' \
-                "$$" "$RUN_ID" "$task_id" "$mode" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK_DIR/info"
+            write_lock_info ""
             LOCK_OWNED=1
             return 0
         fi
-        local lpid="" linfo=""
+        local lpid="" wpid="" linfo=""
         if [[ -f "$LOCK_DIR/info" ]]; then
             linfo="$(tr '\n' ' ' <"$LOCK_DIR/info")"
             lpid="$(awk -F= '/^pid=/{print $2}' "$LOCK_DIR/info" | head -1)"
+            wpid="$(awk -F= '/^worker_pid=/{print $2}' "$LOCK_DIR/info" | head -1)"
         fi
-        if [[ -n "$lpid" ]] && kill -0 "$lpid" 2>/dev/null; then
-            printf 'run-worker: another worker is already running for this project (pid %s; %s)\n' "$lpid" "$linfo" >&2
+        if [[ -n "$lpid" && "$lpid" != "$$" ]] && kill -0 "$lpid" 2>/dev/null; then
+            printf 'run-worker: another worker wrapper is running for this project (pid %s; %s)\n' "$lpid" "$linfo" >&2
             exit 7
         fi
-        printf 'run-worker: stale lock (pid %s not running); moving it aside\n' "${lpid:-unknown}" >&2
+        if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
+            printf 'run-worker: the worker process of a previous run is STILL RUNNING (pid %s; %s)\n' "$wpid" "$linfo" >&2
+            exit 7
+        fi
+        if [[ "$break_lock" -ne 1 ]]; then
+            printf 'run-worker: stale lock, and the previous run cannot be proven dead:\n  %s\n' "${linfo:-<no lock info>}" >&2
+            printf 'run-worker: verify no worker is running (see check-state.sh), then re-run with --break-lock\n' >&2
+            exit 8
+        fi
+        printf 'run-worker: --break-lock given; moving the stale lock aside\n' >&2
         local stale="$project_root/.agent/history/attempts/stale-locks/$(date -u '+%Y%m%dT%H%M%SZ')-${lpid:-unknown}"
         mkdir -p "$stale" && mv "$LOCK_DIR" "$stale/" || die "cannot move stale lock"
         mkdir "$LOCK_DIR" 2>/dev/null || { printf 'run-worker: another worker is already running for this project\n' >&2; exit 7; }
-        printf 'pid=%s\nrun_id=%s\ntask_id=%s\nmode=%s\nstarted_at=%s\n' \
-            "$$" "$RUN_ID" "$task_id" "$mode" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK_DIR/info"
+        write_lock_info ""
         LOCK_OWNED=1
     }
     acquire_lock
@@ -330,7 +355,7 @@ main() {
     if [[ -f "$agent_dir/STATE.json" ]]; then
         prev_run="$(jq -r '.run_id // empty' "$agent_dir/STATE.json" 2>/dev/null || true)"
     fi
-    for f in RESULT.md ESCALATION.md BASELINE.md; do
+    for f in RESULT.md ESCALATION.md BASELINE.md BASELINE.patch; do
         if [[ -s "$agent_dir/$f" ]]; then
             local dest="$project_root/.agent/history/attempts/${task_id}/${prev_run:-prev-$(date -u '+%Y%m%dT%H%M%SZ')}"
             mkdir -p "$dest" && mv "$agent_dir/$f" "$dest/$f"
@@ -351,8 +376,9 @@ main() {
         git -C "$project_root" diff --stat 2>/dev/null || true
         printf '```\n\n## git diff --cached --stat (staged)\n\n```\n'
         git -C "$project_root" diff --cached --stat 2>/dev/null || true
-        printf '```\n'
+        printf '```\n\n## Full pre-run patch\n\nThe complete `git diff HEAD --binary` (tracked changes) is stored next to this\nfile as `BASELINE.patch`, so the Supervisor can separate pre-existing changes\nfrom the changes of this run.\n'
     } >"$agent_dir/BASELINE.md"
+    git -C "$project_root" diff --binary HEAD >"$agent_dir/BASELINE.patch" 2>/dev/null || : >"$agent_dir/BASELINE.patch"
 
     local log_file="$agent_dir/logs/worker-${RUN_ID}-${task_id}.jsonl"
     local started_at
@@ -412,10 +438,13 @@ embedded above - do not try to open the skill directory yourself).
 
 Begin now. Read the Task, follow the contract, write exactly one report file, stop.
 EOF
-    } | ( cd "$project_root" && opencode run \
+    } | ( cd "$project_root" && exec opencode run \
             --agent "$OPENCODE_AGENT" \
             --format json \
-            --title "$session_title" ) >"$log_file" 2>&1 || rc=$?
+            --title "$session_title" ) >"$log_file" 2>&1 &
+    WORKER_PID=$!
+    write_lock_info "$WORKER_PID"
+    wait "$WORKER_PID" || rc=$?
 
     local session_id=""
     session_id="$(jq -r 'select(.sessionID) | .sessionID' "$log_file" 2>/dev/null | head -1 || true)"

@@ -38,9 +38,11 @@ output are the evidence.
 
 All criteria satisfied, scope clean, verification real.
 
-1. `TASK_QUEUE.json`: Task -> `done`, append a history entry
-   (`{at, decision: "ACCEPT", note}`).
-2. `run-worker.sh`'s sibling `archive-task.sh --yes --decision ACCEPT`.
+1. `archive-task.sh --yes --decision ACCEPT` **first** (archive, then done: an
+   interruption then leaves an archived Task that is still `in_progress`, which
+   `check-state.sh` reports as "already archived, verify then mark done").
+2. `TASK_QUEUE.json`: Task -> `done`, append a history entry
+   (`{at, decision: "ACCEPT", note}`). Write via temp file + rename.
 3. `RUN_STATE.json`: `current_task` = next Task (or empty at phase end).
 4. Start the next Task immediately. **Do not ask the human whether to continue.**
 

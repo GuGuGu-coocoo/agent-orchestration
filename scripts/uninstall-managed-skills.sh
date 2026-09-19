@@ -57,6 +57,19 @@ fi
 TARGET_ROOT="$(cd "$TARGET_ROOT" && pwd -P)"
 [[ "$(basename "$TARGET_ROOT")" == "skills" ]] || die "safety check failed: target root must end in '/skills': $TARGET_ROOT"
 
+# Never operate on the source tree (or an ancestor/descendant of it).
+REPO_RESOLVED="$(cd "$REPO_ROOT" && pwd -P)"
+[[ "$TARGET_ROOT" != "$REPO_RESOLVED" ]] || die "target root equals the source repo"
+case "$REPO_RESOLVED" in "$TARGET_ROOT"/*) die "target root contains the source repo: $TARGET_ROOT" ;; esac
+case "$TARGET_ROOT" in "$REPO_RESOLVED"/*) die "target root is inside the source repo: $TARGET_ROOT" ;; esac
+
+# Physical target policy: the managed target lives under $HOME. A parent symlink
+# that resolves outside home is refused (test redirects need the explicit gate).
+HOME_PHYS_TR="$(cd "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
+if [[ "$TARGET_ROOT" != "$HOME"/* && "$TARGET_ROOT" != "$HOME_PHYS_TR"/* && "${AGENT_ORCHESTRATION_TEST_TARGET:-0}" != "1" ]]; then
+    die "resolved target $TARGET_ROOT is outside \$HOME; parent-symlink escapes are refused (test-only gate: AGENT_ORCHESTRATION_TEST_TARGET=1)"
+fi
+
 TO_REMOVE=()
 for skill in "${SKILLS[@]}"; do
     dst="$TARGET_ROOT/$skill"

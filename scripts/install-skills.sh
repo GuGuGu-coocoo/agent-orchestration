@@ -85,6 +85,13 @@ RD="$(cd "$REPO_ROOT" && pwd -P)"
 case "$RD" in "$TR_RESOLVED"/*) die "target root is inside the source repo: $TR_RESOLVED" ;; esac
 case "$TR_RESOLVED" in "$RD"/*) die "target root contains the source repo: $TR_RESOLVED" ;; esac
 
+# Physical target policy: the managed target lives under $HOME. A parent symlink
+# that resolves outside home is refused (test redirects need the explicit gate).
+HOME_PHYS_TR="$(cd "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
+if [[ "$TR_RESOLVED" != "$HOME"/* && "$TR_RESOLVED" != "$HOME_PHYS_TR"/* && "${AGENT_ORCHESTRATION_TEST_TARGET:-0}" != "1" ]]; then
+    die "resolved target $TR_RESOLVED is outside \$HOME; parent-symlink escapes are refused (test-only gate: AGENT_ORCHESTRATION_TEST_TARGET=1)"
+fi
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
