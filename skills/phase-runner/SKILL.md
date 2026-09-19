@@ -46,23 +46,27 @@ Phase C
 
 ## Background handoff (wake-up mode)
 
-Prerequisites: the human names this Codex session (e.g. `编排`) and keeps the
-ChatGPT/Codex desktop app running **with that session open**. An open session can
-be woken by `codex queue`; a closed or archived one cannot (the message stays
-queued, or the helper writes `NOTIFY_FAILED.md`).
+The human only has to say: *"用 $phase-runner 做到 Phase C"*. No session naming.
 
-Handoff: run `worker-notify.sh --codex-thread "<name>" ...`, report the plan in one
-line, and end your turn. You will receive a short `[worker-notify]` message when the
-Task ends:
+Handoff: run `worker-notify.sh ...` (no session argument needed - the helper detects
+this Codex session from Codex's local history: the thread with the most recent
+activity, archived ones skipped, a session rooted at this project preferred). Report
+the plan in one line and end your turn. You will receive a short `[worker-notify]`
+message when the Task ends:
 
 - `完成` -> do the normal review (step 14-15) and hand off the next Task.
 - `需要你决策` -> read `ESCALATION.md`, resolve or ask the human, then continue.
 - `失败` -> inspect `STATE.json` and the logs, then retry or escalate.
 
+Prerequisites: the ChatGPT/Codex desktop app stays running **with this session open**
+(an open session can be woken by `codex queue`; a closed or archived one cannot).
+If detection picks the wrong session (several sessions active), pass
+`--codex-thread <name-or-id>` explicitly.
+
 If the app was closed or the session could not be reached, the helper writes
-`.agent/current/NOTIFY_FAILED.md` with the message; read it on your next turn to see
-what ended. Keep wake-up messages short - they enter this conversation as a user
-message and cost tokens on every wake-up.
+`.agent/current/NOTIFY_FAILED.md` with the message and a hint; read it on your next
+turn to see what ended. Keep wake-up messages short - they enter this conversation
+as a user message and cost tokens on every wake-up.
 
 ## Workflow
 
@@ -101,12 +105,14 @@ Details and sizing rules: `references/phase-planning.md`.
     `.agent/phases/<PHASE>/history/` for traceability).
 12. Record the git baseline: `git status`, `git rev-parse HEAD`.
 13. Hand off the Task to the worker - exactly one Task at a time - in one of two modes:
-    - **Background + wake-up (default when the human named a Supervisor session)**:
-      `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --codex-thread "<session name>" --mode <mode> --task-id <id> --title "<queue title>"`
+    - **Background + wake-up (default)**:
+      `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --mode <mode> --task-id <id> --title "<queue title>"`
       The command returns immediately. End your turn and wait. When the worker
       finishes, `codex queue` delivers a short message into THIS session and you
-      wake up to review it.
-    - **Blocking (fallback: no session name, or the human wants to watch live)**:
+      wake up to review it. The session is auto-detected from Codex's own local
+      history; pass `--codex-thread <name-or-id>` only when the detection picks the
+      wrong session (e.g. several Codex sessions are active at once).
+    - **Blocking (fallback: the human wants to watch live)**:
       `~/.agents/skills/cheap-worker/scripts/run-worker.sh --mode <mode> --task-id <id> --title "<queue title>"`
       This blocks until the worker finishes, then continue in the same turn.
     Model choice belongs to OpenCode's own configuration; neither script passes

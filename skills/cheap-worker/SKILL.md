@@ -88,9 +88,12 @@ turn and be woken up when there is something to review.
 
 ```sh
 ~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
-  --codex-thread "编排" --mode implement --task-id C01 --title "Coarse task title"
+  --mode implement --task-id C01 --title "Coarse task title"
 ```
 
+The Codex session is auto-detected (most recent activity in Codex's own history,
+archived sessions skipped, a session rooted at this project preferred);
+`--codex-thread <name-or-id>` overrides it and `--print-session` shows the result.
 It forwards every other option to `run-worker.sh`, and writes
 `.agent/current/NOTIFY_FAILED.md` (plus a desktop notification) if the Codex
 session cannot be reached - for example when the app is closed or the session is

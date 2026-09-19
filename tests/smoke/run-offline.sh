@@ -163,13 +163,6 @@ else
     fail "worker-notify.sh --help failed"
 fi
 
-if (cd "$repo" && "$NOTIFY" --mode implement) >"$OUT_DIR/notify-no-thread.log" 2>&1; then
-    fail "worker-notify.sh should require --codex-thread"
-else
-    pass "worker-notify.sh requires --codex-thread"
-fi
-check "requirement message is clear" grep -q 'codex-thread NAME is required' "$OUT_DIR/notify-no-thread.log"
-
 (cd "$repo" && "$NOTIFY" --print-message --simulate-exit 0 --task-id OFF2) >"$OUT_DIR/notify-msg-0.log" 2>&1 || true
 (cd "$repo" && "$NOTIFY" --print-message --simulate-exit 10 --task-id OFF2) >"$OUT_DIR/notify-msg-10.log" 2>&1 || true
 (cd "$repo" && "$NOTIFY" --print-message --simulate-exit 2 --task-id OFF2) >"$OUT_DIR/notify-msg-2.log" 2>&1 || true
@@ -191,6 +184,13 @@ exit 0
 FAKEEOF
 chmod +x "$repo/.fake-worker.sh" "$repo/.fake-codex"
 rm -f "$OUT_DIR/fake-codex-calls.log"
+
+if (cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-worker.sh" "$NOTIFY" \
+        --no-notify --foreground --mode implement) >"$OUT_DIR/notify-no-thread.log" 2>&1; then
+    pass "worker-notify.sh runs without --codex-thread (auto-discovery / no-notify)"
+else
+    fail "worker-notify.sh --no-notify run failed"
+fi
 
 if (cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-worker.sh" "$NOTIFY" \
         --foreground --codex-thread "smoke-thread" --codex-bin "$repo/.fake-codex" \
@@ -250,6 +250,32 @@ if [[ "$detached_ok" -eq 1 ]]; then
 else
     fail "detached worker did not notify within 10s"
 fi
+
+# --- 6c. session auto-discovery (fixture Codex home) ----------------------------
+FAKE_HOME="$repo/.fake-codex-home"
+mkdir -p "$FAKE_HOME"
+PROJ="$(cd "$repo" && pwd -P)"
+sqlite3 "$FAKE_HOME/thread_history_1.sqlite" \
+    "CREATE TABLE thread_items(thread_id TEXT, created_at_ms INTEGER);
+     INSERT INTO thread_items VALUES ('thread-old', 1000000), ('thread-new', 2000000);"
+sqlite3 "$FAKE_HOME/state_5.sqlite" \
+    "CREATE TABLE threads(id TEXT, archived INTEGER, cwd TEXT, title TEXT, updated_at INTEGER);
+     INSERT INTO threads VALUES ('thread-old',0,'/tmp/old','old',1000),
+                               ('thread-new',0,'/tmp/new','new',2000);"
+
+discovered="$(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --print-session 2>/dev/null | cut -f1)"
+check_eq "auto-discovery picks the most recently active thread" "thread-new" "$discovered"
+
+sqlite3 "$FAKE_HOME/state_5.sqlite" "UPDATE threads SET archived=1 WHERE id='thread-new';"
+discovered="$(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --print-session 2>/dev/null | cut -f1)"
+check_eq "auto-discovery skips archived threads" "thread-old" "$discovered"
+
+sqlite3 "$FAKE_HOME/state_5.sqlite" \
+    "INSERT INTO threads VALUES ('thread-project',0,'$PROJ','project',500);"
+sqlite3 "$FAKE_HOME/thread_history_1.sqlite" \
+    "INSERT INTO thread_items VALUES ('thread-project', 500000);"
+discovered="$(cd "$repo" && WORKER_NOTIFY_CODEX_HOME="$FAKE_HOME" "$NOTIFY" --print-session 2>/dev/null | cut -f1)"
+check_eq "auto-discovery prefers a session rooted at this project" "thread-project" "$discovered"
 
 # --- 7. uninstall safety (dry-run only) -------------------------------------------
 if "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" --dry-run >"$OUT_DIR/uninstall-dry.log" 2>&1; then

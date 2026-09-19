@@ -199,23 +199,28 @@ for you).
 ln -sfn ~/.agents/skills/phase-runner ~/.codex/skills/phase-runner
 ```
 
-Then in a new Codex conversation, name the session (e.g. `编排`) and say:
+Then in a new Codex conversation, you only need one sentence:
 
-> 用 $phase-runner 按现有 roadmap 做到 Phase C。
-> 我的会话名是「编排」；每个 Task 用后台方式投递：
-> `~/.agents/skills/cheap-worker/scripts/worker-notify.sh --codex-thread "编排" --mode implement --task-id C01 --title "..."`
-> 投递完就结束回合，收到通知后再验收。
-> 普通技术问题不要问我。Phase C 验收通过后停止，我来人工测试。
+> 用 $phase-runner 做到 Phase C。
+
+The Supervisor takes it from there: it plans the Phase, hands off each Task with
+`worker-notify.sh` (background, auto-detected session, no naming needed), and wakes
+up in the same session to review. Ask for the blocking mode only when you want to
+watch a Task live.
 
 ### Two handoff modes
 
 | Mode | Command | Codex behavior | Use when |
 | --- | --- | --- | --- |
-| Blocking | `run-worker.sh ...` | waits inside the turn, then continues | watching live, or no session name |
-| Background + wake-up | `worker-notify.sh --codex-thread "<name>" ...` | returns immediately and ends the turn; `codex queue` wakes the SAME session when the Task ends | unattended / long Tasks (default) |
+| Background + wake-up | `worker-notify.sh ...` (session auto-detected) | returns immediately and ends the turn; `codex queue` wakes the SAME session when the Task ends | unattended / long Tasks (default) |
+| Blocking | `run-worker.sh ...` | waits inside the turn, then continues | watching live |
 
 Wake-up details:
 
+- The Codex session is auto-detected from Codex's own local history: the thread with
+  the most recent activity (archived threads skipped; a session rooted at this
+  project preferred). `--codex-thread <name-or-id>` overrides it; `--print-session`
+  shows what would be detected.
 - Requires the ChatGPT/Codex desktop app to stay open **with the orchestration
   session open**: an open session can be woken; a closed or archived one cannot
   (the message waits in the queue, and the helper writes `NOTIFY_FAILED.md` with a
