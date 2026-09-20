@@ -353,7 +353,7 @@ main() {
     printf '\nverdict: %s' "$VERDICT"
     case "$VERDICT" in
         WORKER_RUNNING)
-            printf ' - a worker or phase loop is alive; do not start another\n' ;;
+            printf ' - a worker or phase loop is alive; do not start another and do not poll - the notifier wakes the Supervisor once it stops\n' ;;
         STALE_LOCK)
             if [[ "$worker_stale" -eq 1 && "$phase_stale" -eq 1 ]]; then
                 printf ' - a stale WORKER lock and a stale PHASE lock cannot be proven dead; verify nothing runs, then --break-lock\n'

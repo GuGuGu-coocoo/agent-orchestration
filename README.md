@@ -314,6 +314,11 @@ Then in a new Codex conversation:
 | Blocking | `run-phase.sh` | waits inside the turn, then does the Phase review | default; always available |
 | Background + wake-up | `worker-notify.sh --phase --codex-thread <id-or-name>` | returns immediately and ends the turn; `codex queue` wakes that session when the loop **stops** | you want to leave the machine and a target session is known |
 
+Either mode is **one handoff for the whole Phase**: never run the loop once per
+Task and never poll `status.sh` / `check-state.sh` while it runs (`--max-tasks N`
+is a safety cap, not a rhythm). A running loop answers `WORKER_RUNNING` until it
+stops, and the notifier wakes the Supervisor exactly once per stop.
+
 Wake-up details:
 
 - The target must be **exact**: `--codex-thread <id-or-name>`, or `CODEX_THREAD_ID`

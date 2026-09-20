@@ -125,13 +125,14 @@ non-blocking variant: it detaches, holds a `caffeinate` no-sleep assertion, and
 then delivers a short message to a Codex session with `codex queue`.
 
 ```sh
-# one Task
-~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
-  --codex-thread "编排" --mode implement --task-id C01 --title "Coarse task title"
-
-# a whole Phase loop: Codex is only woken when the loop stops
+# a whole Phase (the normal handoff): Codex is woken once, when the loop stops
 ~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
   --phase --codex-thread "编排"
+
+# a single Task by hand - NOT for running a Phase: this wakes Codex after every
+# Task, so using it per Task turns the Phase into per-Task reporting
+~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
+  --codex-thread "编排" --mode implement --task-id C01 --title "Coarse task title"
 ```
 
 The target session must be exact (`--codex-thread <id-or-name>`, or

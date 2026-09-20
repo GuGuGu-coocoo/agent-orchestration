@@ -137,6 +137,23 @@ main() {
     printf '  phase log    : %s\n' "${latest_phase_log:-<none>}"
     printf '  worker log   : %s\n' "${latest_worker_log:-<none>}"
 
+    # A live run is not something to poll: it wakes the Supervisor itself when it
+    # stops (worker-notify / phase-notify), so say so instead of inviting checks.
+    local lock lpid wpid live=""
+    for lock in "$current/.worker.lock" "$current/.phase.lock"; do
+        [[ -d "$lock" && -f "$lock/info" ]] || continue
+        lpid="$(awk -F= '/^pid=/{print $2}' "$lock/info" | head -1)"
+        wpid="$(awk -F= '/^worker_pid=/{print $2}' "$lock/info" | head -1)"
+        if { [[ -n "$lpid" ]] && kill -0 "$lpid" 2>/dev/null; } \
+           || { [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; }; then
+            live="$(basename "$lock")"
+            break
+        fi
+    done
+    if [[ -n "$live" ]]; then
+        printf '  hint         : %s is live - do not poll; the notifier wakes the Supervisor once the run stops\n' "$live"
+    fi
+
     exit 0
 }
 

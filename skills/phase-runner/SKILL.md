@@ -31,15 +31,21 @@ Phase C
    scope + ticked criteria).
 3. **One Task = one OpenCode session.** Never pass `--standalone` or `--model`;
    the model is whatever OpenCode is configured to use.
-4. **Codex owns the queue.** Only Codex edits `TASK_QUEUE.json` and `PHASE.md`;
+4. **One handoff per Phase, then get out of the way.** Hand the whole Phase over
+   in ONE call - `run-phase.sh` (blocking) or `worker-notify.sh --phase`
+   (background, one wake-up per stop) - and end your turn. Never hand off
+   Task-by-Task, never re-enter the loop once per Task, and never poll
+   `status.sh`/`check-state.sh` while it runs: `--max-tasks N` is a safety cap,
+   not a rhythm, and the notifier wakes you exactly once per stop.
+5. **Codex owns the queue.** Only Codex edits `TASK_QUEUE.json` and `PHASE.md`;
    only the loop writes `.agent/current/`.
-5. **A Phase always ends in a STOP.** All Tasks done is `awaiting_phase_review`,
+6. **A Phase always ends in a STOP.** All Tasks done is `awaiting_phase_review`,
    never the next Phase and never human QA directly.
-6. **`awaiting_human_qa` is a hard gate.** The next Phase starts only after the
+7. **`awaiting_human_qa` is a hard gate.** The next Phase starts only after the
    human confirms; `run-phase.sh` refuses to run until then.
-7. **Files are the source of truth.** `.agent/*.json` + `.agent/phases/**` survive
+8. **Files are the source of truth.** `.agent/*.json` + `.agent/phases/**` survive
    session loss, terminal close and reboot. Chat history is not state.
-8. **No automation glue.** No daemons, schedulers, watchers, DAGs, parallel
+9. **No automation glue.** No daemons, schedulers, watchers, DAGs, parallel
    workers or custom UIs. The loop is one bash script; Codex is the Supervisor.
 
 ## What Codex owns
@@ -92,13 +98,17 @@ Phase C
    checkpoint, an escalation, or the end of the Phase.
 
    ```sh
-   # blocking (Codex waits; always available)
+   # blocking (Codex waits for the whole Phase inside this one call)
    ~/.agents/skills/phase-runner/scripts/run-phase.sh --root "$PWD"
 
    # background + wake-up: Codex ends its turn and is woken when the loop STOPS
    ~/.agents/skills/cheap-worker/scripts/worker-notify.sh \
      --phase --codex-thread "<id-or-name>"
    ```
+
+   Either way it is **one** call for the **whole** Phase. Do not run the loop
+   once per Task, do not re-check its progress, and do not poll `status.sh` /
+   `check-state.sh`: a running loop prints `WORKER_RUNNING` until it stops.
 
    Useful flags: `--max-tasks N` (safety cap), `--dry-run` (print the queue
    without running), `--break-lock` (after a crash, once nothing is running),

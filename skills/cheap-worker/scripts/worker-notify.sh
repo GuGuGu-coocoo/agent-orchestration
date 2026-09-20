@@ -235,9 +235,10 @@ compose_phase_message() {
             msg="[phase-notify] $label 因状态不一致或管道问题停下。检查 $root/.agent/current/ 与 check-state.sh，修好后重跑 run-phase.sh。"
             ;;
         *)
-            msg="[phase-notify] $label 结束（exit=$rc，未预期状态）。检查 $root/.agent/RUN_STATE.json 与 .agent/current/logs/。"
+            msg="[phase-notify] $label 结束（exit=${rc}，未预期状态）。检查 $root/.agent/RUN_STATE.json 与 .agent/current/logs/。"
             ;;
     esac
+    msg="${msg}（无需轮询：该 loop 下一次停下时会自动通知）"
     if [[ -n "$MESSAGE_PREFIX" ]]; then
         msg="$MESSAGE_PREFIX $msg"
     fi
@@ -252,7 +253,7 @@ compose_message() {
     fi
     case "$rc" in
         0)
-            msg="[worker-notify] $id 完成。读 $root/.agent/current/RESULT.md + VERIFY.md + git diff → 证据达标即继续（由 run-phase.sh 自动判定），否则处理。"
+            msg="[worker-notify] $id 完成。读 $root/.agent/current/RESULT.md + VERIFY.md + git diff → 证据达标即继续（由 run-phase.sh 自动判定），否则处理。若这是整个 Phase，请改用 --phase 一次交接，不要逐 Task 唤醒。"
             ;;
         5)
             msg="[worker-notify] $id 有 RESULT.md 但 opencode 非零退出（exit=5）。先检查 $root/.agent/current/RESULT.md、VERIFY.md 与 BASELINE.md，再决定重跑或人工处理。"

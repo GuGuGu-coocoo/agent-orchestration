@@ -333,12 +333,17 @@ phase_msg 0
 phase_msg 2
 phase_msg 3
 phase_msg 4
+phase_msg 99
 check "phase wake-up: phase-review wording" grep -q 'awaiting_phase_review' "$OUT_DIR/notify-phase-msg-0.log"
 check "phase wake-up: review is Phase-level" grep -q 'Phase 级 integration review' "$OUT_DIR/notify-phase-msg-0.log"
 check "phase wake-up: checkpoint wording" grep -q 'checkpoint' "$OUT_DIR/notify-phase-msg-2.log"
 check "phase wake-up: escalation wording" grep -q 'escalation' "$OUT_DIR/notify-phase-msg-3.log"
 check "phase wake-up: human gate wording" grep -q 'awaiting_human_qa' "$OUT_DIR/notify-phase-msg-4.log"
 check "phase wake-up: does not ask for a per-Task review" bash -c "! grep -q '下一个 Task' '$OUT_DIR/notify-phase-msg-0.log'"
+check "phase wake-up: says no polling is needed" grep -q '无需轮询' "$OUT_DIR/notify-phase-msg-0.log"
+check "phase wake-up: an unexpected exit still produces a message" grep -q 'exit=99' "$OUT_DIR/notify-phase-msg-99.log"
+check "phase wake-up: the unexpected branch names the state file" grep -q 'RUN_STATE.json' "$OUT_DIR/notify-phase-msg-99.log"
+check "task wake-up: points a whole-Phase user at --phase" grep -q -- '--phase' "$OUT_DIR/notify-msg-0.log"
 
 # ---------------------------------------------------------------------------
 # 6d. session identity: explicit only, fail closed
