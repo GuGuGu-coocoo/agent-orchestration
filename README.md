@@ -1,3 +1,5 @@
+**English** | [简体中文](README.zh-CN.md) | [Français](README.fr.md)
+
 # agent-orchestration
 
 [![CI](https://github.com/GuGuGu-coocoo/agent-orchestration/actions/workflows/ci.yml/badge.svg)](https://github.com/GuGuGu-coocoo/agent-orchestration/actions/workflows/ci.yml)
@@ -53,7 +55,7 @@ OpenCode Desktop while the loop runs.
 
 ```
 agent-orchestration/
-├── README.md
+├── README.md  README.zh-CN.md  README.fr.md
 ├── .gitignore
 ├── scripts/
 │   ├── install-skills.sh              # install/update the two managed skills
