@@ -31,6 +31,11 @@
 #   run-phase.sh [--root DIR] [--max-tasks N] [--dry-run] [--break-lock]
 #                [--no-check-state]
 #
+# --break-lock is the explicit human confirmation that nothing is running. It
+# authorizes the recovery of BOTH stale locks - the loop's own .phase.lock and a
+# stale .worker.lock (forwarded to run-worker.sh) - and it is never implied: a
+# live pid always wins, and a lock with no live pid is never assumed dead.
+#
 # Exit codes:
 #   0  the Phase reached awaiting_phase_review (STOP: Codex phase review)
 #   1  invalid invocation, invalid plan, or a state gate refused the run
@@ -198,6 +203,26 @@ update_run_state() {  # update_run_state <status> <task> <stop_reason> <notes>
 }
 
 PHASE_LOCK_DIR_NAME=".phase.lock"
+
+# lock_live_pid <lock-dir> - prints "wrapper:<pid>" or "worker:<pid>" when the
+# lock records a live process. A lock with no live pid is NOT proof that the run
+# stopped (a shared-service execution can outlive its local wrapper), so it is
+# never taken over automatically.
+lock_live_pid() {
+    local lock="$1" lpid="" wpid=""
+    [[ -d "$lock" && -f "$lock/info" ]] || return 1
+    lpid="$(awk -F= '/^pid=/{print $2}' "$lock/info" | head -1)"
+    wpid="$(awk -F= '/^worker_pid=/{print $2}' "$lock/info" | head -1)"
+    if [[ -n "$lpid" ]] && kill -0 "$lpid" 2>/dev/null; then printf 'wrapper:%s' "$lpid"; return 0; fi
+    if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then printf 'worker:%s' "$wpid"; return 0; fi
+    return 1
+}
+
+lock_info_line() {
+    local lock="$1"
+    if [[ -f "$lock/info" ]]; then tr '\n' ' ' <"$lock/info"; else printf '<no lock info>'; fi
+}
+
 
 acquire_phase_lock() {
     local break_lock="$1" lock="$ROOT/.agent/current/$PHASE_LOCK_DIR_NAME" lpid="" info=""
@@ -761,6 +786,32 @@ main() {
         exit 0
     fi
 
+    # --- worker lock gate (READ-ONLY, before any project write) ----------------------
+    # run-worker.sh refuses a lock it cannot prove dead (exit 8) and only an explicit
+    # --break-lock moves it aside. Checking it *here*, before TASK.md / the queue /
+    # RUN_STATE are touched, is what keeps an unconfirmed refusal from changing the
+    # project at all. A vanished local pid is never treated as proof that the
+    # shared-service execution stopped.
+    local worker_lock="$CURRENT/.worker.lock" worker_live=""
+    if [[ -d "$worker_lock" ]]; then
+        worker_live="$(lock_live_pid "$worker_lock" || true)"
+        if [[ -n "$worker_live" ]]; then
+            warn "a worker is still running ($worker_live): $(lock_info_line "$worker_lock")"
+            refuse_phase 5 "live worker lock: nothing was started and no project file was changed"
+        fi
+        if [[ "$break_lock" -eq 1 ]]; then
+            log "stale worker lock present; --break-lock is forwarded to run-worker.sh for this run"
+        else
+            warn "a stale worker lock cannot be proven dead: $(lock_info_line "$worker_lock")"
+            warn "  nothing was started and no project file was changed"
+            warn "  a disappeared local pid is NOT proof that a shared-service run stopped; verify first:"
+            warn "    check-state.sh   (verdict STALE_LOCK)   /   ps -p <pid> [-p <worker_pid>]"
+            warn "  only if nothing is running, re-run with --break-lock: run-worker.sh then moves the"
+            warn "  stale lock to .agent/history/attempts/stale-locks/ before starting the Task."
+            refuse_phase 5 "unconfirmed stale worker lock: confirm nothing is running, then use --break-lock"
+        fi
+    fi
+
     # --- resume diagnostics (READ-ONLY: a refused run must not change anything) -----
     # check-state also reports a live worker/loop lock; this runs before the loop
     # takes its own lock and before any file is touched, so a live run is never
@@ -850,8 +901,12 @@ main() {
         snapshot_tree "$before_tree"
         snapshot_hashes >"$before_hashes"
         started="$(date +%s)"
+        # --break-lock is an explicit human confirmation: forward it so run-worker.sh
+        # can move a stale *worker* lock aside (never a live one).
+        local worker_extra=()
+        [[ "$break_lock" -eq 1 ]] && worker_extra=(--break-lock)
         "$WORKER" --root "$ROOT" --allow-dirty --mode "$mode" --task-id "$next_id" --title "$title" \
-            2>&1 | tee -a "$phase_log" || rc=$?
+            ${worker_extra[@]+"${worker_extra[@]}"} 2>&1 | tee -a "$phase_log" || rc=$?
         log "$next_id worker exit=$rc"
 
         # 4. deterministic outcome classification

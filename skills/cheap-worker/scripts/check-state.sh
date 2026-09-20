@@ -17,6 +17,10 @@
 # Verdicts (printed as "verdict: <V>"):
 #   WORKER_RUNNING        a worker or phase loop process is alive - do not start
 #   INCONSISTENT          files disagree, are missing, or are unreadable - fix first
+#                         (reported BEFORE STALE_LOCK: a stale lock never hides a
+#                         state problem, and --break-lock never bypasses one)
+#   STALE_LOCK            a worker/phase lock has no live pid, but that is NOT
+#                         proof the run stopped: verify, then --break-lock
 #   ESCALATED             the loop stopped on a blocker (status or a Task) - Codex
 #   CHECKPOINT            the loop stopped for a Codex decision (status=checkpoint)
 #   AWAITING_PHASE_REVIEW Tasks are done, the Phase waits for the Codex review
@@ -27,7 +31,6 @@
 #   EMPTY                 a fresh project (no .agent state at all)
 #
 # Exit codes: 0 = actionable (RUNNING / QUEUE_COMPLETE / EMPTY), 1 = stop (the rest).
-#
 # Usage:
 #   check-state.sh [--root DIR] [--ignore-phase-lock-pid PID]
 #
@@ -102,6 +105,11 @@ live_pid_in() {  # live_pid_in <lock-dir> -> prints "wrapper:<pid>|worker:<pid>"
     return 1
 }
 
+lock_info_line() {
+    local lock="$1"
+    if [[ -f "$lock/info" ]]; then tr '\n' ' ' <"$lock/info"; else printf '<no lock info>'; fi
+}
+
 VERDICT=""
 STOP=1
 set_verdict() { VERDICT="$1"; case "$1" in RUNNING|EMPTY|QUEUE_COMPLETE) STOP=0 ;; esac; }
@@ -131,7 +139,10 @@ main() {
     fi
 
     # --- live processes -----------------------------------------------------------------
-    local worker_live="" phase_live="" phase_ignored=0
+    # A lock with no live pid is NOT automatically "stale": the execution behind it
+    # may still be running on the shared service, so it is reported as STALE_LOCK
+    # (a stop verdict) until a human verifies and passes --break-lock.
+    local worker_live="" phase_live="" phase_ignored=0 worker_stale=0 phase_stale=0
     worker_live="$(live_pid_in "$current/.worker.lock" || true)"
     phase_live="$(live_pid_in "$current/.phase.lock" || true)"
     if [[ -n "$phase_live" && -n "$ignore_phase_pid" ]]; then
@@ -142,7 +153,9 @@ main() {
     if [[ -n "$worker_live" ]]; then
         ok "worker lock held by a LIVE process ($worker_live): $(tr '\n' ' ' <"$current/.worker.lock/info")"
     elif [[ -d "$current/.worker.lock" ]]; then
-        warn "stale worker lock (no live pid); run-worker refuses until --break-lock is passed after verification"
+        worker_stale=1
+        warn "stale worker lock (no live pid): $(lock_info_line "$current/.worker.lock")"
+        warn "  a vanished local pid is not proof that the shared-service run stopped; verify, then use --break-lock"
     else
         ok "no worker lock"
     fi
@@ -151,7 +164,9 @@ main() {
     elif [[ "$phase_ignored" -eq 1 ]]; then
         ok "phase lock is this loop's own (pid $ignore_phase_pid), ignored"
     elif [[ -d "$current/.phase.lock" ]]; then
-        warn "stale phase lock (no live pid); run-phase refuses until --break-lock is passed after verification"
+        phase_stale=1
+        warn "stale phase lock (no live pid): $(lock_info_line "$current/.phase.lock")"
+        warn "  verify nothing is running, then use --break-lock"
     fi
 
     # --- RUN_STATE ------------------------------------------------------------------------
@@ -311,10 +326,14 @@ main() {
     fi
 
     # --- verdict -------------------------------------------------------------------------------
+    # State correctness comes BEFORE lock recovery: a stale lock must never hide an
+    # ISSUE, and --break-lock authorizes only the lock, never a bypass of the rest.
     if [[ -n "$worker_live" || -n "$phase_live" ]]; then
         set_verdict "WORKER_RUNNING"
     elif [[ "$ISSUES" -gt 0 ]]; then
         set_verdict "INCONSISTENT"
+    elif [[ "$worker_stale" -eq 1 || "$phase_stale" -eq 1 ]]; then
+        set_verdict "STALE_LOCK"
     elif [[ -n "$escalated" || "$rs_status" == "escalated" ]]; then
         set_verdict "ESCALATED"
     elif [[ "$rs_status" == "checkpoint" ]]; then
@@ -335,8 +354,24 @@ main() {
     case "$VERDICT" in
         WORKER_RUNNING)
             printf ' - a worker or phase loop is alive; do not start another\n' ;;
+        STALE_LOCK)
+            if [[ "$worker_stale" -eq 1 && "$phase_stale" -eq 1 ]]; then
+                printf ' - a stale WORKER lock and a stale PHASE lock cannot be proven dead; verify nothing runs, then --break-lock\n'
+            elif [[ "$worker_stale" -eq 1 ]]; then
+                printf ' - a stale WORKER lock cannot be proven dead; a vanished pid is not proof, verify (ps / check-state), then --break-lock\n'
+            else
+                printf ' - a stale PHASE lock cannot be proven dead; verify nothing runs, then --break-lock\n'
+            fi ;;
         INCONSISTENT)
-            printf ' (%d issue(s)) - fix the issues above before resuming\n' "$ISSUES" ;;
+            printf ' (%d issue(s)) - fix the issues above before resuming' "$ISSUES"
+            if [[ "$worker_stale" -eq 1 && "$phase_stale" -eq 1 ]]; then
+                printf '; stale worker+phase locks are also present, but --break-lock does not bypass issues'
+            elif [[ "$worker_stale" -eq 1 ]]; then
+                printf '; a stale worker lock is also present, but --break-lock does not bypass issues'
+            elif [[ "$phase_stale" -eq 1 ]]; then
+                printf '; a stale phase lock is also present, but --break-lock does not bypass issues'
+            fi
+            printf '\n' ;;
         ESCALATED)
             printf ' task=%s - Codex must resolve the blocker (queue history / ESCALATION.md)\n' "${escalated:-${rs_task:-?}}" ;;
         CHECKPOINT)

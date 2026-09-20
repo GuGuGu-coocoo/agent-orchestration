@@ -61,9 +61,31 @@ human-owned decision does not slip through unreviewed.
 
 A **refusal before the loop starts** (exit 5: a live worker or another phase loop,
 an inconsistent state, a path the scope check cannot represent) changes nothing:
-no `RUN_STATE.json` write, no `TASK.md` rewrite, no logs directory. It reports what
-it found and leaves the project exactly as it was, so a live run is never disturbed.
-Fix the cause, then run the loop again.
+no `RUN_STATE.json` write, no `TASK.md` rewrite, no logs directory, no new
+`history/` copy. It reports what it found and leaves the whole `.agent/` tree
+byte-identical, so a live run is never disturbed. Fix the cause, then run again.
+
+**A stale lock is never taken over automatically** - neither the loop's
+`.phase.lock` nor a `.worker.lock` (a cancelled run keeps its lock on purpose, and
+a shared-service execution can outlive its local wrapper, so a vanished pid proves
+nothing). Verify yourself first:
+
+```sh
+~/.agents/skills/cheap-worker/scripts/check-state.sh   # verdict: STALE_LOCK?
+ps -p <pid> [-p <worker_pid>]                          # pids from .agent/current/.worker.lock/info
+```
+
+Only when nothing is running, re-run the loop with `--break-lock`: it authorizes
+the recovery of both stale locks (`run-worker.sh` moves the worker lock to
+`.agent/history/attempts/stale-locks/` before starting). A live pid always wins -
+`--break-lock` never overrides one.
+
+`--break-lock` is **not** a general "force" flag: it authorizes the lock recovery
+only. State validation still runs first and is never bypassed - if
+`check-state.sh` reports `INCONSISTENT` (invalid `current/STATE.json`, conflicting
+reports, ...), the loop refuses before any write and before the lock is touched,
+with or without the flag. `check-state.sh` reports `INCONSISTENT` before
+`STALE_LOCK` for exactly that reason.
 
 Stops **inside** the loop do record their state (`stop_reason`):
 

@@ -97,7 +97,10 @@ Priority: **Correctness > minimal change > verifiability > elegance.**
 
 - A project-level lock records the wrapper pid **and** the worker pid, refuses a
   second worker (`exit 7`), and never takes over a stale lock automatically
-  (`exit 8`; clear it with `--break-lock` after verifying nothing runs). A
+  (`exit 8`; clear it with `--break-lock` after verifying nothing runs).
+  `run-phase.sh` checks the same lock **before it writes anything**, so an
+  unconfirmed stale worker lock aborts the loop with the project unchanged instead
+  of failing halfway through the Task handoff. A
   cancelled run (Ctrl-C / SIGTERM) attempts to stop its worker (TERM + up to ~10s),
   **keeps the lock**, and records the cancellation; killing the CLI is not proof
   that a shared-service execution stopped.

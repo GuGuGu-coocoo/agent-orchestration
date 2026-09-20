@@ -560,7 +560,7 @@ check_eq "harness: dirty tree without --allow-dirty -> exit 1" "1" "$FAKE_RC"
 run_fake result 0 --allow-dirty --mode implement
 check_eq "harness: dirty tree with --allow-dirty -> exit 0" "0" "$FAKE_RC"
 check "harness: BASELINE.md lists the dirty file" grep -q 'M app.py' "$hrepo/.agent/current/BASELINE.md"
-check "harness: BASELINE.patch holds the full pre-run patch" grep -q 'local change' "$hrepo/.agent/current/BASELINE.patch"
+check_commit "harness: BASELINE.patch holds the full pre-run patch" grep -q 'local change' "$hrepo/.agent/current/BASELINE.patch"
 
 # cwd pinning when invoked from elsewhere
 OTHER="$(new_repo smoke-caller)"
@@ -1073,7 +1073,7 @@ queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' 
 write_queue "$G2" "A" "$G2Q" 'test "$(cat allowed.txt)" = ok'
 commit_all "$G2" "baseline"
 printf 'local uncommitted user work\n' >"$G2/forbidden.txt"
-check "G2: fixture really has a HEAD and a dirty forbidden file" bash -c \
+check_commit "G2: fixture really has a HEAD and a dirty forbidden file" bash -c \
     "git -C '$G2' rev-parse -q --verify HEAD >/dev/null && ! git -C '$G2' diff --quiet -- forbidden.txt"
 cat >"$G2FIX/A01.sh" <<'EOF'
 printf 'ok\n' > allowed.txt
@@ -1184,12 +1184,13 @@ sleep 30 &
 H1PID=$!
 mkdir -p "$H1/.agent/current/.worker.lock"
 printf 'pid=%s\nworker_pid=\nrun_id=live\n' "$H1PID" >"$H1/.agent/current/.worker.lock/info"
+H1_MANIFEST="$(agent_manifest "$H1")"
 H1_BEFORE_TASK="$(shasum "$H1/.agent/current/TASK.md" | awk '{print $1}')"
 H1_BEFORE_RS="$(shasum "$H1/.agent/RUN_STATE.json" | awk '{print $1}')"
 H1_BEFORE_Q="$(shasum "$H1/.agent/phases/A/TASK_QUEUE.json" | awk '{print $1}')"
 run_phase_fake "$H1" "$FAKEBIN"
 check_eq "H1: a live worker lock refuses the loop -> exit 5" "5" "$LAST_EXIT"
-check "H1: the refusal says a worker is live" grep -q 'is live' "$OUT_DIR/phase-${TEST_NAME}.log"
+check "H1: the refusal says a worker is running" grep -q 'worker is still running' "$OUT_DIR/phase-${TEST_NAME}.log"
 check_eq "H1: TASK.md is byte-identical after the refusal" "$H1_BEFORE_TASK" \
     "$(shasum "$H1/.agent/current/TASK.md" | awk '{print $1}')"
 check "H1: the original Task definition survived" grep -q 'AUDIT ORIGINAL DEFINITION' "$H1/.agent/current/TASK.md"
@@ -1198,6 +1199,7 @@ check_eq "H1: RUN_STATE.json is byte-identical after the refusal" "$H1_BEFORE_RS
 check_eq "H1: TASK_QUEUE.json is byte-identical after the refusal" "$H1_BEFORE_Q" \
     "$(shasum "$H1/.agent/phases/A/TASK_QUEUE.json" | awk '{print $1}')"
 check "H1: RUN_STATE still says running" bash -c "jq -e '.status == \"running\"' '$H1/.agent/RUN_STATE.json' >/dev/null"
+check_eq "H1: the whole .agent tree is byte-identical after the refusal" "$H1_MANIFEST" "$(agent_manifest "$H1")"
 check "H1: no phase log directory was created" bash -c "! test -d '$H1/.agent/current/logs'"
 check "H1: no phase lock was left behind" bash -c "! test -e '$H1/.agent/current/.phase.lock'"
 kill "$H1PID" 2>/dev/null || true
@@ -1224,10 +1226,12 @@ H2PID=$!
 mkdir -p "$H2/.agent/current/.phase.lock"
 printf 'pid=%s\nrun_id=other\nphase=A\n' "$H2PID" >"$H2/.agent/current/.phase.lock/info"
 H2_BEFORE_RS="$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+H2_MANIFEST="$(agent_manifest "$H2")"
 run_phase_fake "$H2" "$FAKEBIN"
 check_eq "H2: a live phase loop refuses a second loop -> exit 5" "5" "$LAST_EXIT"
 check_eq "H2: RUN_STATE.json is byte-identical" "$H2_BEFORE_RS" \
     "$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+check_eq "H2: the whole .agent tree is byte-identical" "$H2_MANIFEST" "$(agent_manifest "$H2")"
 check "H2: the other loop's lock was left in place" test -d "$H2/.agent/current/.phase.lock"
 kill "$H2PID" 2>/dev/null || true
 wait "$H2PID" 2>/dev/null || true
@@ -1243,6 +1247,228 @@ check "H3: the stale lock is still there" test -d "$H2/.agent/current/.phase.loc
 FAKE_TASK_DIR="$H2FIX" run_phase_fake "$H2" "$FAKEBIN" --break-lock
 check_eq "H3: --break-lock lets the loop proceed -> exit 0" "0" "$LAST_EXIT"
 check "H3: the stale lock was archived" bash -c "ls -d '$H2'/.agent/history/attempts/stale-locks/* >/dev/null 2>&1"
+
+# ---------------------------------------------------------------------------
+# 7d-2. stale WORKER lock: refuse before any project write, then recover only
+#       with an explicit --break-lock (review finding MEDIUM). H3 covers the
+#       stale PHASE lock only; a stale worker lock is a separate case.
+# ---------------------------------------------------------------------------
+info "startup: stale WORKER lock (regression)"
+
+stale_worker_fixture() {  # <repo> <fixdir> <lock-info-text>
+    local repo="$1" fix="$2" info="$3" q
+    printf 'old\n' >"$repo/allowed.txt"
+    write_phase_md "$repo" "A"
+    write_run_state "$repo" "A" "running" >/dev/null
+    q="$fix/tasks.jsonl"
+    queue_task_json A01 "edit allowed" low pending 'test "$(cat allowed.txt)" = ok' "allowed.txt" "" >>"$q"
+    write_queue "$repo" "A" "$q" 'test "$(cat allowed.txt)" = ok'
+    printf 'printf "ok\\n" > allowed.txt\n' >"$fix/A01.sh"
+    mkdir -p "$repo/.agent/current"
+    printf '# Task\n\n## Task ID\nA01\n\n## Marker\nORIGINAL DEFINITION\n' >"$repo/.agent/current/TASK.md"
+    commit_all "$repo" "stale worker lock fixture"
+    mkdir -p "$repo/.agent/current/.worker.lock"
+    printf '%s' "$info" >"$repo/.agent/current/.worker.lock/info"
+}
+
+# J1: cancelled worker lock, no --break-lock -> refuse, whole .agent byte-identical
+J1="$(new_repo smoke-stale-j1)"
+CLEANUP_DIRS+=("$J1")
+J1FIX="$(mktemp -d "$TMP_BASE/smoke-fix-j1.XXXXXX")"
+CLEANUP_DIRS+=("$J1FIX")
+stale_worker_fixture "$J1" "$J1FIX" 'pid=999999
+worker_pid=999998
+run_id=cancelled
+cancelled_by=TERM
+'
+J1_MANIFEST="$(agent_manifest "$J1")"
+FAKE_TASK_DIR="$J1FIX" run_phase_fake "$J1" "$FAKEBIN"
+check_eq "J1: unconfirmed stale worker lock -> exit 5" "5" "$LAST_EXIT"
+check_eq "J1: the whole .agent tree is byte-identical after the refusal" "$J1_MANIFEST" "$(agent_manifest "$J1")"
+check "J1: no worker was started" bash -c "! test -d '$J1/.agent/current/logs'"
+check "J1: the original TASK.md survived" grep -q 'ORIGINAL DEFINITION' "$J1/.agent/current/TASK.md"
+check "J1: the stale lock was NOT moved" test -d "$J1/.agent/current/.worker.lock"
+check "J1: the refusal explains the pid is not proof" grep -qi 'not proof' "$OUT_DIR/phase-${TEST_NAME}.log"
+check "J1: the refusal names the recovery flag" grep -q -- '--break-lock' "$OUT_DIR/phase-${TEST_NAME}.log"
+check "J1: the refusal says nothing was changed" grep -q 'no project file was changed' "$OUT_DIR/phase-${TEST_NAME}.log"
+check "J1: no checkpoint was written to RUN_STATE" bash -c "jq -e '.status == \"running\"' '$J1/.agent/RUN_STATE.json' >/dev/null"
+check "J1: the task is still pending in the queue" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"A01\")][0].status == \"pending\"' '$J1/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+
+# J2: same lock, explicit --break-lock -> run-worker moves it aside and the Task runs
+FAKE_TASK_DIR="$J1FIX" run_phase_fake "$J1" "$FAKEBIN" --break-lock
+check_eq "J2: --break-lock recovers the stale worker lock -> exit 0" "0" "$LAST_EXIT"
+check "J2: the Task was accepted" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"A01\")][0].status == \"done\"' '$J1/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "J2: the worker really ran" bash -c "[ \"\$(cat '$J1/allowed.txt')\" = ok ]"
+check "J2: the stale lock was archived, not deleted" bash -c \
+    "ls -d '$J1'/.agent/history/attempts/stale-locks/*-999999 >/dev/null 2>&1"
+check "J2: the worker lock is gone after the run" bash -c "! test -e '$J1/.agent/current/.worker.lock'"
+check "J2: it stopped at the phase review, not mid-phase" bash -c \
+    "jq -e '.status == \"awaiting_phase_review\"' '$J1/.agent/RUN_STATE.json' >/dev/null"
+
+# J3: a lock directory with no info at all cannot be proven dead either
+J3="$(new_repo smoke-stale-j3)"
+CLEANUP_DIRS+=("$J3")
+J3FIX="$(mktemp -d "$TMP_BASE/smoke-fix-j3.XXXXXX")"
+CLEANUP_DIRS+=("$J3FIX")
+stale_worker_fixture "$J3" "$J3FIX" ''
+rm -f "$J3/.agent/current/.worker.lock/info"
+J3_MANIFEST="$(agent_manifest "$J3")"
+FAKE_TASK_DIR="$J3FIX" run_phase_fake "$J3" "$FAKEBIN"
+check_eq "J3: a worker lock with no info -> exit 5" "5" "$LAST_EXIT"
+check_eq "J3: the whole .agent tree is byte-identical" "$J3_MANIFEST" "$(agent_manifest "$J3")"
+
+# J4: check-state reports STALE_LOCK for a stale WORKER lock (not WORKER_RUNNING)
+J4="$(new_repo smoke-stale-j4)"
+CLEANUP_DIRS+=("$J4")
+J4FIX="$(mktemp -d "$TMP_BASE/smoke-fix-j4.XXXXXX")"
+CLEANUP_DIRS+=("$J4FIX")
+stale_worker_fixture "$J4" "$J4FIX" 'pid=999999
+worker_pid=999998
+run_id=cancelled
+cancelled_by=TERM
+'
+(cd "$J4" && "$CHECK_STATE") >"$OUT_DIR/cs-stale-worker.log" 2>&1 || true
+check "J4: check-state verdict is STALE_LOCK" grep -q 'verdict: STALE_LOCK' "$OUT_DIR/cs-stale-worker.log"
+check "J4: it names the WORKER lock" grep -q 'stale WORKER lock' "$OUT_DIR/cs-stale-worker.log"
+check "J4: it warns a pid is not proof" grep -qi 'not proof' "$OUT_DIR/cs-stale-worker.log"
+check "J4: check-state is a stop verdict (exit 1)" bash -c \
+    "cd '$J4' && '$CHECK_STATE' >/dev/null 2>&1; [ \$? -eq 1 ]"
+
+# J5: check-state reports STALE_LOCK for a stale PHASE lock, and distinguishes it
+J5="$(new_repo smoke-stale-j5)"
+CLEANUP_DIRS+=("$J5")
+J5FIX="$(mktemp -d "$TMP_BASE/smoke-fix-j5.XXXXXX")"
+CLEANUP_DIRS+=("$J5FIX")
+stale_worker_fixture "$J5" "$J5FIX" ''
+rm -rf "$J5/.agent/current/.worker.lock"
+mkdir -p "$J5/.agent/current/.phase.lock"
+printf 'pid=999999\nrun_id=dead\nphase=A\n' >"$J5/.agent/current/.phase.lock/info"
+(cd "$J5" && "$CHECK_STATE") >"$OUT_DIR/cs-stale-phase.log" 2>&1 || true
+check "J5: check-state verdict is STALE_LOCK" grep -q 'verdict: STALE_LOCK' "$OUT_DIR/cs-stale-phase.log"
+check "J5: it names the PHASE lock (not the worker lock)" grep -q 'stale PHASE lock' "$OUT_DIR/cs-stale-phase.log"
+
+# J6: a live worker pid still wins over --break-lock (never overridden)
+J6="$(new_repo smoke-stale-j6)"
+CLEANUP_DIRS+=("$J6")
+J6FIX="$(mktemp -d "$TMP_BASE/smoke-fix-j6.XXXXXX")"
+CLEANUP_DIRS+=("$J6FIX")
+stale_worker_fixture "$J6" "$J6FIX" ''
+sleep 30 &
+J6PID=$!
+printf 'pid=%s\nworker_pid=\nrun_id=live\n' "$J6PID" >"$J6/.agent/current/.worker.lock/info"
+J6_MANIFEST="$(agent_manifest "$J6")"
+FAKE_TASK_DIR="$J6FIX" run_phase_fake "$J6" "$FAKEBIN" --break-lock
+check_eq "J6: --break-lock never overrides a live worker pid -> exit 5" "5" "$LAST_EXIT"
+check_eq "J6: the whole .agent tree is byte-identical" "$J6_MANIFEST" "$(agent_manifest "$J6")"
+kill "$J6PID" 2>/dev/null || true
+wait "$J6PID" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 7d-3. a confirmed stale lock must NOT bypass non-lock state validation
+#       (review finding MEDIUM: STALE_LOCK masked INCONSISTENT, so --break-lock
+#        ran the loop with an invalid current/STATE.json)
+# ---------------------------------------------------------------------------
+info "lock confirmation vs non-lock issues (regression)"
+
+# helper: add an unrepairable issue the loop must refuse on
+break_state_json() { printf '{invalid json' >"$1/.agent/current/STATE.json"; }
+
+# K1: invalid STATE, no lock at all, --break-lock -> refuse, tree unchanged
+K1="$(new_repo smoke-issue-k1)"
+CLEANUP_DIRS+=("$K1")
+K1FIX="$(mktemp -d "$TMP_BASE/smoke-fix-k1.XXXXXX")"
+CLEANUP_DIRS+=("$K1FIX")
+stale_worker_fixture "$K1" "$K1FIX" 'pid=999999
+'
+rm -rf "$K1/.agent/current/.worker.lock"
+break_state_json "$K1"
+K1_MANIFEST="$(agent_manifest "$K1")"
+FAKE_TASK_DIR="$K1FIX" run_phase_fake "$K1" "$FAKEBIN" --break-lock
+check_eq "K1: invalid STATE (+no lock) -> exit 5" "5" "$LAST_EXIT"
+check_eq "K1: the whole .agent tree is byte-identical" "$K1_MANIFEST" "$(agent_manifest "$K1")"
+check "K1: the invalid STATE was not overwritten" grep -q 'invalid json' "$K1/.agent/current/STATE.json"
+
+# K2: invalid STATE + stale WORKER lock, --break-lock -> still refuse (the regression)
+K2="$(new_repo smoke-issue-k2)"
+CLEANUP_DIRS+=("$K2")
+K2FIX="$(mktemp -d "$TMP_BASE/smoke-fix-k2.XXXXXX")"
+CLEANUP_DIRS+=("$K2FIX")
+stale_worker_fixture "$K2" "$K2FIX" 'pid=999999
+worker_pid=999998
+run_id=cancelled
+cancelled_by=TERM
+'
+break_state_json "$K2"
+K2_MANIFEST="$(agent_manifest "$K2")"
+FAKE_TASK_DIR="$K2FIX" run_phase_fake "$K2" "$FAKEBIN" --break-lock
+check_eq "K2: invalid STATE + stale worker lock + --break-lock -> exit 5" "5" "$LAST_EXIT"
+check_eq "K2: the whole .agent tree is byte-identical" "$K2_MANIFEST" "$(agent_manifest "$K2")"
+check "K2: the stale worker lock was NOT moved" test -d "$K2/.agent/current/.worker.lock"
+check "K2: no worker ran" bash -c "! test -d '$K2/.agent/current/logs'"
+check "K2: the task is still pending" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"A01\")][0].status == \"pending\"' '$K2/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "K2: check-state says INCONSISTENT, not STALE_LOCK" bash -c \
+    "cd '$K2' && '$CHECK_STATE' 2>&1 | grep -q 'verdict: INCONSISTENT'"
+check "K2: the verdict says --break-lock does not bypass issues" bash -c \
+    "cd '$K2' && '$CHECK_STATE' 2>&1 | grep -q 'does not bypass'"
+
+# K3: invalid STATE + stale PHASE lock, --break-lock -> still refuse
+K3="$(new_repo smoke-issue-k3)"
+CLEANUP_DIRS+=("$K3")
+K3FIX="$(mktemp -d "$TMP_BASE/smoke-fix-k3.XXXXXX")"
+CLEANUP_DIRS+=("$K3FIX")
+stale_worker_fixture "$K3" "$K3FIX" ''
+rm -rf "$K3/.agent/current/.worker.lock"
+mkdir -p "$K3/.agent/current/.phase.lock"
+printf 'pid=999999\nrun_id=dead\nphase=A\n' >"$K3/.agent/current/.phase.lock/info"
+break_state_json "$K3"
+K3_MANIFEST="$(agent_manifest "$K3")"
+FAKE_TASK_DIR="$K3FIX" run_phase_fake "$K3" "$FAKEBIN" --break-lock
+check_eq "K3: invalid STATE + stale phase lock + --break-lock -> exit 5" "5" "$LAST_EXIT"
+check_eq "K3: the whole .agent tree is byte-identical" "$K3_MANIFEST" "$(agent_manifest "$K3")"
+check "K3: the stale phase lock was NOT moved" test -d "$K3/.agent/current/.phase.lock"
+
+# K4: conflicting reports (RESULT + ESCALATION for the same Task) + stale worker lock
+K4="$(new_repo smoke-issue-k4)"
+CLEANUP_DIRS+=("$K4")
+K4FIX="$(mktemp -d "$TMP_BASE/smoke-fix-k4.XXXXXX")"
+CLEANUP_DIRS+=("$K4FIX")
+stale_worker_fixture "$K4" "$K4FIX" 'pid=999999
+worker_pid=999998
+run_id=cancelled
+'
+printf '# Result\n\n## Task ID\nA01\n\n## Status\nDONE\n' >"$K4/.agent/current/RESULT.md"
+printf '# Escalation\n\n## Task ID\nA01\n\n## Class\nESCALATE\n\n## Current Blocker\nfixture\n' >"$K4/.agent/current/ESCALATION.md"
+K4_MANIFEST="$(agent_manifest "$K4")"
+FAKE_TASK_DIR="$K4FIX" run_phase_fake "$K4" "$FAKEBIN" --break-lock
+check_eq "K4: conflicting reports + stale worker lock -> exit 5" "5" "$LAST_EXIT"
+check_eq "K4: the whole .agent tree is byte-identical" "$K4_MANIFEST" "$(agent_manifest "$K4")"
+check "K4: both reports were left in place" bash -c \
+    "test -s '$K4/.agent/current/RESULT.md' && test -s '$K4/.agent/current/ESCALATION.md'"
+
+# K5: the allowed reconciliation still works together with a confirmed lock
+K5="$(new_repo smoke-issue-k5)"
+CLEANUP_DIRS+=("$K5")
+K5FIX="$(mktemp -d "$TMP_BASE/smoke-fix-k5.XXXXXX")"
+CLEANUP_DIRS+=("$K5FIX")
+stale_worker_fixture "$K5" "$K5FIX" 'pid=999999
+worker_pid=999998
+run_id=cancelled
+'
+jq '(.tasks[0].status) = "in_progress"' "$K5/.agent/phases/A/TASK_QUEUE.json" >"$K5/.agent/phases/A/q.json" \
+    && mv "$K5/.agent/phases/A/q.json" "$K5/.agent/phases/A/TASK_QUEUE.json"
+printf '%s' '{"current_phase":"A","current_task":"A01","status":"running"}' >"$K5/.agent/RUN_STATE.json"
+cp "$PROJECT_ROOT/skills/cheap-worker/assets/templates/TASK.md" "$K5/.agent/current/TASK.md"
+printf '%s' '{"task_id":"A01","run_id":"r1","status":"running"}' >"$K5/.agent/current/STATE.json"
+FAKE_TASK_DIR="$K5FIX" run_phase_fake "$K5" "$FAKEBIN" --break-lock
+check_eq "K5: repairable TASK mismatch + stale worker lock -> exit 0" "0" "$LAST_EXIT"
+check "K5: the Task ran and was accepted" bash -c \
+    "jq -e '[.tasks[] | select(.id==\"A01\")][0].status == \"done\"' '$K5/.agent/phases/A/TASK_QUEUE.json' >/dev/null"
+check "K5: TASK.md was rebuilt from the queue" bash -c "grep -q 'Risk' '$K5/.agent/current/TASK.md'"
+check "K5: the stale lock was archived by run-worker" bash -c \
+    "ls -d '$K5'/.agent/history/attempts/stale-locks/*-999999 >/dev/null 2>&1"
 
 # ---------------------------------------------------------------------------
 # 7e. gate text is data, never jq filter source

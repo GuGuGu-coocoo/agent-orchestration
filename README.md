@@ -144,14 +144,30 @@ cd /path/to/target-project
 | 4 | refused: the Phase is at a gate (`awaiting_phase_review` / `awaiting_human_qa`) |
 | 5 | refused before the loop started (live worker/loop, inconsistent state) or stopped at an inconsistent/plumbing state — a **refusal never changes any file** |
 
-Flags: `--root DIR`, `--max-tasks N` (safety cap), `--dry-run`, `--break-lock`
-(clear a provably dead loop lock), `--no-check-state`.
+Flags: `--root DIR`, `--max-tasks N` (safety cap), `--dry-run`, `--no-check-state`,
+`--break-lock` (the explicit human confirmation that nothing is running: it
+authorizes the recovery of **both** stale locks - the loop's `.phase.lock` and a
+stale `.worker.lock`, which is forwarded to `run-worker.sh`).
 
 Before it touches anything, the loop (1) validates the plan and the state
-read-only, (2) asks `check-state.sh` whether a worker or another loop is live —
-**a refusal leaves `RUN_STATE.json`, `TASK_QUEUE.json` and `TASK.md` byte-identical**,
-(3) takes its own `.phase.lock`, and only then repairs a missing/template `TASK.md`
-or quarantines a report left over from another Task.
+read-only, (2) refuses a live **or unprovable-stale worker lock**, (3) asks
+`check-state.sh` whether a worker or another loop is live — **a refusal leaves the
+whole `.agent/` tree byte-identical** (no `RUN_STATE.json` write, no `TASK.md`
+rewrite, no new log) — (4) takes its own `.phase.lock`, and only then repairs a
+missing/template `TASK.md` or quarantines a report left over from another Task.
+
+A lock with no live pid is never assumed dead: a shared-service execution can
+outlive its local wrapper. Verify yourself (`check-state.sh` verdict `STALE_LOCK`,
+`ps`), and only then pass `--break-lock`; `run-worker.sh` moves the stale lock to
+`.agent/history/attempts/stale-locks/` before starting. A live pid always wins —
+`--break-lock` never overrides it.
+
+`--break-lock` authorizes **only** the lock recovery. It never bypasses state
+validation: when `check-state.sh` reports `INCONSISTENT` (an invalid
+`current/STATE.json`, conflicting reports, ...) the run is refused before any
+write, with or without the flag; only the TASK/report identity issues that the
+pre-flight can repair itself go through reconciliation, and they are re-checked
+afterwards.
 
 The Phase review is recorded with:
 
@@ -354,7 +370,10 @@ project has an `AGENTS.md`, the worker must read it.
 
 `check-state.sh` prints one verdict for resume: `RUNNING`, `QUEUE_COMPLETE`, `EMPTY`,
 `CHECKPOINT`, `ESCALATED`, `AWAITING_PHASE_REVIEW`, `AWAITING_HUMAN_QA`,
-`WORKER_RUNNING` or `INCONSISTENT` (exit `0` = actionable, `1` = stop).
+`WORKER_RUNNING`, `STALE_LOCK` or `INCONSISTENT` (exit `0` = actionable, `1` = stop).
+`STALE_LOCK` means a worker/phase lock has no live pid, which is **not** proof that
+the run stopped: verify nothing is running, then `--break-lock`. `INCONSISTENT` is
+reported **before** `STALE_LOCK`, so a stale lock can never hide a state problem.
 
 ## When the loop stops (checkpoint / escalation rules)
 

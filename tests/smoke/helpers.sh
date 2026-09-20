@@ -38,11 +38,13 @@ TMP_BASE="${TMPDIR:-/tmp}"
 TEST_NAME="test"
 PASS_COUNT=0
 FAIL_COUNT=0
+SKIP_COUNT=0
 LAST_EXIT=0
 CLEANUP_DIRS=()
 
 pass() { PASS_COUNT=$((PASS_COUNT + 1)); printf '  PASS  %s\n' "$*"; }
 fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); printf '  FAIL  %s\n' "$*"; }
+skip() { SKIP_COUNT=$((SKIP_COUNT + 1)); printf '  SKIP  %s\n' "$*"; }
 info() { printf '  info  %s\n' "$*"; }
 
 check() {
@@ -61,6 +63,59 @@ check_eq() {
     else
         fail "$desc (expected '$expected', got '$actual')"
     fi
+}
+
+# Some sandboxes refuse to create commits (a gated git shim returns success
+# without writing a commit). Assertions that need a real HEAD are then reported as
+# SKIP rather than FAIL, so the suite is honest in that environment instead of
+# reporting a false pass. Probe once, at source time.
+GIT_COMMIT_OK=1
+probe_git_commit() {
+    local d
+    d="$(mktemp -d "$TMP_BASE/git-probe.XXXXXX")"
+    if (
+        cd "$d" || exit 1
+        git init -q || exit 1
+        git config user.email "probe@test.local" || exit 1
+        git config user.name "Probe" || exit 1
+        : >probe.txt || exit 1
+        git add probe.txt || exit 1
+        git commit -qm probe >/dev/null 2>&1 || exit 1
+        git rev-parse --verify -q HEAD >/dev/null 2>&1 || exit 1
+    ); then
+        GIT_COMMIT_OK=1
+    else
+        GIT_COMMIT_OK=0
+    fi
+    rm -rf "$d"
+}
+probe_git_commit
+
+# check_commit <desc> <cmd...> - like check, but skipped when a fixture commit is
+# not possible in this environment (the two assertions that need a real HEAD).
+check_commit() {
+    local desc="$1"; shift
+    if [[ "$GIT_COMMIT_OK" -eq 1 ]]; then
+        check "$desc" "$@"
+    else
+        skip "$desc (needs a real HEAD; git commit is unavailable here)"
+    fi
+}
+
+# agent_manifest <repo> - sorted dirs + content hashes of the WHOLE .agent tree,
+# so a refusal can be proven byte-identical (no new files, no new directories).
+agent_manifest() {
+    local repo="$1" p
+    (
+        cd "$repo" || exit 1
+        find .agent \( -type f -o -type d \) | LC_ALL=C sort | while IFS= read -r p; do
+            if [[ -d "$p" ]]; then
+                printf 'dir  %s\n' "$p"
+            else
+                printf 'file %s %s\n' "$(shasum "$p" | awk '{print $1}')" "$p"
+            fi
+        done
+    )
 }
 
 # new_repo <name> -> creates a temp git repo, echoes its path
@@ -312,7 +367,11 @@ cleanup_temp_repos() {
 
 finish() {
     cleanup_temp_repos
-    printf '\n%s: %d passed, %d failed\n' "$TEST_NAME" "$PASS_COUNT" "$FAIL_COUNT"
+    if [[ "$SKIP_COUNT" -gt 0 ]]; then
+        printf '\n%s: %d passed, %d failed, %d skipped\n' "$TEST_NAME" "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+    else
+        printf '\n%s: %d passed, %d failed\n' "$TEST_NAME" "$PASS_COUNT" "$FAIL_COUNT"
+    fi
     printf '(test output kept in %s)\n' "$OUT_DIR"
     if [[ "$FAIL_COUNT" -gt 0 ]]; then
         exit 1

@@ -173,6 +173,7 @@ Any time a session starts, before anything else:
 | check-state verdict | action |
 | --- | --- |
 | `WORKER_RUNNING` | a worker or the loop is alive: do not start another; wait for the report or the `[phase-notify]` message |
+| `STALE_LOCK` | a worker/phase lock has no live pid, which is **not** proof the run stopped: verify (`ps`, the recorded pids), then re-run with `--break-lock` (never implied) |
 | `INCONSISTENT` | fix the listed issues first (rewrite TASK.md from the queue, resolve double reports, archive missing done Tasks) |
 | `ESCALATED` | resolve the escalated Task in the queue, then run the loop |
 | `CHECKPOINT` | a Codex decision is pending: read `.agent/current/` and `stop_reason` |

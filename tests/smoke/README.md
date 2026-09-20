@@ -17,6 +17,13 @@ nothing is committed to this repository.
 | `run-live.sh` | convenience wrapper: `a`, `b`, `c`, `d`, `e`, or all | - |
 | `run-all.sh` | offline, then all live | - |
 
+## Environment notes
+
+The suite creates throwaway repos and commits fixtures in them. If the sandbox
+refuses to create commits (a gated `git` shim), the two assertions that need a real
+`HEAD` are reported as `SKIP` instead of failing - the summary line then reads
+`N passed, M failed, K skipped`. Everything else must still pass.
+
 ## Running
 
 ```sh
