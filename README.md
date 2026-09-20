@@ -1,5 +1,7 @@
 # agent-orchestration
 
+[![CI](https://github.com/GuGuGu-coocoo/agent-orchestration/actions/workflows/ci.yml/badge.svg)](https://github.com/GuGuGu-coocoo/agent-orchestration/actions/workflows/ci.yml)
+
 Global, cross-project Agent Orchestration Skills for a three-layer workflow where
 **OpenCode does the Task-level work and verification, and Codex supervises at
 Phase level**:
@@ -89,6 +91,28 @@ agent-orchestration/
 │           ├── PHASE.md  TASK_QUEUE.json  RUN_STATE.json
 └── tests/smoke/                       # throwaway-repo tests, never the user's projects
 ```
+
+## Requirements
+
+| Dependency | Needed for | Notes |
+| --- | --- | --- |
+| [OpenCode](https://opencode.ai) v2 (`opencode`) | running Tasks: one session per Task on the shared background service | must be on `PATH` and authenticated |
+| `git` | baselines, diffs and the scope check | every target project is a repository |
+| `jq` | every state file is read and written with it | required, no fallback |
+| `bash` | all scripts | targets bash 3.2+; macOS system bash works |
+| `python3` | verification commands in Python projects | optional |
+| Codex desktop app | the background hand-off and wake-up (`worker-notify.sh`) | optional; blocking mode needs no Codex |
+
+### Platform support
+
+| Platform | Status |
+| --- | --- |
+| macOS | developed and tested here (system bash 3.2) |
+| Linux | exercised by CI (`ubuntu-latest`, bash 5) |
+| Windows | not supported natively. Use WSL — it should work, but it is untested. Native Git Bash is not supported: process-liveness checks (`kill -0`) and signal handling are unreliable there. |
+
+The scripts avoid GNU/BSD-only flags where the two differ (`stat`, `shasum` vs
+`sha256sum`, `sed -i`), so the same code runs on macOS and Linux.
 
 ## Install
 
@@ -402,10 +426,15 @@ runs the scripts from **this source tree**. It never touches real projects and
 never installs anything. See `tests/smoke/README.md`.
 
 ```sh
-tests/smoke/run-offline.sh                  # no model calls (266 checks)
+tests/smoke/run-offline.sh                  # no model calls, no credentials (379 checks)
 tests/smoke/run-live.sh                     # all live tests (OpenCode default model)
 SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh  # keep the generated repos
 ```
+
+`run-offline.sh` is the project's contract, and CI runs it on Linux and macOS
+(`.github/workflows/ci.yml`). It needs `opencode` on `PATH` because the doctor
+checks the real CLI, but it makes no model calls: every worker it drives is a
+deterministic fake.
 
 Live tests use OpenCode's configured default model and retry transient provider
 quota errors (HTTP 429); otherwise they fail loudly. They never silently pass.
@@ -450,7 +479,8 @@ verdict. See `skills/phase-runner/references/human-checkpoint.md`.
   root: they must be non-interactive, deterministic and reasonably fast.
 - The installer's `rsync --delete` mirror mode assumes the target directory is
   fully managed by this project. `--target` is test-only.
-- macOS bash 3.2 compatible; not tested on Windows.
+- Bash 3.2 compatible (macOS) and CI-tested on Linux; Windows is unsupported
+  natively (see [Platform support](#platform-support)).
 
 ## Development rules
 

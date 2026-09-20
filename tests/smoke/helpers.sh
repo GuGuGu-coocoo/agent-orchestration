@@ -102,6 +102,20 @@ check_commit() {
     fi
 }
 
+# file_hash <path> - stable content hash, portable across macOS (shasum) and
+# Linux (sha256sum). Fails loudly when neither tool exists: a missing hasher
+# must never turn into "two empty hashes are equal" (a silent false pass).
+file_hash() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        printf 'file_hash: neither shasum nor sha256sum is available\n' >&2
+        return 1
+    fi
+}
+
 # agent_manifest <repo> - sorted dirs + content hashes of the WHOLE .agent tree,
 # so a refusal can be proven byte-identical (no new files, no new directories).
 agent_manifest() {
@@ -112,7 +126,7 @@ agent_manifest() {
             if [[ -d "$p" ]]; then
                 printf 'dir  %s\n' "$p"
             else
-                printf 'file %s %s\n' "$(shasum "$p" | awk '{print $1}')" "$p"
+                printf 'file %s %s\n' "$(file_hash "$p")" "$p"
             fi
         done
     )

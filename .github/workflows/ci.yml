@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The offline suite is the project's contract: it drives every script with a
+  # deterministic fake worker, so it needs no model calls and no credentials.
+  # It runs on Linux and macOS because the scripts target bash 3.2 (macOS ships
+  # that) while a modern bash 5 (Linux) must keep working too.
+  offline:
+    name: offline smoke tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq sqlite3
+
+      - name: Tool versions
+        run: |
+          bash --version | head -1
+          git --version
+          jq --version
+          python3 --version
+          sqlite3 --version
+
+      # doctor.sh is part of the offline suite and checks the real OpenCode CLI,
+      # so the binary (not a service, not credentials) must be present.
+      - name: Install OpenCode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: OpenCode version
+        run: opencode --version
+
+      - name: Run the offline smoke tests
+        run: tests/smoke/run-offline.sh
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-failure-evidence-${{ matrix.os }}
+          path: tests/smoke/.out
+          if-no-files-found: ignore
+          retention-days: 7

@@ -27,7 +27,7 @@ commit_all "$repo" "initial commit"
 (
     cd "$repo" || exit 1
     cp main.py main.py.orig
-    sed -i '' 's/print(message())/print(message() + "!")/' main.py
+    sed 's/print(message())/print(message() + "!")/' main.py >main.py.new && mv main.py.new main.py
     if python3 test_main.py >/dev/null 2>&1; then
         printf 'contradiction check: test unexpectedly PASSED with hi! output\n' >"$OUT_DIR/c-contradiction.txt"
     else

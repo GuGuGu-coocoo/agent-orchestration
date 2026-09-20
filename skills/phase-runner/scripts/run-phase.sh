@@ -127,8 +127,16 @@ hash_file() {
     fi
 }
 
+# file_mtime <path> -> epoch seconds, or 0 when unavailable.
+# GNU stat's `-f` means "filesystem status", so `stat -f %m` succeeds on Linux
+# while printing a mount point instead of a timestamp. The output is therefore
+# validated, not trusted: try GNU first, fall back to BSD, then give up as 0.
 file_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf '0'
+    local out
+    out="$(stat -c %Y "$1" 2>/dev/null || true)"
+    [[ "$out" =~ ^[0-9]+$ ]] || out="$(stat -f %m "$1" 2>/dev/null || true)"
+    [[ "$out" =~ ^[0-9]+$ ]] || out=0
+    printf '%s\n' "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -400,8 +408,14 @@ NL="$(printf '\nX')"; NL="${NL%X}"
 TAB_CHAR="$(printf '\t')"
 UNREPRESENTABLE="!unrepresentable-path"
 
+# file_mode <path> -> octal permission bits, or '?' when unavailable.
+# Same GNU/BSD split as file_mtime: validate the shape instead of the exit code.
 file_mode() {
-    stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf '?'
+    local out
+    out="$(stat -c %a "$1" 2>/dev/null || true)"
+    [[ "$out" =~ ^[0-7]+$ ]] || out="$(stat -f %Lp "$1" 2>/dev/null || true)"
+    [[ "$out" =~ ^[0-7]+$ ]] || out='?'
+    printf '%s\n' "$out"
 }
 
 # dirty_paths - every path git reports as changed, .agent/.git excluded, sorted.

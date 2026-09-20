@@ -53,8 +53,8 @@ done
 # The installed copy is a separate, deliberate install step: this repo must never
 # assume it is in sync (and the tests never install it).
 if [[ -f "$HOME/.agents/skills/cheap-worker/SKILL.md" ]]; then
-    if [[ "$(shasum "$PROJECT_ROOT/skills/cheap-worker/SKILL.md" | awk '{print $1}')" == \
-          "$(shasum "$HOME/.agents/skills/cheap-worker/SKILL.md" | awk '{print $1}')" ]]; then
+    if [[ "$(file_hash "$PROJECT_ROOT/skills/cheap-worker/SKILL.md")" == \
+          "$(file_hash "$HOME/.agents/skills/cheap-worker/SKILL.md")" ]]; then
         pass "installed cheap-worker SKILL.md matches source"
     else
         info "installed ~/.agents/skills/cheap-worker differs from this source tree (run scripts/install-skills.sh to sync; the tests never do)"
@@ -64,8 +64,13 @@ else
     info "cheap-worker is not installed globally (fine for development)"
 fi
 
-check "other skills still present (docx)" test -f "$HOME/.agents/skills/docx/SKILL.md"
-check "other skills still present (pdf)" test -f "$HOME/.agents/skills/pdf/SKILL.md"
+# This machine's other skills are optional and are not part of this repo, so
+# they are not asserted here. The deterministic guarantee - the installer never
+# touches other skills in the target - is tested with a purpose-built fixture
+# HOME in the install/uninstall section below.
+if [[ -f "$HOME/.agents/skills/docx/SKILL.md" || -f "$HOME/.agents/skills/pdf/SKILL.md" ]]; then
+    info "other skills are present in this HOME; they are left alone by the tests"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. doctor
@@ -343,7 +348,6 @@ check "phase wake-up: does not ask for a per-Task review" bash -c "! grep -q '�
 check "phase wake-up: says no polling is needed" grep -q '无需轮询' "$OUT_DIR/notify-phase-msg-0.log"
 check "phase wake-up: an unexpected exit still produces a message" grep -q 'exit=99' "$OUT_DIR/notify-phase-msg-99.log"
 check "phase wake-up: the unexpected branch names the state file" grep -q 'RUN_STATE.json' "$OUT_DIR/notify-phase-msg-99.log"
-check "task wake-up: points a whole-Phase user at --phase" grep -q -- '--phase' "$OUT_DIR/notify-msg-0.log"
 
 # ---------------------------------------------------------------------------
 # 6d. session identity: explicit only, fail closed
@@ -392,6 +396,7 @@ check "worker-notify: refusal is explicit" grep -q 'refusing to guess' "$OUT_DIR
 (NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 10 --task-id OFF2) >"$OUT_DIR/notify-msg-10.log" 2>&1 || true
 (NOTIFY_HOME_TEST "$NOTIFY" --print-message --simulate-exit 2 --task-id OFF2) >"$OUT_DIR/notify-msg-2.log" 2>&1 || true
 check "task wake-up: mentions the evidence gate" grep -q 'VERIFY.md' "$OUT_DIR/notify-msg-0.log"
+check "task wake-up: points a whole-Phase user at --phase" grep -q -- '--phase' "$OUT_DIR/notify-msg-0.log"
 check "exit 5 asks to read the existing RESULT" grep -q '有 RESULT.md' "$OUT_DIR/notify-msg-5.log"
 check "exit 6 asks to inspect current/ and attempts/" grep -q 'attempts' "$OUT_DIR/notify-msg-6.log"
 check "exit 7 says a worker is already running" grep -q '已有 worker' "$OUT_DIR/notify-msg-7.log"
@@ -537,7 +542,8 @@ check_eq "harness: --mode mismatch -> exit 1" "1" "$FAKE_RC"
 
 # template list placeholders are still placeholders
 cp "$HARNESS/TASK.good" "$hrepo/.agent/current/TASK.md"
-sed -i '' 's/^- \[ \] works$/- [ ] <observable, checkable criterion>/' "$hrepo/.agent/current/TASK.md"
+sed 's/^- \[ \] works$/- [ ] <observable, checkable criterion>/' "$hrepo/.agent/current/TASK.md" >"$hrepo/.agent/current/TASK.md.new" \
+    && mv "$hrepo/.agent/current/TASK.md.new" "$hrepo/.agent/current/TASK.md"
 run_fake result 0 --allow-dirty --mode implement
 check_eq "harness: list placeholders rejected -> exit 1" "1" "$FAKE_RC"
 check "harness: placeholder message names the section" grep -q 'placeholder' "$OUT_DIR/fake-run.log"
@@ -1190,19 +1196,19 @@ H1PID=$!
 mkdir -p "$H1/.agent/current/.worker.lock"
 printf 'pid=%s\nworker_pid=\nrun_id=live\n' "$H1PID" >"$H1/.agent/current/.worker.lock/info"
 H1_MANIFEST="$(agent_manifest "$H1")"
-H1_BEFORE_TASK="$(shasum "$H1/.agent/current/TASK.md" | awk '{print $1}')"
-H1_BEFORE_RS="$(shasum "$H1/.agent/RUN_STATE.json" | awk '{print $1}')"
-H1_BEFORE_Q="$(shasum "$H1/.agent/phases/A/TASK_QUEUE.json" | awk '{print $1}')"
+H1_BEFORE_TASK="$(file_hash "$H1/.agent/current/TASK.md")"
+H1_BEFORE_RS="$(file_hash "$H1/.agent/RUN_STATE.json")"
+H1_BEFORE_Q="$(file_hash "$H1/.agent/phases/A/TASK_QUEUE.json")"
 run_phase_fake "$H1" "$FAKEBIN"
 check_eq "H1: a live worker lock refuses the loop -> exit 5" "5" "$LAST_EXIT"
 check "H1: the refusal says a worker is running" grep -q 'worker is still running' "$OUT_DIR/phase-${TEST_NAME}.log"
 check_eq "H1: TASK.md is byte-identical after the refusal" "$H1_BEFORE_TASK" \
-    "$(shasum "$H1/.agent/current/TASK.md" | awk '{print $1}')"
+    "$(file_hash "$H1/.agent/current/TASK.md")"
 check "H1: the original Task definition survived" grep -q 'AUDIT ORIGINAL DEFINITION' "$H1/.agent/current/TASK.md"
 check_eq "H1: RUN_STATE.json is byte-identical after the refusal" "$H1_BEFORE_RS" \
-    "$(shasum "$H1/.agent/RUN_STATE.json" | awk '{print $1}')"
+    "$(file_hash "$H1/.agent/RUN_STATE.json")"
 check_eq "H1: TASK_QUEUE.json is byte-identical after the refusal" "$H1_BEFORE_Q" \
-    "$(shasum "$H1/.agent/phases/A/TASK_QUEUE.json" | awk '{print $1}')"
+    "$(file_hash "$H1/.agent/phases/A/TASK_QUEUE.json")"
 check "H1: RUN_STATE still says running" bash -c "jq -e '.status == \"running\"' '$H1/.agent/RUN_STATE.json' >/dev/null"
 check_eq "H1: the whole .agent tree is byte-identical after the refusal" "$H1_MANIFEST" "$(agent_manifest "$H1")"
 check "H1: no phase log directory was created" bash -c "! test -d '$H1/.agent/current/logs'"
@@ -1230,24 +1236,24 @@ sleep 30 &
 H2PID=$!
 mkdir -p "$H2/.agent/current/.phase.lock"
 printf 'pid=%s\nrun_id=other\nphase=A\n' "$H2PID" >"$H2/.agent/current/.phase.lock/info"
-H2_BEFORE_RS="$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+H2_BEFORE_RS="$(file_hash "$H2/.agent/RUN_STATE.json")"
 H2_MANIFEST="$(agent_manifest "$H2")"
 run_phase_fake "$H2" "$FAKEBIN"
 check_eq "H2: a live phase loop refuses a second loop -> exit 5" "5" "$LAST_EXIT"
 check_eq "H2: RUN_STATE.json is byte-identical" "$H2_BEFORE_RS" \
-    "$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+    "$(file_hash "$H2/.agent/RUN_STATE.json")"
 check_eq "H2: the whole .agent tree is byte-identical" "$H2_MANIFEST" "$(agent_manifest "$H2")"
 check "H2: the other loop's lock was left in place" test -d "$H2/.agent/current/.phase.lock"
 kill "$H2PID" 2>/dev/null || true
 wait "$H2PID" 2>/dev/null || true
 
 # H3: a stale phase lock refuses read-only, and --break-lock is the way out
-H3_BEFORE_RS="$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+H3_BEFORE_RS="$(file_hash "$H2/.agent/RUN_STATE.json")"
 printf 'pid=999999\nrun_id=dead\nphase=A\n' >"$H2/.agent/current/.phase.lock/info"
 run_phase_fake "$H2" "$FAKEBIN"
 check_eq "H3: an unprovable stale phase lock -> exit 5" "5" "$LAST_EXIT"
 check_eq "H3: RUN_STATE.json is byte-identical" "$H3_BEFORE_RS" \
-    "$(shasum "$H2/.agent/RUN_STATE.json" | awk '{print $1}')"
+    "$(file_hash "$H2/.agent/RUN_STATE.json")"
 check "H3: the stale lock is still there" test -d "$H2/.agent/current/.phase.lock"
 FAKE_TASK_DIR="$H2FIX" run_phase_fake "$H2" "$FAKEBIN" --break-lock
 check_eq "H3: --break-lock lets the loop proceed -> exit 0" "0" "$LAST_EXIT"
@@ -1744,6 +1750,29 @@ fi
 check "fresh HOME install created both skills" test -f "$FRESH_HOME/.agents/skills/phase-runner/SKILL.md"
 check "fresh HOME install includes the loop script" test -x "$FRESH_HOME/.agents/skills/phase-runner/scripts/run-phase.sh"
 check "fresh HOME install includes the gate script" test -x "$FRESH_HOME/.agents/skills/phase-runner/scripts/phase-gate.sh"
+
+# The installer must leave every other skill in the target alone. This is
+# asserted on a purpose-built HOME so it is deterministic: the machine running
+# the suite (and CI) does not need to have those skills installed.
+OTHER_HOME="$(mktemp -d "$TMP_BASE/other-skills-home.XXXXXX")"
+CLEANUP_DIRS+=("$OTHER_HOME")
+mkdir -p "$OTHER_HOME/.agents/skills/docx" "$OTHER_HOME/.agents/skills/pdf" "$OTHER_HOME/.agents/skills/unrelated/sub"
+printf 'name: docx\n' >"$OTHER_HOME/.agents/skills/docx/SKILL.md"
+printf 'name: pdf\n' >"$OTHER_HOME/.agents/skills/pdf/SKILL.md"
+printf 'user work\n' >"$OTHER_HOME/.agents/skills/unrelated/sub/notes.txt"
+if HOME="$OTHER_HOME" "$PROJECT_ROOT/scripts/install-skills.sh" --quiet >"$OUT_DIR/install-other-skills.log" 2>&1; then
+    pass "installer runs with unrelated skills already present"
+else
+    fail "installer failed with unrelated skills present (see $OUT_DIR/install-other-skills.log)"
+fi
+check "an unrelated skill (docx) is byte-identical after install" \
+    test "$(cat "$OTHER_HOME/.agents/skills/docx/SKILL.md")" = "name: docx"
+check "an unrelated skill (pdf) is byte-identical after install" \
+    test "$(cat "$OTHER_HOME/.agents/skills/pdf/SKILL.md")" = "name: pdf"
+check "a nested file in an unrelated skill survives" \
+    test "$(cat "$OTHER_HOME/.agents/skills/unrelated/sub/notes.txt")" = "user work"
+check "the managed skills were installed alongside them" \
+    test -f "$OTHER_HOME/.agents/skills/phase-runner/SKILL.md"
 
 LINK_HOME="$(mktemp -d "$TMP_BASE/linkhome.XXXXXX")"
 ALTERNATE="$(mktemp -d "$TMP_BASE/alternate.XXXXXX")"

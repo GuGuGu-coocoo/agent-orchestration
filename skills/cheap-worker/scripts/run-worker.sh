@@ -143,8 +143,16 @@ read_report_status() {
     awk '/^## Status[[:space:]]*$/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' "$1"
 }
 
+# file_mtime <path> -> epoch seconds, or 0 when unavailable.
+# GNU stat's `-f` means "filesystem status", so `stat -f %m` succeeds on Linux
+# while printing a mount point instead of a timestamp. The output is therefore
+# validated, not trusted: try GNU first, fall back to BSD, then give up as 0.
 file_mtime() {
-    stat -f %m "$1" 2>/dev/null || { stat -c %Y "$1" 2>/dev/null || printf '0'; }
+    local out
+    out="$(stat -c %Y "$1" 2>/dev/null || true)"
+    [[ "$out" =~ ^[0-9]+$ ]] || out="$(stat -f %m "$1" 2>/dev/null || true)"
+    [[ "$out" =~ ^[0-9]+$ ]] || out=0
+    printf '%s\n' "$out"
 }
 
 # is_fresh <file> -> 0 when the file was written at/after this run started
