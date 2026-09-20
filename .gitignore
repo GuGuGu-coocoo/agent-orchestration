@@ -8,6 +8,9 @@
 # Smoke-test output
 tests/smoke/.out/
 
+# Independent review notes (kept locally, not tracked)
+ASTRA_REVIEW*.md
+
 # Editor / OS noise
 .DS_Store
 .idea/
