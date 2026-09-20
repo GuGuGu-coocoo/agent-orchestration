@@ -1812,13 +1812,13 @@ HOME="$ESCAPE_HOME" "$PROJECT_ROOT/scripts/install-skills.sh" --quiet >"$OUT_DIR
 check_eq "installer refuses a parent symlink escape" "1" "$ES_RC"
 check "installer did not create the refused target" bash -c "! test -e '$ESCAPE_OUT/skills'"
 
-if "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" --dry-run >"$OUT_DIR/uninstall-dry.log" 2>&1; then
+if HOME="$FRESH_HOME" "$PROJECT_ROOT/scripts/uninstall-managed-skills.sh" --dry-run >"$OUT_DIR/uninstall-dry.log" 2>&1; then
     pass "uninstall --dry-run exits 0"
 else
     fail "uninstall --dry-run failed"
 fi
 check "uninstall lists both managed skills" bash -c "grep -q 'cheap-worker' '$OUT_DIR/uninstall-dry.log' && grep -q 'phase-runner' '$OUT_DIR/uninstall-dry.log'"
-check "uninstall did not delete anything" test -d "$HOME/.agents/skills/cheap-worker"
+check "uninstall did not delete anything" test -d "$FRESH_HOME/.agents/skills/cheap-worker"
 
 # ---------------------------------------------------------------------------
 # 10. the installed skills were not touched by this test run

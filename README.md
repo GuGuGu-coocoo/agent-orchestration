@@ -426,7 +426,7 @@ runs the scripts from **this source tree**. It never touches real projects and
 never installs anything. See `tests/smoke/README.md`.
 
 ```sh
-tests/smoke/run-offline.sh                  # no model calls, no credentials (379 checks)
+tests/smoke/run-offline.sh                  # no model calls, no credentials (~380 checks)
 tests/smoke/run-live.sh                     # all live tests (OpenCode default model)
 SMOKE_KEEP_REPOS=1 tests/smoke/run-live.sh  # keep the generated repos
 ```
