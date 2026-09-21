@@ -64,8 +64,9 @@ Phase C
 
 1. Read `AGENTS.md` (project rules win over these defaults).
 2. Find the roadmap: `ROADMAP.md`, `docs/ROADMAP.md`, `docs/roadmap.md`,
-   `.agent/ROADMAP.md`, or a pointer inside `AGENTS.md`. If several exist, pick the
-   current one by content/recency; ask the human only if genuinely ambiguous.
+   `docs/internal/next/roadmap.md`, `.agent/ROADMAP.md`, or a pointer inside
+   `AGENTS.md`. If several exist, pick the current one by content/recency; ask the
+   human only if genuinely ambiguous.
 3. Inspect the repo: `git status`, `git rev-parse HEAD`, `git log --oneline -10`,
    `.agent/` contents, existing phase dirs. On resume, read `.agent/RUN_STATE.json`
    first (and run `check-state.sh`, see Resume).

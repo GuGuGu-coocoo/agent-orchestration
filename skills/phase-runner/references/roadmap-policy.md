@@ -7,8 +7,9 @@ Check, in order, and stop at the first real roadmap:
 1. `ROADMAP.md` (project root)
 2. `docs/ROADMAP.md`
 3. `docs/roadmap.md`
-4. `.agent/ROADMAP.md`
-5. A pointer in `AGENTS.md` (e.g. "roadmap lives in `plans/roadmap-v3.md`")
+4. `docs/internal/next/roadmap.md`
+5. `.agent/ROADMAP.md`
+6. A pointer in `AGENTS.md` (e.g. "roadmap lives in `plans/roadmap-v3.md`")
 
 Then read it, plus any architecture/product docs it references. Use `docs/` or
 `plans/` conventions if the project has them.
