@@ -44,10 +44,23 @@ jobs:
 
       # doctor.sh is part of the offline suite and checks the real OpenCode CLI,
       # so the binary (not a service, not credentials) must be present.
+      # The installer fetches release metadata, which intermittently fails on the
+      # shared runner IP ("Failed to fetch version information"). Retry with
+      # backoff so an upstream blip cannot turn a green change red.
       - name: Install OpenCode
         run: |
-          curl -fsSL https://opencode.ai/install | bash
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL https://opencode.ai/install | bash; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            delay=$((attempt * 15))
+            echo "install attempt ${attempt} failed; retrying in ${delay}s" >&2
+            sleep "$delay"
+          done
+          echo "OpenCode install failed after 5 attempts" >&2
+          exit 1
 
       - name: OpenCode version
         run: opencode --version
