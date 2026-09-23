@@ -328,6 +328,34 @@ else
     fail "detached worker did not notify within 10s"
 fi
 
+# The detached child must leave the caller's process group. `nohup ... &` alone
+# keeps it, so a harness that cleans up the process group when the command ends
+# kills the worker while the launcher still reports success - the field failure
+# where no OpenCode session ever appeared.
+cat >"$repo/.fake-slow-worker.sh" <<'FAKEEOF'
+#!/usr/bin/env bash
+sleep 8
+exit 0
+FAKEEOF
+chmod +x "$repo/.fake-slow-worker.sh"
+if (cd "$repo" && WORKER_NOTIFY_RUN_WORKER="$repo/.fake-slow-worker.sh" "$NOTIFY" \
+        --no-notify --mode implement --task-id OFF2) >"$OUT_DIR/notify-group.log" 2>&1; then
+    pass "detached launch with a slow worker exits 0"
+else
+    fail "detached launch with a slow worker failed"
+fi
+DPID="$(sed -n 's/.*background worker started (pid \([0-9]*\)).*/\1/p' "$OUT_DIR/notify-group.log" | head -1)"
+check "detached child is alive when the launcher returns" bash -c \
+    "[ -n '$DPID' ] && kill -0 '$DPID' 2>/dev/null"
+DPGID="$(ps -o pgid= -p "${DPID:-0}" 2>/dev/null | tr -d ' ')"
+if command -v python3 >/dev/null 2>&1; then
+    check "detached child leads its own process group" bash -c \
+        "[ -n '$DPGID' ] && [ '$DPGID' = '$DPID' ]"
+else
+    skip "detached child process group (no python3: the nohup fallback keeps the caller's group)"
+fi
+kill -TERM -"${DPID:-0}" 2>/dev/null || true
+
 # --- 6c. worker-notify.sh --phase message wording ---------------------------------
 phase_msg() {  # phase_msg <exit-code> -> file
     local rc="$1"

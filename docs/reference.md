@@ -191,6 +191,9 @@ ln -sfn ~/.agents/skills/phase-runner ~/.codex/skills/phase-runner
   escalation 或管道停止。
 - `exit 15` 表示循环已结束但唤醒未能送达：消息保留在
   `.agent/current/NOTIFY_FAILED.md`。
+- `exit 16` 表示后台启动的子进程没活下来（该环境在命令结束时清理后台进程组）：
+  工具**不会**谎报成功，而是明确失败。此时请改用阻塞模式（`run-phase.sh` 或
+  `run-worker.sh`）。
 - 需要 ChatGPT/Codex 桌面应用保持打开，且**目标 session 处于打开状态**。循环运行
   期间，该工具会持有一个 `caffeinate -i` 断言（因此它无法阻止合盖休眠）。
 
@@ -421,6 +424,9 @@ Wake-up details:
   escalation or plumbing stop.
 - `exit 15` means the loop finished but the wake-up could not be delivered: the
   message is preserved in `.agent/current/NOTIFY_FAILED.md`.
+- `exit 16` means the detached child did not survive the launch (this environment
+  cleans up the background process group when the command returns). The helper
+  reports the failure instead of a pid — use blocking mode.
 - Requires the ChatGPT/Codex desktop app to stay open **with the target session
   open**. While the loop runs, the helper holds a `caffeinate -i` assertion (so
   it cannot prevent lid-close sleep).
@@ -670,6 +676,9 @@ Détails du réveil :
   Phase, checkpoint, escalade ou arrêt d'infrastructure.
 - `exit 15` signifie que la boucle s'est terminée mais que le réveil n'a pas pu
   être délivré : le message est conservé dans `.agent/current/NOTIFY_FAILED.md`.
+- `exit 16` signifie que l'enfant détaché n'a pas survécu au lancement (cet
+  environnement nettoie le groupe de processus à la fin de la commande). L'outil
+  signale l'échec au lieu d'un pid — utilisez le mode bloquant.
 - Nécessite que l'application de bureau ChatGPT/Codex reste ouverte **avec la
   session cible ouverte**. Pendant que la boucle tourne, l'outil maintient une
   assertion `caffeinate -i` (il ne peut donc pas empêcher la veille à la

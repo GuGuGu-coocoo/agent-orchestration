@@ -46,7 +46,8 @@
 # Exit codes: the runner's exit code (foreground mode);
 #             0 when the background launch succeeded;
 #             14 no exact target (refusing to guess);
-#             15 the run finished but the wake-up could not be delivered.
+#             15 the run finished but the wake-up could not be delivered;
+#             16 the background child did not survive the launch (use blocking mode).
 #
 # This script never commits, pushes, merges or deletes anything.
 
@@ -307,6 +308,34 @@ if [[ "$NO_NOTIFY" -eq 0 && -z "$CODEX_THREAD" ]]; then
 fi
 
 # --- detach (default): re-exec in the background and return immediately -------
+
+# launch_detached <log> <pidfile> <cmd> [args...]
+#
+# `nohup cmd &` only ignores SIGHUP: the child keeps the caller's process group
+# and session, so a harness that cleans up the process group when the command
+# returns still kills it - while the caller was told the launch succeeded.
+# Prefer a real detach (fork + setsid: new session, new process group) where
+# python3 exists, fall back to nohup, and always record the pid in <pidfile> so
+# the caller can prove liveness before reporting success.
+launch_detached() {
+    local log="$1" pidfile="$2"; shift 2
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import os, sys
+pidfile = sys.argv[1]
+if os.fork() > 0:
+    sys.exit(0)          # the wrapper returns at once; the child is reparented
+os.setsid()              # new session and process group
+with open(pidfile, "w") as fh:
+    fh.write(str(os.getpid()))
+os.execvp(sys.argv[2], sys.argv[2:])
+' "$pidfile" "$@" >>"$log" 2>&1
+        return 0
+    fi
+    nohup "$@" >>"$log" 2>&1 &
+    printf '%s' "$!" >"$pidfile"
+}
+
 if [[ "$FOREGROUND" -eq 0 && "$DETACHED" != "1" ]]; then
     mkdir -p "$ROOT/.agent/current/logs"
     LOG_FILE="$ROOT/.agent/current/logs/notify-$(date -u '+%Y%m%dT%H%M%SZ')-${TASK_ID}.log"
@@ -314,8 +343,41 @@ if [[ "$FOREGROUND" -eq 0 && "$DETACHED" != "1" ]]; then
     if [[ -n "$CODEX_THREAD" ]]; then
         CHILD_ARGS+=(--codex-thread "$CODEX_THREAD")
     fi
-    WORKER_NOTIFY_DETACHED=1 nohup bash "$0" "${CHILD_ARGS[@]}" >"$LOG_FILE" 2>&1 &
-    PID=$!
+    PID_FILE="$LOG_FILE.pid"
+    rm -f "$PID_FILE"
+    export WORKER_NOTIFY_DETACHED=1
+    launch_detached "$LOG_FILE" "$PID_FILE" bash "$0" "${CHILD_ARGS[@]}"
+
+    # Never report success for a child that is already gone: that is exactly the
+    # failure mode where the launcher looks fine but no OpenCode session ever
+    # appears. Poll briefly for a live pid, then fail loudly with exit 16 so the
+    # caller falls back to blocking mode instead of waiting for a wake-up.
+    PID=""
+    i=0
+    while [[ "$i" -lt 15 ]]; do
+        PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+            break
+        fi
+        PID=""
+        sleep 0.2
+        i=$((i + 1))
+    done
+    if [[ -z "$PID" ]]; then
+        printf 'worker-notify: the background worker did not survive the launch\n' >&2
+        printf 'worker-notify: this environment cleans up background children, so use blocking mode:\n' >&2
+        if [[ "$PHASE_MODE" -eq 1 ]]; then
+            printf 'worker-notify:   %s --root "%s"\n' "$SCRIPT_DIR/../phase-runner/scripts/run-phase.sh" "$ROOT" >&2
+        else
+            printf 'worker-notify:   %s --mode <mode> --task-id %s --root "%s"\n' "$RUN_WORKER" "$TASK_ID" "$ROOT" >&2
+        fi
+        printf 'worker-notify: log: %s\n' "$LOG_FILE" >&2
+        if [[ -s "$LOG_FILE" ]]; then
+            tail -5 "$LOG_FILE" 2>/dev/null | sed 's/^/worker-notify:   /' >&2 || true
+        fi
+        exit 16
+    fi
+
     printf 'worker-notify: background worker started (pid %s)\n' "$PID"
     printf 'worker-notify: task=%s\n' "$TASK_ID"
     printf 'worker-notify: log=%s\n' "$LOG_FILE"
