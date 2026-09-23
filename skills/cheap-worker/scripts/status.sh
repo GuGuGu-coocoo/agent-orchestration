@@ -152,6 +152,12 @@ main() {
     done
     if [[ -n "$live" ]]; then
         printf '  hint         : %s is live - do not poll; the notifier wakes the Supervisor once the run stops\n' "$live"
+    elif [[ "$loop_status" == "running" || "$run_status" == "running" ]]; then
+        # The state claims a run in progress, yet no lock holds a live pid: the
+        # process died without updating anything and without sending a wake-up.
+        # Say so - a stale "running" must never read as progress.
+        printf '  warning      : the state says running but nothing is alive - the run stopped without saving it\n'
+        printf '  next         : check-state.sh --root "%s"   then recover with --break-lock\n' "$root"
     fi
 
     exit 0

@@ -177,6 +177,36 @@ fi
 check "status.sh shows the task id" grep -q 'task id      : OFF1' "$OUT_DIR/status.log"
 check "status.sh shows the loop state" grep -q 'loop state   :' "$OUT_DIR/status.log"
 
+# A stale "running" must never read as progress. This is the field failure where
+# the worker/loop process died without writing anything, RUN_STATE still said
+# running, no wake-up was sent, and both sides simply sat silent.
+STALE_HOME="$(mktemp -d "$TMP_BASE/smoke-status-stale.XXXXXX")"
+CLEANUP_DIRS+=("$STALE_HOME")
+mkdir -p "$STALE_HOME/.agent/current/.worker.lock"
+printf '{"current_phase":"A","current_task":"A01","status":"running","stop_reason":"none"}\n' >"$STALE_HOME/.agent/RUN_STATE.json"
+printf '{"task_id":"A01","mode":"implement","status":"running"}\n' >"$STALE_HOME/.agent/current/STATE.json"
+printf 'pid=999999\nworker_pid=999998\n' >"$STALE_HOME/.agent/current/.worker.lock/info"
+(cd "$STALE_HOME" && "$STATUS") >"$OUT_DIR/status-stale.log" 2>&1 || true
+check "status.sh warns when the state says running but nothing is alive" \
+    grep -q 'the state says running but nothing is alive' "$OUT_DIR/status-stale.log"
+check "status.sh names the recovery flag for a stale run" \
+    grep -q -- '--break-lock' "$OUT_DIR/status-stale.log"
+
+LIVE_HOME="$(mktemp -d "$TMP_BASE/smoke-status-live.XXXXXX")"
+CLEANUP_DIRS+=("$LIVE_HOME")
+mkdir -p "$LIVE_HOME/.agent/current/.worker.lock"
+printf '{"current_phase":"A","current_task":"A01","status":"running","stop_reason":"none"}\n' >"$LIVE_HOME/.agent/RUN_STATE.json"
+printf '{"task_id":"A01","mode":"implement","status":"running"}\n' >"$LIVE_HOME/.agent/current/STATE.json"
+sleep 30 &
+LIVE_CHILD=$!
+printf 'pid=%s\nworker_pid=%s\n' "$$" "$LIVE_CHILD" >"$LIVE_HOME/.agent/current/.worker.lock/info"
+(cd "$LIVE_HOME" && "$STATUS") >"$OUT_DIR/status-live.log" 2>&1 || true
+kill "$LIVE_CHILD" 2>/dev/null || true
+check "status.sh reports a live lock as do-not-poll" \
+    grep -q 'is live - do not poll' "$OUT_DIR/status-live.log"
+check "status.sh does not warn while a lock is live" bash -c \
+    "! grep -q 'nothing is alive' '$OUT_DIR/status-live.log'"
+
 if (cd "$repo" && "$COLLECT") >/dev/null 2>&1; then
     fail "collect-result.sh should fail with no report"
 else
